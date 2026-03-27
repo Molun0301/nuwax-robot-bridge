@@ -1,8 +1,8 @@
 # nuwax_robot_bridge
 
-`nuwax_robot_bridge` 是一个运行在 Go2 侧的 TCP 代理服务，入口是 `go2_proxy_server.py`。它把 Unitree Go2 的高层运动控制、摄像头抓图、可选低级别关节控制、可选的 Doubao 实时 TTS / 日志播报，以及音量控制整合到了同一个进程里。
-
-这个目录现在补了 `requirements.txt` 用来记录 Python 依赖，但仍然没有 `Dockerfile` 或现成的部署脚本；CycloneDDS、本地音频命令和 Go2 运行环境仍然需要宿主机自行准备。
+`nuwax_robot_bridge` 是一个运行在 机器人 侧的 TCP 代理服务，可以将你的机器人或者机器狗接入女娲智能体平台。
+本项目基于宇树Go2实现，宇树G1以及其他品牌机器人均可使用本项目，但不保证开箱即用。
+当前入口是 `go2_proxy_server.py`。它把 Unitree Go2 的高层运动控制、摄像头抓图、可选低级别关节控制、可选的 Doubao 实时 TTS / 日志播报，以及音量控制整合到了同一个进程里。
 
 如果你当前只需要控制、摄像头或 low-level 控制，不需要 TTS，那么 Doubao、播放链路和日志桥接相关内容都可以跳过。
 
