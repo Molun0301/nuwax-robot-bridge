@@ -1,0 +1,6 @@
+.env
+go2_proxy.log
+__pycache__/
+*.pyc
+.claude/
+

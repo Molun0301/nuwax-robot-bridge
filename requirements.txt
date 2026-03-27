@@ -1,0 +1,16 @@
+# nuwax_robot_bridge Python runtime dependencies
+#
+# This file records the Python package side of the runtime.
+# You still need host-level prerequisites that pip cannot provide, including:
+# - CycloneDDS native shared library for cyclonedds / unitree_sdk2py
+# - ALSA / Pulse / PipeWire commands for local playback and volume fallback
+#
+# If you use a local Unitree SDK checkout via GO2_SDK_PATH, keep these packages
+# installed and ensure unitree_sdk2py is importable in the active interpreter.
+
+websockets==10.4
+unitree_sdk2py==1.0.1
+cyclonedds==0.10.5
+numpy==2.4.3
+opencv-python==4.10.0.84
+unitree_webrtc_connect_leshy==2.0.7
