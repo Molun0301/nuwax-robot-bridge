@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
+import logging
 import re
 from typing import Deque, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -64,6 +65,8 @@ from services.memory.vision_to_map_projection_service import ProjectedObservatio
 from services.observation_service import ObservationService
 from services.perception import PerceptionService
 
+LOGGER = logging.getLogger(__name__)
+
 
 @dataclass
 class _ScoredCandidate:
@@ -120,15 +123,22 @@ class MemoryService:
         self._repository = MemoryRepository(memory_db_path)
         self._vector_store = vector_store or SQLiteNamedVectorStore(memory_db_path)
 
-        resolved_text_model = text_embedding_model or embedding_model or "hashing-v1"
-        resolved_text_dimension = int(text_embedding_dimension or embedding_dimension or 256)
-        self._text_embedder = text_embedder or build_text_embedder(
+        resolved_text_model = (
+            text_embedding_model
+            or embedding_model
+            or "sentence-transformers:BAAI/bge-m3"
+        )
+        resolved_text_dimension = int(text_embedding_dimension or embedding_dimension or 1024)
+        self._text_embedder = text_embedder or self._build_text_embedder_with_fallback(
             resolved_text_model,
             resolved_text_dimension,
         )
-        self._image_embedder = vision_language_embedder or build_vision_language_embedder(
-            image_embedding_model,
-            image_embedding_dimension,
+        self._image_embedder = (
+            vision_language_embedder
+            or self._build_image_embedder_with_fallback(
+                image_embedding_model,
+                image_embedding_dimension,
+            )
         )
         self._inspection_pose_planner = InspectionPosePlanner()
         self._semantic_map_builder = SemanticMapBuilder(
@@ -157,6 +167,44 @@ class MemoryService:
         self._semantic_instance_history: Deque[SemanticInstance] = deque(maxlen=max(1, history_limit))
         self._observation_event_history: Deque[ObservationEvent] = deque(maxlen=max(1, history_limit))
         self._load_persisted_memory()
+
+    def _build_text_embedder_with_fallback(
+        self,
+        model_name: str,
+        dimension: int,
+    ) -> TextEmbedder:
+        """优先构造配置指定的文本向量器，失败时回退到 hashing。"""
+
+        try:
+            return build_text_embedder(model_name, dimension)
+        except Exception as exc:
+            LOGGER.warning(
+                "文本向量模型初始化失败，已回退到 hashing-v1。requested=%s error=%s",
+                model_name,
+                exc,
+            )
+            fallback_dimension = dimension if dimension > 0 else 256
+            return HashingTextEmbedder(
+                model_name="hashing-v1",
+                dimension=fallback_dimension,
+            )
+
+    def _build_image_embedder_with_fallback(
+        self,
+        model_name: str,
+        dimension: int,
+    ) -> Optional[VisionLanguageEmbedder]:
+        """优先构造图文共享向量器，失败时关闭图像向量链路。"""
+
+        try:
+            return build_vision_language_embedder(model_name, dimension)
+        except Exception as exc:
+            LOGGER.warning(
+                "图像向量模型初始化失败，已关闭图像向量链路。requested=%s error=%s",
+                model_name,
+                exc,
+            )
+            return None
 
     def tag_location(
         self,

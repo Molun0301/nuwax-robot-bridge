@@ -68,7 +68,7 @@
 9. `runtime_data/`
    运行时本地数据目录，例如记忆库和持久化状态。
 10. `scripts/`
-    部署辅助和运维脚本，例如容器侧外部 MCP 注入脚本、YOLO TensorRT 引擎导出脚本。
+    部署辅助和运维脚本，例如容器侧外部 MCP 注入脚本、YOLO 权重预下载脚本、YOLO TensorRT 引擎导出脚本。
 11. `services/`
     平台能力服务层，负责状态、观察、感知、地图、定位、导航、记忆、音频等正式能力。
     其中 `services/memory/` 已包含语义地图构建、视觉投影、实例关联、grounding 查询规划和 inspection pose 规划。
@@ -85,20 +85,25 @@
 17. `.env.example`
     宿主机运行时配置示例。
     记忆向量配置当前统一使用 `NUWAX_MEMORY_TEXT_EMBEDDING_*` 与 `NUWAX_MEMORY_IMAGE_EMBEDDING_*`；
+    当前默认文本向量模型为 `sentence-transformers:BAAI/bge-m3`，默认图像向量模型为
+    `transformers-clip:openai/clip-vit-base-patch32`；
     日志配置当前统一使用 `NUWAX_LOG_*`；
     `settings.py` 仍兼容旧变量名，但仅用于旧部署回退，不建议新环境继续使用。
-18. `drivers/robots/go2/data_plane.env.example`
+18. `requirements-memory-models.txt`
+    语义空间记忆的模型依赖清单。
+    Jetson 场景应先确认 `torch` 可用，再安装本文件。
+19. `drivers/robots/go2/data_plane.env.example`
     Go2 端侧定位、地图、Nav2 与探索能力的专属配置示例。
-19. `drivers/robots/go2/data_plane_entry.py`
+20. `drivers/robots/go2/data_plane_entry.py`
     Go2 端侧数据面的独立启动入口，可单独拉起 Go2 端侧定位、地图、Nav2、探索相关数据面，再由平台装配接入。
-20. `drivers/robots/go2/ros2_ws/`
+21. `drivers/robots/go2/ros2_ws/`
     Go2 示例 ROS2 工作空间，内含 `unitree_lidar_ros2`、`point_lio`、`elevation_mapping_cupy` 相关 vendor 包和
     `nuwax_go2_bringup` 启动包。
-21. `drivers/robots/go2/build_ros2_workspace.sh`
+22. `drivers/robots/go2/build_ros2_workspace.sh`
     构建 Go2 端侧 ROS2 工作空间的示例脚本。
-22. `drivers/robots/go2/launch_ros2_stack.sh`
+23. `drivers/robots/go2/launch_ros2_stack.sh`
     一键启动 Go2 端侧激光雷达、Point-LIO（点激光惯导）、高程建图与 Nav2 的示例脚本。
-23. `requirements.txt`
+24. `requirements.txt`
     Python 运行时依赖。
 
 ## 推荐阅读顺序
@@ -107,6 +112,7 @@
 
 1. 本文档：先理解项目定位和仓库结构。
 2. [部署文档.md](部署文档.md)：按步骤完成宿主机部署、容器接入和开机自启。
+   其中已包含 `YOLO26n` 权重准备和 TensorRT 引擎导出步骤；仓库本身不内置模型权重。
 3. [文档导航.md](docs/公开介绍文档/文档导航.md)：查看公开文档总入口。
 4. [平台架构说明.md](docs/公开介绍文档/平台架构说明.md)：理解能力分层和数据流。
 5. [宿主机与容器通信说明.md](docs/公开介绍文档/宿主机与容器通信说明.md)：理解容器内外职责和通信方式。

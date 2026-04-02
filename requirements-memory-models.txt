@@ -1,0 +1,14 @@
+# `nuwax_robot_bridge` 的语义空间记忆模型依赖
+#
+# 使用场景：
+# 1. 默认文本向量模型：sentence-transformers:BAAI/bge-m3
+# 2. 默认图像向量模型：transformers-clip:openai/clip-vit-base-patch32
+#
+# 注意：
+# 1. Jetson + JetPack 场景下，`torch` 请优先使用 NVIDIA 提供的版本。
+# 2. 在确认 `import torch` 正常后，再安装本文件。
+
+sentence-transformers==3.2.1
+transformers==4.46.3
+sentencepiece>=0.1.91
+safetensors>=0.4.1

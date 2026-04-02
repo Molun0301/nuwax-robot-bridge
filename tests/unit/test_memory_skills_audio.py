@@ -26,6 +26,7 @@ from services import ArtifactService, AudioService, ObservationService, Percepti
 from services.localization import LocalizationService
 from services.mapping import MappingService
 from services.memory import MemoryService
+import services.memory.service as memory_service_module
 from services.perception import DetectorPipeline, MetadataDrivenDetectorBackend, SceneDescriptionBackend, SceneDescriptionBackendSpec
 from services.memory.vectorizer import HashingTextEmbedder, VisionLanguageEmbedder
 from settings import load_config
@@ -339,6 +340,87 @@ def test_memory_service_can_tag_location_and_write_memory(tmp_path: Path) -> Non
     assert summary.metadata["store_mode"] == "multimodal_named_vector"
     assert summary.metadata["named_vector_counts"]["text_dense"] >= 1
     assert summary.metadata["named_vector_counts"]["image_dense"] >= 1
+
+
+def test_memory_service_falls_back_when_default_embedding_dependencies_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认 BGE 与 CLIP 依赖缺失时，应回退而不是阻断服务启动。"""
+
+    providers = _ProviderBundle()
+    provider_owner = _ProviderOwner(providers)
+    state_store = StateStore()
+    event_bus = EventBus()
+    artifact_service = ArtifactService(
+        LocalArtifactStore(str(tmp_path / "artifacts"), "http://testserver"),
+        retention_policy=ArtifactRetentionPolicy(
+            retention_days=7,
+            max_count=20,
+            max_total_bytes=1024 * 1024,
+            cleanup_batch_size=10,
+        ),
+    )
+    observation_service = ObservationService(
+        provider_owner=provider_owner,
+        artifact_service=artifact_service,
+        state_store=state_store,
+        event_bus=event_bus,
+        history_limit=10,
+    )
+    localization_service = LocalizationService(
+        provider_owner=provider_owner,
+        state_store=state_store,
+        event_bus=event_bus,
+        history_limit=10,
+    )
+    mapping_service = MappingService(
+        provider_owner=provider_owner,
+        state_store=state_store,
+        event_bus=event_bus,
+        history_limit=10,
+    )
+    perception_service = PerceptionService(
+        provider_owner=provider_owner,
+        artifact_service=artifact_service,
+        state_store=state_store,
+        detector_pipeline=DetectorPipeline((MetadataDrivenDetectorBackend(),)),
+        event_bus=event_bus,
+        history_limit=10,
+        pipeline_name="memory_fallback_test_pipeline",
+    )
+
+    def _raise_text(*args, **kwargs):
+        raise RuntimeError("sentence-transformers 缺失")
+
+    def _raise_image(*args, **kwargs):
+        raise RuntimeError("transformers 缺失")
+
+    monkeypatch.setattr(memory_service_module, "build_text_embedder", _raise_text)
+    monkeypatch.setattr(memory_service_module, "build_vision_language_embedder", _raise_image)
+
+    memory_service = MemoryService(
+        localization_service=localization_service,
+        mapping_service=mapping_service,
+        observation_service=observation_service,
+        perception_service=perception_service,
+        state_store=state_store,
+        event_bus=event_bus,
+        artifact_store=artifact_service._store,
+        history_limit=10,
+        memory_db_path=str(tmp_path / "memory" / "vector_memory.db"),
+        text_embedding_model="sentence-transformers:BAAI/bge-m3",
+        text_embedding_dimension=1024,
+        image_embedding_model="transformers-clip:openai/clip-vit-base-patch32",
+        image_embedding_dimension=512,
+    )
+
+    summary = memory_service.get_summary()
+
+    assert summary.metadata["text_embedding_model"] == "hashing-v1"
+    assert summary.metadata["text_embedding_dimension"] == 1024
+    assert summary.metadata["image_embedding_model"] == "disabled"
+    assert summary.metadata["image_embedding_dimension"] == 0
 
 
 def test_memory_service_can_query_locations_and_semantic_entries(tmp_path: Path) -> None:

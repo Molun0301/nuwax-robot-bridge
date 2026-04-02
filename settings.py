@@ -262,7 +262,7 @@ class PerceptionYoloConfig:
 
     enabled: bool = True
     backend_name: str = "yolo_local"
-    model_name: str = "yolo26n.pt"
+    model_name: str = str(BASE_DIR / "runtime_data" / "models" / "yolo26n.pt")
     runtime_preference: str = "tensorrt"
     engine_path: str = ""
     device: str = ""
@@ -333,9 +333,9 @@ class RuntimeDataConfig:
     navigation_history_limit: int = 100
     memory_history_limit: int = 200
     memory_db_path: str = ""
-    memory_embedding_model: str = "hashing-v1"
-    memory_embedding_dimension: int = 256
-    memory_image_embedding_model: str = "disabled"
+    memory_embedding_model: str = "sentence-transformers:BAAI/bge-m3"
+    memory_embedding_dimension: int = 1024
+    memory_image_embedding_model: str = "transformers-clip:openai/clip-vit-base-patch32"
     memory_image_embedding_dimension: int = 512
     memory_vector_store_backend: str = "sqlite_named_vectors"
     artifact_retention_days: int = 7
@@ -504,7 +504,10 @@ def load_config() -> NuwaxRobotBridgeConfig:
         yolo=PerceptionYoloConfig(
             enabled=_cfg_bool("NUWAX_PERCEPTION_YOLO_ENABLED", True),
             backend_name=_cfg_str("NUWAX_PERCEPTION_YOLO_BACKEND_NAME", "yolo_local"),
-            model_name=_cfg_str("NUWAX_PERCEPTION_YOLO_MODEL", "yolo26n.pt"),
+            model_name=_cfg_str(
+                "NUWAX_PERCEPTION_YOLO_MODEL",
+                str(BASE_DIR / "runtime_data" / "models" / "yolo26n.pt"),
+            ),
             runtime_preference=_cfg_str("NUWAX_PERCEPTION_YOLO_RUNTIME", "tensorrt"),
             engine_path=_cfg_str(
                 "NUWAX_PERCEPTION_YOLO_ENGINE_PATH",
@@ -619,16 +622,22 @@ def load_config() -> NuwaxRobotBridgeConfig:
         # NUWAX_MEMORY_TEXT_EMBEDDING_* 与 NUWAX_MEMORY_IMAGE_EMBEDDING_*。
         memory_embedding_model=_cfg_str(
             "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL",
-            _cfg_str("NUWAX_MEMORY_EMBEDDING_MODEL", "hashing-v1"),
+            _cfg_str(
+                "NUWAX_MEMORY_EMBEDDING_MODEL",
+                "sentence-transformers:BAAI/bge-m3",
+            ),
         ),
         memory_embedding_dimension=max(
             8,
             _cfg_int(
                 "NUWAX_MEMORY_TEXT_EMBEDDING_DIM",
-                _cfg_int("NUWAX_MEMORY_EMBEDDING_DIM", 256),
+                _cfg_int("NUWAX_MEMORY_EMBEDDING_DIM", 1024),
             ),
         ),
-        memory_image_embedding_model=_cfg_str("NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL", "disabled"),
+        memory_image_embedding_model=_cfg_str(
+            "NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL",
+            "transformers-clip:openai/clip-vit-base-patch32",
+        ),
         memory_image_embedding_dimension=max(8, _cfg_int("NUWAX_MEMORY_IMAGE_EMBEDDING_DIM", 512)),
         memory_vector_store_backend=_cfg_str("NUWAX_MEMORY_VECTOR_STORE_BACKEND", "sqlite_named_vectors"),
         artifact_retention_days=max(1, _cfg_int("NUWAX_ARTIFACT_RETENTION_DAYS", 7)),

@@ -23,4 +23,8 @@ fastapi==0.115.14
 uvicorn==0.30.6
 httpx==0.27.2
 openai==1.60.2
+# `ultralytics` 会依赖 `polars>=0.20.0`。
+# Jetson + Python 3.8 场景建议固定到已验证的 wheel 版本，
+# 避免解析到源码包后触发上游 `puccinialin` 构建依赖问题。
+polars==1.8.2
 ultralytics==8.4.33
