@@ -36,6 +36,13 @@ GO2_DEFAULT_TOPICS = {
     "joint_state": "robot.go2.joint_state",
     "imu_state": "robot.go2.imu_state",
     "robot_volume": "robot.go2.audio.volume",
+    "odom_lio": "/odom_lio",
+    "tf": "/tf",
+    "tf_static": "/tf_static",
+    "occupancy_map": "/map",
+    "grid_map": "/elevation_mapping_cupy/elevation_map_raw",
+    "global_costmap": "/global_costmap/costmap",
+    "navigate_to_pose": "/navigate_to_pose",
 }
 
 GO2_DEFAULT_SENSOR_BINDINGS = (

@@ -44,6 +44,18 @@ def build_go2_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None) -> Rob
                 description="Go2 低层关节控制器。",
                 required=False,
             ),
+            ComponentBinding(
+                name="go2_data_plane_runtime",
+                path="drivers.robots.go2.data_plane.Go2DataPlaneRuntime",
+                description="Go2 端侧定位、地图、Nav2 与探索数据面运行时。",
+                required=False,
+            ),
+            ComponentBinding(
+                name="go2_data_plane_settings",
+                path="drivers.robots.go2.settings.load_go2_data_plane_config",
+                description="Go2 端侧定位、地图、Nav2 与探索配置加载入口。",
+                required=False,
+            ),
         ),
         default_sensors=GO2_DEFAULT_SENSOR_BINDINGS,
         default_audio_backends=GO2_DEFAULT_AUDIO_BINDINGS,

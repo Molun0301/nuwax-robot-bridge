@@ -55,6 +55,9 @@
 6. `drivers/`
    机器人入口与装配层，按 `robots/<robot>` 组织具体机器人实现。
    其中 Go2 的底层控制实现已固定放在 `drivers/robots/go2/control/`。
+   Go2 的端侧定位、地图、Nav2、探索启动入口与专属配置也固定放在 `drivers/robots/go2/`，
+   例如 `drivers/robots/go2/data_plane.py`、`drivers/robots/go2/data_plane_entry.py`、
+   `drivers/robots/go2/settings.py`、`drivers/robots/go2/data_plane.env.example`。
 7. `gateways/`
    对外通信入口，包括 MCP、HTTP、事件流、relay 和兼容策略说明。
 8. `providers/`
@@ -81,7 +84,11 @@
     记忆向量配置当前统一使用 `NUWAX_MEMORY_TEXT_EMBEDDING_*` 与 `NUWAX_MEMORY_IMAGE_EMBEDDING_*`；
     日志配置当前统一使用 `NUWAX_LOG_*`；
     `settings.py` 仍兼容旧变量名，但仅用于旧部署回退，不建议新环境继续使用。
-18. `requirements.txt`
+18. `drivers/robots/go2/data_plane.env.example`
+    Go2 端侧定位、地图、Nav2 与探索能力的专属配置示例。
+19. `drivers/robots/go2/data_plane_entry.py`
+    Go2 端侧数据面的独立启动入口，可单独拉起 `lidar-dev + Nav2` 相关数据面，再由平台装配接入。
+20. `requirements.txt`
     Python 运行时依赖。
 
 ## 推荐阅读顺序

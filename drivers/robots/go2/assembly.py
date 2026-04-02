@@ -9,9 +9,11 @@ from typing import Dict, Optional, Tuple, Any, Callable, TYPE_CHECKING
 from adapters.base import AdapterBase, AdapterConfig
 from drivers.robots.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
 from drivers.robots.go2.capabilities import GO2_CAPABILITY_DESCRIPTORS_BY_NAME
+from drivers.robots.go2.data_plane import Go2DataPlaneRuntime
 from drivers.robots.go2.defaults import GO2_TIMEOUTS, build_go2_defaults
 from drivers.robots.go2.manifest import build_go2_manifest
 from drivers.robots.go2.providers import Go2ProviderBundle
+from drivers.robots.go2.settings import load_go2_data_plane_config
 
 if TYPE_CHECKING:
     from settings import NuwaxRobotBridgeConfig
@@ -62,12 +64,14 @@ class Go2RobotAssembly(RobotAssemblyBase):
     factories: Optional[Go2ClientFactories] = None
     adapter_configs: Optional[Dict[str, AdapterConfig]] = None
     prebound_adapters: Tuple[AdapterBase[Any, Any], ...] = ()
+    data_plane: Optional[Go2DataPlaneRuntime] = None
 
     def __post_init__(self) -> None:
         self.factories = self.factories or _load_default_factories()
         self.defaults = build_go2_defaults(self.config, self.iface)
         self.manifest = build_go2_manifest(self.config)
         self._initialize_adapter_runtime(self.adapter_configs)
+        self.data_plane = self.data_plane or Go2DataPlaneRuntime(load_go2_data_plane_config())
         self.providers = Go2ProviderBundle(self)
         self.perception_pipeline = self.build_default_perception_pipeline()
         self.sport_client = None
@@ -81,10 +85,14 @@ class Go2RobotAssembly(RobotAssemblyBase):
 
     def start(self) -> None:
         self.ensure_high_level_clients()
+        if self.data_plane is not None:
+            self.data_plane.start()
         self.initialize_registered_adapters()
 
     def stop(self) -> None:
         self.stop_registered_adapters()
+        if self.data_plane is not None:
+            self.data_plane.stop()
         self.switch_mode("high")
 
     def get_status(self) -> RobotAssemblyStatus:
@@ -496,6 +504,7 @@ def create_go2_assembly(
     factories: Optional[Go2ClientFactories] = None,
     adapter_configs: Optional[Dict[str, AdapterConfig]] = None,
     prebound_adapters: Tuple[AdapterBase[Any, Any], ...] = (),
+    data_plane: Optional[Go2DataPlaneRuntime] = None,
 ) -> Go2RobotAssembly:
     """创建 Go2 机器人装配入口。"""
 
@@ -505,4 +514,5 @@ def create_go2_assembly(
         factories=factories,
         adapter_configs=adapter_configs,
         prebound_adapters=prebound_adapters,
+        data_plane=data_plane,
     )

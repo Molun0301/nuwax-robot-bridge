@@ -3,12 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, TYPE_CHECKING
 
-from contracts.geometry import Quaternion, Twist, Vector3
+from contracts.geometry import FrameTree, Pose, Quaternion, Twist, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
+from contracts.maps import CostMap, OccupancyGrid, SemanticMap
+from contracts.navigation import ExplorationState, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
 from contracts.robot_state import IMUState, JointState, RobotControlMode, RobotState, SafetyState
 from drivers.robots.go2.defaults import GO2_DEFAULT_CAMERA_INFO
+from providers.exploration import ExplorationProvider
 from providers.image import ImageProvider
+from providers.localization import LocalizationProvider
+from providers.maps import MapProvider
 from providers.motion import MotionControl
+from providers.navigation import NavigationProvider
 from providers.safety import SafetyProvider
 from providers.state import StateProvider
 
@@ -25,7 +31,16 @@ def _to_control_mode(mode: str) -> RobotControlMode:
 
 
 @dataclass
-class Go2ProviderBundle(StateProvider, ImageProvider, MotionControl, SafetyProvider):
+class Go2ProviderBundle(
+    StateProvider,
+    ImageProvider,
+    LocalizationProvider,
+    MapProvider,
+    NavigationProvider,
+    ExplorationProvider,
+    MotionControl,
+    SafetyProvider,
+):
     """Go2 默认提供器集合。"""
 
     assembly: "Go2RobotAssembly"
@@ -34,6 +49,24 @@ class Go2ProviderBundle(StateProvider, ImageProvider, MotionControl, SafetyProvi
 
     def is_available(self) -> bool:
         return self.assembly.high_level_initialized
+
+    def is_state_available(self) -> bool:
+        return self.assembly.high_level_initialized
+
+    def is_image_available(self) -> bool:
+        return self.assembly.high_level_initialized
+
+    def is_localization_available(self) -> bool:
+        return self.assembly.data_plane is not None and self.assembly.data_plane.is_localization_available()
+
+    def is_map_available(self) -> bool:
+        return self.assembly.data_plane is not None and self.assembly.data_plane.is_map_available()
+
+    def is_navigation_available(self) -> bool:
+        return self.assembly.data_plane is not None and self.assembly.data_plane.is_navigation_available()
+
+    def is_exploration_available(self) -> bool:
+        return self.assembly.data_plane is not None and self.assembly.data_plane.is_exploration_available()
 
     def get_robot_state(self) -> RobotState:
         metadata = {
@@ -52,6 +85,8 @@ class Go2ProviderBundle(StateProvider, ImageProvider, MotionControl, SafetyProvi
         except Exception:
             metadata["robot_volume"] = None
         metadata["volume_state"] = metadata["robot_volume"]
+        if self.assembly.data_plane is not None:
+            metadata["data_plane"] = self.assembly.data_plane.get_status()
 
         return RobotState(
             robot_id=self.assembly.defaults.parameters["robot_id"],
@@ -129,6 +164,66 @@ class Go2ProviderBundle(StateProvider, ImageProvider, MotionControl, SafetyProvi
         if camera_id:
             camera_info.camera_id = camera_id
         return camera_info
+
+    def get_current_pose(self) -> Optional[Pose]:
+        if self.assembly.data_plane is None:
+            return None
+        return self.assembly.data_plane.get_current_pose()
+
+    def get_frame_tree(self) -> Optional[FrameTree]:
+        if self.assembly.data_plane is None:
+            return None
+        return self.assembly.data_plane.get_frame_tree()
+
+    def get_occupancy_grid(self) -> Optional[OccupancyGrid]:
+        if self.assembly.data_plane is None:
+            return None
+        return self.assembly.data_plane.get_occupancy_grid()
+
+    def get_cost_map(self) -> Optional[CostMap]:
+        if self.assembly.data_plane is None:
+            return None
+        return self.assembly.data_plane.get_cost_map()
+
+    def get_semantic_map(self) -> Optional[SemanticMap]:
+        if self.assembly.data_plane is None:
+            return None
+        return self.assembly.data_plane.get_semantic_map()
+
+    def set_goal(self, goal: NavigationGoal) -> bool:
+        if self.assembly.data_plane is None:
+            return False
+        return self.assembly.data_plane.set_goal(goal)
+
+    def cancel_goal(self) -> bool:
+        if self.assembly.data_plane is None:
+            return False
+        return self.assembly.data_plane.cancel_goal()
+
+    def get_navigation_state(self) -> NavigationState:
+        if self.assembly.data_plane is None:
+            return NavigationState(status=NavigationStatus.IDLE, message="Go2 数据面未启用。")
+        return self.assembly.data_plane.get_navigation_state()
+
+    def is_goal_reached(self) -> bool:
+        if self.assembly.data_plane is None:
+            return False
+        return self.assembly.data_plane.is_goal_reached()
+
+    def start_exploration(self, request: ExploreAreaRequest) -> bool:
+        if self.assembly.data_plane is None:
+            return False
+        return self.assembly.data_plane.start_exploration(request)
+
+    def stop_exploration(self) -> bool:
+        if self.assembly.data_plane is None:
+            return False
+        return self.assembly.data_plane.stop_exploration()
+
+    def get_exploration_state(self) -> ExplorationState:
+        if self.assembly.data_plane is None:
+            return ExplorationState(message="Go2 数据面未启用。")
+        return self.assembly.data_plane.get_exploration_state()
 
     def send_twist(self, twist: Twist) -> None:
         self.assembly.move(

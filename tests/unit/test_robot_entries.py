@@ -4,7 +4,10 @@ from dataclasses import dataclass
 
 from adapters.base import AdapterCategory, AdapterConfig
 from adapters.streams import RosImageAdapter
+from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
 from contracts.image import ImageFrame
+from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
+from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
 from contracts.robot_state import RobotControlMode
 from drivers.robots.g1 import G1_MANIFEST, create_g1_assembly
 from drivers.robots.go2 import GO2_CAPABILITY_DESCRIPTORS, GO2_CAPABILITY_MATRIX, create_go2_assembly
@@ -165,6 +168,141 @@ class FakeChannelInitializer:
         self.last_call = (domain_id, iface)
 
 
+class FakeGo2DataPlane:
+    """Go2 端侧数据面桩。"""
+
+    def __init__(self) -> None:
+        self.started = False
+        self.pose = Pose(frame_id="odom", position=Vector3(x=1.0, y=2.0, z=0.0))
+        self.frame_tree = FrameTree(
+            root_frame_id="odom",
+            transforms=[
+                Transform(
+                    parent_frame_id="odom",
+                    child_frame_id="body",
+                    translation=Vector3(x=1.0, y=2.0, z=0.0),
+                    rotation=Quaternion(w=1.0),
+                )
+            ],
+        )
+        self.occupancy_grid = OccupancyGrid(
+            map_id="go2_occ",
+            frame_id="odom",
+            width=2,
+            height=2,
+            resolution_m=0.1,
+            origin=Pose(frame_id="odom", position=Vector3()),
+            data=[0, 0, 50, 100],
+        )
+        self.cost_map = CostMap(
+            map_id="go2_cost",
+            frame_id="odom",
+            width=2,
+            height=2,
+            resolution_m=0.1,
+            origin=Pose(frame_id="odom", position=Vector3()),
+            data=[0.0, 10.0, 40.0, 100.0],
+        )
+        self.semantic_map = SemanticMap(
+            map_id="go2_semantic",
+            frame_id="odom",
+            regions=[
+                SemanticRegion(
+                    region_id="dock_1",
+                    label="dock",
+                    centroid=Pose(frame_id="odom", position=Vector3(x=1.2, y=2.3, z=0.0)),
+                    attributes={"alias": "充电桩"},
+                )
+            ],
+        )
+        self.navigation_state = NavigationState(status=NavigationStatus.IDLE, current_pose=self.pose)
+        self.exploration_state = ExplorationState(status=ExplorationStatus.IDLE)
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.started = False
+
+    def is_localization_available(self) -> bool:
+        return True
+
+    def is_map_available(self) -> bool:
+        return True
+
+    def is_navigation_available(self) -> bool:
+        return True
+
+    def is_exploration_available(self) -> bool:
+        return True
+
+    def get_current_pose(self) -> Optional[Pose]:
+        return self.pose
+
+    def get_frame_tree(self) -> Optional[FrameTree]:
+        return self.frame_tree
+
+    def get_occupancy_grid(self) -> Optional[OccupancyGrid]:
+        return self.occupancy_grid
+
+    def get_cost_map(self) -> Optional[CostMap]:
+        return self.cost_map
+
+    def get_semantic_map(self) -> Optional[SemanticMap]:
+        return self.semantic_map
+
+    def set_goal(self, goal: NavigationGoal) -> bool:
+        self.navigation_state = NavigationState(
+            current_goal_id=goal.goal_id,
+            status=NavigationStatus.ACCEPTED,
+            current_pose=self.pose,
+        )
+        self.last_goal = goal
+        return True
+
+    def cancel_goal(self) -> bool:
+        self.navigation_state = self.navigation_state.model_copy(
+            update={"status": NavigationStatus.CANCELLED},
+            deep=True,
+        )
+        return True
+
+    def get_navigation_state(self) -> NavigationState:
+        return self.navigation_state
+
+    def is_goal_reached(self) -> bool:
+        return self.navigation_state.status == NavigationStatus.SUCCEEDED
+
+    def start_exploration(self, request: ExploreAreaRequest) -> bool:
+        self.exploration_state = ExplorationState(
+            current_request_id=request.request_id,
+            status=ExplorationStatus.RUNNING,
+            strategy=request.strategy,
+        )
+        self.last_explore_request = request
+        return True
+
+    def stop_exploration(self) -> bool:
+        self.exploration_state = self.exploration_state.model_copy(
+            update={"status": ExplorationStatus.CANCELLED},
+            deep=True,
+        )
+        return True
+
+    def get_exploration_state(self) -> ExplorationState:
+        return self.exploration_state
+
+    def get_status(self) -> Dict[str, object]:
+        return {
+            "enabled": True,
+            "started": self.started,
+            "localization_available": True,
+            "map_available": True,
+            "navigation_available": True,
+            "exploration_available": True,
+        }
+
+
 def _build_go2_factories(channel_initializer: FakeChannelInitializer) -> Go2ClientFactories:
     return Go2ClientFactories(
         channel_factory_initialize=channel_initializer,
@@ -278,3 +416,40 @@ def test_g1_skeleton_keeps_entry_format_stable() -> None:
 
     assert G1_MANIFEST.robot_name == "g1"
     assert status.initialized is False
+
+
+def test_go2_data_plane_is_managed_under_robot_entry() -> None:
+    """Go2 端侧定位、地图、导航与探索能力应由机器人入口统一管理。"""
+
+    data_plane = FakeGo2DataPlane()
+    assembly = create_go2_assembly(
+        APP_CONFIG,
+        factories=_build_go2_factories(FakeChannelInitializer()),
+        data_plane=data_plane,
+    )
+
+    assembly.start()
+
+    assert data_plane.started is True
+    assert assembly.providers.is_localization_available() is True
+    assert assembly.providers.get_current_pose() is not None
+    assert assembly.providers.get_occupancy_grid() is not None
+    assert assembly.providers.get_semantic_map() is not None
+
+    accepted = assembly.providers.set_goal(
+        NavigationGoal(
+            goal_id="nav_to_dock",
+            target_pose=Pose(frame_id="odom", position=Vector3(x=1.2, y=2.3, z=0.0)),
+        )
+    )
+    exploring = assembly.providers.start_exploration(
+        ExploreAreaRequest(request_id="explore_dock", target_name="充电桩", strategy="frontier")
+    )
+
+    assert accepted is True
+    assert exploring is True
+    assert assembly.providers.get_navigation_state().current_goal_id == "nav_to_dock"
+    assert assembly.providers.get_exploration_state().current_request_id == "explore_dock"
+
+    assembly.stop()
+    assert data_plane.started is False
