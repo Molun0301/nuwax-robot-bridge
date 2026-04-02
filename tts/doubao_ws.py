@@ -5,7 +5,7 @@ import gzip
 import json
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any
+from typing import Dict, List, Optional, Tuple, Any
 
 from settings import DoubaoConfig
 
@@ -104,15 +104,15 @@ class ParsedFrame:
     session_id: str
     payload: bytes
     json_payload: Any
-    error_code: int | None = None
-    sequence_number: int | None = None
+    error_code: Optional[int] = None
+    sequence_number: Optional[int] = None
 
     @property
     def is_error(self) -> bool:
         return self.message_type == MessageType.ERROR_INFORMATION
 
     @property
-    def code(self) -> int | None:
+    def code(self) -> Optional[int]:
         if self.error_code is not None:
             return self.error_code
         if isinstance(self.json_payload, dict):
@@ -155,8 +155,8 @@ class ParsedFrame:
 
 
 def build_headers(
-    credentials: DoubaoConfig, request_id: str, resource_id: str | None = None
-) -> dict[str, str]:
+    credentials: DoubaoConfig, request_id: str, resource_id: Optional[str] = None
+) -> Dict[str, str]:
     headers = {
         "X-Api-Access-Key": credentials.access_key,
         "X-Api-Connect-Id": request_id,
@@ -171,8 +171,8 @@ def build_headers(
 def build_header_candidates(
     credentials: DoubaoConfig,
     request_id: str,
-    resource_id: str | None = None,
-) -> list[tuple[str, dict[str, str]]]:
+    resource_id: Optional[str] = None,
+) -> List[Tuple[str, Dict[str, str]]]:
     base_headers = build_headers(credentials, request_id, resource_id=resource_id)
     candidates = []
 
@@ -198,7 +198,7 @@ def build_header_candidates(
     return candidates
 
 
-def build_start_payload(settings: Any) -> dict[str, Any]:
+def build_start_payload(settings: Any) -> Dict[str, Any]:
     req_params = _build_req_params(settings)
     return {
         "event": int(Event.START_SESSION),
@@ -208,7 +208,7 @@ def build_start_payload(settings: Any) -> dict[str, Any]:
     }
 
 
-def build_text_payload(text: str, settings: Any) -> dict[str, Any]:
+def build_text_payload(text: str, settings: Any) -> Dict[str, Any]:
     req_params = _build_req_params(settings, text=text)
     return {
         "event": int(Event.TASK_REQUEST),
@@ -218,7 +218,7 @@ def build_text_payload(text: str, settings: Any) -> dict[str, Any]:
     }
 
 
-def _build_req_params(settings: Any, text: str | None = None) -> dict[str, Any]:
+def _build_req_params(settings: Any, text: Optional[str] = None) -> Dict[str, Any]:
     audio_params = {
         "format": settings.audio_format,
         "sample_rate": settings.sample_rate,
@@ -253,7 +253,7 @@ def _build_req_params(settings: Any, text: str | None = None) -> dict[str, Any]:
     return req_params
 
 
-def build_finish_payload() -> dict[str, Any]:
+def build_finish_payload() -> Dict[str, Any]:
     return {}
 
 
@@ -265,11 +265,11 @@ def build_finish_connection_frame() -> bytes:
     return _build_request_frame(Event.FINISH_CONNECTION, _encode_json({}))
 
 
-def build_start_session_frame(session_id: str, payload: dict[str, Any]) -> bytes:
+def build_start_session_frame(session_id: str, payload: Dict[str, Any]) -> bytes:
     return _build_request_frame(Event.START_SESSION, _encode_json(payload), session_id=session_id)
 
 
-def build_task_request_frame(session_id: str, payload: dict[str, Any]) -> bytes:
+def build_task_request_frame(session_id: str, payload: Dict[str, Any]) -> bytes:
     return _build_request_frame(Event.TASK_REQUEST, _encode_json(payload), session_id=session_id)
 
 
@@ -407,7 +407,7 @@ def parse_frame(frame: bytes) -> ParsedFrame:
     )
 
 
-def _encode_json(payload: dict[str, Any]) -> bytes:
+def _encode_json(payload: Dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
@@ -429,7 +429,7 @@ def _build_request_frame(event: Event, payload: bytes, session_id: str = "") -> 
     return bytes(frame)
 
 
-def _identifier_kind(message_type: int, event: int) -> str | None:
+def _identifier_kind(message_type: int, event: int) -> Optional[str]:
     if event == 0:
         return None
 
@@ -458,7 +458,7 @@ def _identifier_kind(message_type: int, event: int) -> str | None:
 def _read_audio_only_payload(
     frame: bytes,
     offset: int,
-) -> tuple[bytes, str, int | None]:
+) -> Tuple[bytes, str, Optional[int]]:
     if len(frame) == offset:
         return b"", "", None
 
@@ -491,7 +491,7 @@ def _read_identifier_and_payload(
     *,
     strict_identifier: bool,
     label: str,
-) -> tuple[str, bytes, int]:
+) -> Tuple[str, bytes, int]:
     identifier_length = _read_uint32(frame, offset, "%s_length" % label)
     identifier_start = offset + 4
     identifier_end = identifier_start + identifier_length
@@ -511,7 +511,7 @@ def _read_identifier_and_payload(
     return "", payload, payload_end
 
 
-def _read_length_prefixed_payload(frame: bytes, offset: int) -> tuple[bytes, int]:
+def _read_length_prefixed_payload(frame: bytes, offset: int) -> Tuple[bytes, int]:
     payload_length = _read_uint32(frame, offset, "payload_length")
     payload_start = offset + 4
     payload_end = payload_start + payload_length

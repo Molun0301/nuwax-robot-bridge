@@ -23,7 +23,7 @@ import struct
 import sys
 import threading
 import time
-from typing import Any
+from typing import Dict, List, Optional, Any
 
 
 logger = logging.getLogger(__name__)
@@ -88,7 +88,7 @@ class RobotWebRTCAudioHubClient:
         self._megaphone_audio_format = "pcm"
         self._megaphone_streamed_bytes = 0
 
-    def status(self) -> dict[str, Any]:
+    def status(self) -> Dict[str, Any]:
         return {
             "connected": self._connected,
             "robot_ip": self.robot_ip,
@@ -199,7 +199,7 @@ class RobotWebRTCAudioHubClient:
     def pause(self) -> None:
         self._webrtc_request(AUDIO_API["PAUSE"], {})
 
-    def upload_and_play_wav(self, wav_bytes: bytes, file_name: str) -> dict[str, Any]:
+    def upload_and_play_wav(self, wav_bytes: bytes, file_name: str) -> Dict[str, Any]:
         self.connect()
         unique_id = self._upload_audio_to_robot(wav_bytes, file_name)
         self._play_audio_on_robot(unique_id)
@@ -212,7 +212,7 @@ class RobotWebRTCAudioHubClient:
             "bytes_uploaded": len(wav_bytes),
         }
 
-    def upload_megaphone_wav(self, wav_bytes: bytes, duration_sec: float) -> dict[str, Any]:
+    def upload_megaphone_wav(self, wav_bytes: bytes, duration_sec: float) -> Dict[str, Any]:
         self.connect()
         self._upload_and_play_megaphone(wav_bytes, duration_sec)
         self._last_uploaded_name = "megaphone"
@@ -228,7 +228,7 @@ class RobotWebRTCAudioHubClient:
         sample_rate: int,
         channels: int,
         audio_format: str = "pcm",
-    ) -> dict[str, Any]:
+    ) -> Dict[str, Any]:
         """开始实时 megaphone 会话。
 
         这里会先进入 megaphone 模式，并发送一个带超大占位长度的 WAV 头，
@@ -278,7 +278,7 @@ class RobotWebRTCAudioHubClient:
         self._send_megaphone_payload(payload)
         self._megaphone_streamed_bytes += len(payload)
 
-    def finish_streaming_megaphone(self, duration_sec: float = 0.0) -> dict[str, Any]:
+    def finish_streaming_megaphone(self, duration_sec: float = 0.0) -> Dict[str, Any]:
         """结束实时 megaphone 会话。
 
         会在退出前留一个很短的尾巴时间，让机器人端把已经收到的音频播完。
@@ -373,7 +373,7 @@ class RobotWebRTCAudioHubClient:
             return
         logger.error("robot_webrtc 异步事件异常: %s", message or context)
 
-    def _publish_request(self, topic: str, data: dict[str, Any]) -> Any:
+    def _publish_request(self, topic: str, data: Dict[str, Any]) -> Any:
         if not self._connected or self._loop is None or self._conn is None:
             raise RobotWebRTCError("机器人 WebRTC 尚未连接")
         future = asyncio.run_coroutine_threadsafe(
@@ -389,7 +389,7 @@ class RobotWebRTCAudioHubClient:
             self._last_error = self._format_error(exc)
             raise RobotWebRTCError(self._last_error) from exc
 
-    def _webrtc_request(self, api_id: int, parameter: dict[str, Any] | None = None) -> Any:
+    def _webrtc_request(self, api_id: int, parameter: Optional[Dict[str, Any]] = None) -> Any:
         if self._rtc_topic is None:
             raise RobotWebRTCError("机器人 WebRTC 主题未初始化")
         request_data = {
@@ -533,7 +533,7 @@ class RobotWebRTCAudioHubClient:
         )
 
     @staticmethod
-    def _extract_audio_list(response: Any) -> list[dict[str, Any]]:
+    def _extract_audio_list(response: Any) -> List[Dict[str, Any]]:
         if not isinstance(response, dict):
             return []
         data = response.get("data")

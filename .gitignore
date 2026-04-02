@@ -1,6 +1,9 @@
 .env
 go2_proxy.log
+nuwax_robot_bridge.log
 __pycache__/
 *.pyc
 .claude/
-
+docs/内部开发文档/
+runtime_data/**/*.db
+artifacts/

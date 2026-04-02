@@ -1,0 +1,239 @@
+from __future__ import annotations
+
+from datetime import datetime
+
+from compat import StrEnum
+
+from pydantic import Field, field_validator
+
+from contracts.base import ContractModel, MetadataDict, TimestampedContract
+from contracts.geometry import Pose, Vector3
+from contracts.naming import (
+    validate_anchor_id,
+    validate_instance_id,
+    validate_navigation_candidate_id,
+    validate_observation_event_id,
+)
+from typing import List, Optional
+
+
+class SpatialAnchorKind(StrEnum):
+    """空间锚点类型。"""
+
+    PLACE_NODE = "place_node"
+    TOPOLOGY_NODE = "topology_node"
+    SEMANTIC_REGION = "semantic_region"
+    OBJECT_INSTANCE = "object_instance"
+
+
+class InstanceMovability(StrEnum):
+    """实例可移动性分类。"""
+
+    STATIC = "static"
+    MOVABLE = "movable"
+    TRANSIENT = "transient"
+
+
+class InstanceLifecycleState(StrEnum):
+    """实例生命周期状态。"""
+
+    ACTIVE = "active"
+    UNCERTAIN = "uncertain"
+    STALE = "stale"
+    REMOVED = "removed"
+
+
+class SpatialAnchor(TimestampedContract):
+    """可长期引用的空间锚点。"""
+
+    anchor_id: str = Field(description="锚点标识。")
+    anchor_kind: SpatialAnchorKind = Field(description="锚点类型。")
+    name: str = Field(description="锚点名称。")
+    pose: Pose = Field(description="锚点位姿，统一使用 map frame。")
+    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点。")
+    semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域。")
+    semantic_labels: List[str] = Field(default_factory=list, description="关联语义标签。")
+    inspection_poses: List[Pose] = Field(default_factory=list, description="建议巡检位姿列表。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("anchor_id")
+    @classmethod
+    def _validate_anchor_id(cls, value: str) -> str:
+        return validate_anchor_id(value)
+
+
+class SemanticRegion(TimestampedContract):
+    """面向记忆和导航消费的语义区域。"""
+
+    region_id: str = Field(description="区域标识。")
+    anchor_id: str = Field(description="区域锚点标识。")
+    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    frame_id: str = Field(description="区域坐标系，统一应为 map。")
+    label: str = Field(description="区域主标签。")
+    aliases: List[str] = Field(default_factory=list, description="区域别名。")
+    centroid: Optional[Pose] = Field(default=None, description="区域中心位姿。")
+    polygon_points: List[Vector3] = Field(default_factory=list, description="区域轮廓点集合。")
+    topo_node_ids: List[str] = Field(default_factory=list, description="关联拓扑节点集合。")
+    inspection_poses: List[Pose] = Field(default_factory=list, description="建议巡检位姿列表。")
+    attributes: MetadataDict = Field(default_factory=dict, description="附加属性。")
+
+    @field_validator("anchor_id")
+    @classmethod
+    def _validate_region_anchor_id(cls, value: str) -> str:
+        return validate_anchor_id(value)
+
+
+class SemanticInstance(TimestampedContract):
+    """投影并关联后的语义实例，代表世界中的持续对象实体。"""
+
+    instance_id: str = Field(description="实例标识。")
+    anchor_id: str = Field(description="实例空间锚点标识。")
+    label: str = Field(description="实例主标签。")
+    display_name: Optional[str] = Field(default=None, description="展示名称。")
+    pose: Pose = Field(description="实例位姿，统一使用 map frame。")
+    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点。")
+    semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域。")
+    instance_type: str = Field(default="object", description="实例类型。")
+    movability: InstanceMovability = Field(default=InstanceMovability.MOVABLE, description="可移动性分类。")
+    lifecycle_state: InstanceLifecycleState = Field(
+        default=InstanceLifecycleState.ACTIVE,
+        description="生命周期状态。",
+    )
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="当前综合置信度。")
+    observation_count: int = Field(default=0, ge=0, description="累计观察次数。")
+    first_seen_ts: datetime = Field(description="首次观察时间。")
+    last_seen_ts: datetime = Field(description="最近观察时间。")
+    last_observation_event_id: Optional[str] = Field(default=None, description="最近关联的观察事件。")
+    supporting_observation_event_ids: List[str] = Field(default_factory=list, description="支持该实例的观察事件。")
+    artifact_ids: List[str] = Field(default_factory=list, description="关联制品。")
+    semantic_labels: List[str] = Field(default_factory=list, description="语义标签。")
+    visual_labels: List[str] = Field(default_factory=list, description="视觉目标标签。")
+    vision_tags: List[str] = Field(default_factory=list, description="视觉语义标签。")
+    inspection_poses: List[Pose] = Field(default_factory=list, description="建议巡检位姿列表。")
+    attributes: MetadataDict = Field(default_factory=dict, description="附加属性。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("instance_id")
+    @classmethod
+    def _validate_instance_id(cls, value: str) -> str:
+        return validate_instance_id(value)
+
+    @field_validator("anchor_id")
+    @classmethod
+    def _validate_instance_anchor_id(cls, value: str) -> str:
+        return validate_anchor_id(value)
+
+    @field_validator("last_observation_event_id")
+    @classmethod
+    def _validate_last_event_id(cls, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return value
+        return validate_observation_event_id(value)
+
+
+class ObservationEvent(TimestampedContract):
+    """一次带空间锚定的观察事件，代表不可回写的事实层记录。"""
+
+    event_id: str = Field(description="观察事件标识。")
+    title: str = Field(description="事件标题。")
+    summary: str = Field(description="事件摘要。")
+    camera_id: Optional[str] = Field(default=None, description="来源相机。")
+    pose: Optional[Pose] = Field(default=None, description="事件发生位姿。")
+    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点。")
+    semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域。")
+    anchor_id: Optional[str] = Field(default=None, description="关联锚点。")
+    source_observation_id: Optional[str] = Field(default=None, description="来源观察标识。")
+    source_memory_id: Optional[str] = Field(default=None, description="来源记忆标识。")
+    linked_instance_ids: List[str] = Field(default_factory=list, description="关联实例集合。")
+    artifact_ids: List[str] = Field(default_factory=list, description="关联制品。")
+    semantic_labels: List[str] = Field(default_factory=list, description="语义标签。")
+    visual_labels: List[str] = Field(default_factory=list, description="视觉目标标签。")
+    vision_tags: List[str] = Field(default_factory=list, description="视觉语义标签。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("event_id")
+    @classmethod
+    def _validate_event_id(cls, value: str) -> str:
+        return validate_observation_event_id(value)
+
+    @field_validator("anchor_id")
+    @classmethod
+    def _validate_event_anchor_id(cls, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return value
+        return validate_anchor_id(value)
+
+
+class NavigationCandidate(TimestampedContract):
+    """面向导航层输出的空间候选。"""
+
+    candidate_id: str = Field(description="导航候选标识。")
+    anchor_id: str = Field(description="关联锚点标识。")
+    source_collection: str = Field(description="来源集合，例如 place_nodes、object_instances。")
+    record_id: str = Field(description="来源记录标识。")
+    target_name: str = Field(description="导航目标名称。")
+    inspection_pose: Pose = Field(description="建议用于导航的巡检位姿。")
+    anchor_pose: Optional[Pose] = Field(default=None, description="锚点中心位姿。")
+    map_version_id: Optional[str] = Field(default=None, description="关联地图版本。")
+    topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点。")
+    semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域。")
+    distance_m: Optional[float] = Field(default=None, ge=0.0, description="相对当前位姿的距离。")
+    score: float = Field(default=0.0, ge=0.0, le=1.0, description="综合候选分数。")
+    verification_query: Optional[str] = Field(default=None, description="建议到点后复核的文本。")
+    verification_artifact_id: Optional[str] = Field(default=None, description="复核参考制品。")
+    verification_event_id: Optional[str] = Field(default=None, description="复核参考观察事件。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("candidate_id")
+    @classmethod
+    def _validate_candidate_id(cls, value: str) -> str:
+        return validate_navigation_candidate_id(value)
+
+    @field_validator("anchor_id")
+    @classmethod
+    def _validate_candidate_anchor_id(cls, value: str) -> str:
+        return validate_anchor_id(value)
+
+    @field_validator("verification_event_id")
+    @classmethod
+    def _validate_candidate_event_id(cls, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return value
+        return validate_observation_event_id(value)
+
+
+class VerificationResult(TimestampedContract):
+    """导航到点后的复核结果。"""
+
+    anchor_id: Optional[str] = Field(default=None, description="复核目标锚点。")
+    verified: bool = Field(description="是否通过复核。")
+    score: float = Field(ge=0.0, le=1.0, description="综合复核分数。")
+    reason: Optional[str] = Field(default=None, description="复核原因说明。")
+    matched_labels: List[str] = Field(default_factory=list, description="当前场景命中的标签。")
+    matched_instance_ids: List[str] = Field(default_factory=list, description="命中的实例标识。")
+    matched_observation_event_ids: List[str] = Field(default_factory=list, description="命中的观察事件。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+    @field_validator("anchor_id")
+    @classmethod
+    def _validate_verification_anchor_id(cls, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return value
+        return validate_anchor_id(value)
+
+
+class GroundingQueryPlan(ContractModel):
+    """自然语言 grounding 规划结果。"""
+
+    raw_query: str = Field(description="原始查询文本。")
+    normalized_query: str = Field(description="归一化查询文本。")
+    intent: str = Field(description="解析出的意图。")
+    target_class: Optional[str] = Field(default=None, description="目标类别。")
+    attributes: List[str] = Field(default_factory=list, description="属性词集合。")
+    spatial_hint: Optional[str] = Field(default=None, description="空间提示。")
+    temporal_hint: Optional[str] = Field(default=None, description="时间提示。")
+    preferred_collections: List[str] = Field(default_factory=list, description="优先检索的集合。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")

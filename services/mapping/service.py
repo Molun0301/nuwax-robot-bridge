@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+from collections import deque
+
+from contracts.events import RuntimeEventCategory
+from contracts.runtime_views import MapSnapshot
+from core import EventBus, StateNamespace, StateStore
+from gateways.errors import GatewayError
+from providers import MapProvider
+from typing import Deque, Dict, List, Optional, Tuple
+
+
+class MappingService:
+    """统一地图快照与版本管理服务。"""
+
+    def __init__(
+        self,
+        *,
+        provider_owner,
+        state_store: StateStore,
+        event_bus: Optional[EventBus] = None,
+        history_limit: int = 100,
+    ) -> None:
+        self._provider_owner = provider_owner
+        self._state_store = state_store
+        self._event_bus = event_bus
+        self._history: Deque[MapSnapshot] = deque(maxlen=max(1, history_limit))
+        self._latest_snapshot: Optional[MapSnapshot] = None
+        self._revision_by_source: Dict[str, int] = {}
+
+    def refresh(self) -> MapSnapshot:
+        """从本地图提供器刷新地图快照。"""
+
+        provider = self._get_map_provider()
+        return self.ingest_external_snapshot(
+            source_name=provider.provider_name,
+            occupancy_grid=provider.get_occupancy_grid(),
+            cost_map=provider.get_cost_map(),
+            semantic_map=provider.get_semantic_map(),
+            metadata={"source_kind": "provider", "provider_version": provider.provider_version},
+        )
+
+    def ingest_external_snapshot(
+        self,
+        *,
+        source_name: str,
+        occupancy_grid=None,
+        cost_map=None,
+        semantic_map=None,
+        metadata: Optional[Dict[str, object]] = None,
+    ) -> MapSnapshot:
+        """写入来自适配器或外部系统的地图快照。"""
+
+        if occupancy_grid is None and cost_map is None and semantic_map is None:
+            raise GatewayError("地图快照至少需要包含 occupancy_grid、cost_map、semantic_map 之一。")
+
+        revision = self._revision_by_source.get(source_name, 0) + 1
+        self._revision_by_source[source_name] = revision
+        snapshot = MapSnapshot(
+            source_name=source_name,
+            version_id=self._build_version_id(source_name, revision),
+            revision=revision,
+            occupancy_grid=occupancy_grid,
+            cost_map=cost_map,
+            semantic_map=semantic_map,
+            metadata={
+                "available_layers": self._build_available_layers(occupancy_grid, cost_map, semantic_map),
+                **dict(metadata or {}),
+            },
+        )
+        self._latest_snapshot = snapshot
+        self._history.append(snapshot)
+        self._state_store.write(
+            StateNamespace.MAP,
+            source_name,
+            snapshot,
+            source=source_name,
+            metadata={"kind": "latest_map", "version_id": snapshot.version_id, "revision": revision},
+        )
+
+        if self._event_bus is not None:
+            self._event_bus.publish(
+                self._event_bus.build_event(
+                    "mapping.snapshot_ready",
+                    category=RuntimeEventCategory.ROBOT,
+                    source="mapping_service",
+                    message="地图快照已更新。",
+                    payload={
+                        "source_name": source_name,
+                        "version_id": snapshot.version_id,
+                        "revision": revision,
+                    },
+                )
+            )
+        return snapshot
+
+    def get_latest_snapshot(self) -> Optional[MapSnapshot]:
+        """返回最新地图快照。"""
+
+        return self._latest_snapshot
+
+    def list_history(self, *, limit: Optional[int] = None) -> Tuple[MapSnapshot, ...]:
+        """返回地图历史。"""
+
+        items = list(self._history)
+        if limit is not None:
+            items = items[-max(0, limit) :]
+        return tuple(items)
+
+    def is_available(self) -> bool:
+        """判断地图服务当前是否可用。"""
+
+        return self._latest_snapshot is not None or self._find_map_provider() is not None
+
+    def _build_available_layers(self, occupancy_grid, cost_map, semantic_map) -> List[str]:
+        layers: List[str] = []
+        if occupancy_grid is not None:
+            layers.append("occupancy_grid")
+        if cost_map is not None:
+            layers.append("cost_map")
+        if semantic_map is not None:
+            layers.append("semantic_map")
+        return layers
+
+    def _build_version_id(self, source_name: str, revision: int) -> str:
+        normalized = []
+        for char in source_name.lower():
+            if char.isalnum():
+                normalized.append(char)
+            else:
+                normalized.append("_")
+        safe_source = "".join(normalized).strip("_") or "map"
+        return f"mapv_{safe_source}_{revision:06d}"
+
+    def _get_map_provider(self) -> MapProvider:
+        provider = self._find_map_provider()
+        if provider is None:
+            raise GatewayError("当前机器人入口未提供地图提供器。")
+        if not provider.is_available():
+            raise GatewayError("当前地图提供器暂不可用。")
+        return provider
+
+    def _find_map_provider(self) -> Optional[MapProvider]:
+        providers = getattr(self._provider_owner, "providers", None)
+        if providers is None or not isinstance(providers, MapProvider):
+            return None
+        return providers

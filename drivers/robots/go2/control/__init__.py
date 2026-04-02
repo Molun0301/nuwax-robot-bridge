@@ -2,22 +2,21 @@
 # -*- coding:utf-8 -*-
 
 """
-Go2 控制模块
+Go2 低层控制模块。
 """
 
-from .joint_config import (
-    LegID,
-    JOINT_NAMES,
-    SAFETY_LIMITS,
-    DEFAULT_KP,
+from drivers.robots.go2.control.joint_config import (
     DEFAULT_KD,
-    get_joint_id,
-    get_joint_name,
+    DEFAULT_KP,
+    JOINT_NAMES,
+    LegID,
+    SAFETY_LIMITS,
     check_safety_limit,
     clamp_position,
+    get_joint_id,
+    get_joint_name,
 )
-
-from .low_level_controller import LowLevelController
+from drivers.robots.go2.control.low_level_controller import LowLevelController
 
 __all__ = [
     "LegID",

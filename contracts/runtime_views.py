@@ -1,0 +1,139 @@
+from __future__ import annotations
+
+from compat import StrEnum
+
+from pydantic import Field
+
+from contracts.artifacts import ArtifactRef
+from contracts.base import MetadataDict, TimestampedContract
+from contracts.geometry import FrameTree, Pose
+from contracts.image import CameraInfo
+from contracts.maps import CostMap, OccupancyGrid, SemanticMap
+from contracts.navigation import ExplorationState, ExploreAreaRequest, NavigationGoal, NavigationState
+from contracts.perception import Observation
+from contracts.robot_state import RobotState, SafetyState
+from typing import List, Optional
+
+
+class DiagnosticLevel(StrEnum):
+    """诊断等级。"""
+
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+
+
+class DiagnosticItem(TimestampedContract):
+    """单条诊断项。"""
+
+    component: str = Field(description="诊断组件。")
+    level: DiagnosticLevel = Field(description="诊断等级。")
+    message: str = Field(description="诊断说明。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+
+class DiagnosticSnapshot(TimestampedContract):
+    """一次状态采样对应的诊断快照。"""
+
+    robot_name: str = Field(description="机器人名称。")
+    items: List[DiagnosticItem] = Field(default_factory=list, description="诊断项列表。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+
+class RobotStatusSnapshot(TimestampedContract):
+    """机器人状态服务返回的聚合快照。"""
+
+    robot_name: str = Field(description="机器人名称。")
+    robot_model: str = Field(description="机器人型号。")
+    assembly_status: MetadataDict = Field(default_factory=dict, description="装配状态。")
+    robot_state: RobotState = Field(description="机器人状态。")
+    safety_state: SafetyState = Field(description="安全状态。")
+    diagnostics: List[DiagnosticItem] = Field(default_factory=list, description="诊断项列表。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加信息。")
+
+
+class ObservationContext(TimestampedContract):
+    """观察上下文。"""
+
+    camera_id: str = Field(description="观察所属相机。")
+    observation: Observation = Field(description="观察结果。")
+    image_artifact: Optional[ArtifactRef] = Field(default=None, description="关联图像制品。")
+    camera_info: Optional[CameraInfo] = Field(default=None, description="相机参数。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加上下文。")
+
+
+class SceneObjectSummary(TimestampedContract):
+    """单类目标的场景摘要。"""
+
+    label: str = Field(description="目标标签。")
+    count: int = Field(default=0, ge=0, description="当前检测到的数量。")
+    tracked_count: int = Field(default=0, ge=0, description="当前处于可跟踪状态的数量。")
+    max_score: float = Field(default=0.0, ge=0.0, le=1.0, description="当前最高置信度。")
+    camera_ids: List[str] = Field(default_factory=list, description="出现过的相机标识。")
+    track_ids: List[str] = Field(default_factory=list, description="关联轨迹标识。")
+    attributes: MetadataDict = Field(default_factory=dict, description="附加属性。")
+
+
+class SceneSummary(TimestampedContract):
+    """面向上层技能的场景语义摘要。"""
+
+    headline: str = Field(description="一句话中文摘要。")
+    details: List[str] = Field(default_factory=list, description="结构化中文要点。")
+    objects: List[SceneObjectSummary] = Field(default_factory=list, description="按标签聚合的目标摘要。")
+    detection_count: int = Field(default=0, ge=0, description="当前二维检测数量。")
+    active_track_count: int = Field(default=0, ge=0, description="当前活跃轨迹数量。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加摘要元数据。")
+
+
+class PerceptionContext(TimestampedContract):
+    """感知处理上下文。"""
+
+    camera_id: str = Field(description="感知所属相机。")
+    observation: Observation = Field(description="标准观察结果。")
+    scene_summary: SceneSummary = Field(description="结构化场景摘要。")
+    image_artifact: Optional[ArtifactRef] = Field(default=None, description="关联图像制品。")
+    camera_info: Optional[CameraInfo] = Field(default=None, description="相机参数。")
+    pipeline_name: str = Field(description="处理管线名称。")
+    detector_backend: str = Field(description="检测后端名称。")
+    tracker_backend: str = Field(description="跟踪后端名称。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加上下文。")
+
+
+class LocalizationSnapshot(TimestampedContract):
+    """定位服务快照。"""
+
+    source_name: str = Field(description="定位来源名称。")
+    current_pose: Optional[Pose] = Field(default=None, description="当前位姿。")
+    frame_tree: Optional[FrameTree] = Field(default=None, description="当前坐标树快照。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+
+class MapSnapshot(TimestampedContract):
+    """地图服务快照。"""
+
+    source_name: str = Field(description="地图来源名称。")
+    version_id: str = Field(description="地图版本标识。")
+    revision: int = Field(default=1, ge=1, description="来源内递增版本号。")
+    occupancy_grid: Optional[OccupancyGrid] = Field(default=None, description="占据栅格地图。")
+    cost_map: Optional[CostMap] = Field(default=None, description="代价地图。")
+    semantic_map: Optional[SemanticMap] = Field(default=None, description="语义地图。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+
+class NavigationContext(TimestampedContract):
+    """导航服务上下文。"""
+
+    current_goal: Optional[NavigationGoal] = Field(default=None, description="当前导航目标。")
+    navigation_state: NavigationState = Field(description="导航状态。")
+    backend_name: Optional[str] = Field(default=None, description="导航后端名称。")
+    goal_reached: bool = Field(default=False, description="当前目标是否到达。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+
+
+class ExplorationContext(TimestampedContract):
+    """探索服务上下文。"""
+
+    current_request: Optional[ExploreAreaRequest] = Field(default=None, description="当前探索请求。")
+    exploration_state: ExplorationState = Field(description="探索状态。")
+    backend_name: Optional[str] = Field(default=None, description="探索后端名称。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")

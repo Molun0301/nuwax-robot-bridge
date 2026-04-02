@@ -19,6 +19,7 @@ import logging
 import os
 from pathlib import Path
 import threading
+from typing import Deque, Dict, Tuple
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -33,7 +34,7 @@ def _strip_quotes(value: str) -> str:
     return value
 
 
-def _load_file_values() -> dict[str, str]:
+def _load_file_values() -> Dict[str, str]:
     values = {}
     for file_path in (LEGACY_CONFIG_FILE, ENV_FILE):
         if not file_path.exists():
@@ -86,6 +87,18 @@ def _cfg_bool(name: str, default: bool) -> bool:
     if not value.strip():
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _cfg_csv(name: str, default: Tuple[str, ...] = ()) -> Tuple[str, ...]:
+    value = _raw_value(name, "")
+    if not value.strip():
+        return default
+    items = []
+    for raw_item in value.split(","):
+        item = raw_item.strip()
+        if item:
+            items.append(item)
+    return tuple(items)
 
 
 def _clamp_volume(value: float) -> float:
@@ -244,25 +257,123 @@ class VolumeControlConfig:
 
 
 @dataclass
+class PerceptionYoloConfig:
+    """本地 YOLO 感知配置。"""
+
+    enabled: bool = True
+    backend_name: str = "yolo_local"
+    model_name: str = "yolo26n.pt"
+    device: str = ""
+    image_size: int = 640
+    confidence_threshold: float = 0.25
+    iou_threshold: float = 0.45
+    max_detections: int = 100
+
+
+@dataclass
+class PerceptionOpenAIVisionConfig:
+    """云端视觉语义配置。"""
+
+    enabled: bool = False
+    backend_name: str = "openai_vision"
+    base_url: str = "https://api.openai.com/v1"
+    api_key: str = ""
+    model_name: str = ""
+    timeout_sec: float = 20.0
+    max_tokens: int = 700
+    temperature: float = 0.0
+
+
+@dataclass
+class PerceptionConfig:
+    """统一视觉感知配置。"""
+
+    default_detector_backend: str = "yolo_local"
+    default_scene_backend: str = "hybrid_scene"
+    yolo: PerceptionYoloConfig = field(default_factory=PerceptionYoloConfig)
+    openai_vision: PerceptionOpenAIVisionConfig = field(default_factory=PerceptionOpenAIVisionConfig)
+
+
+@dataclass
+class RuntimeDataConfig:
+    """状态、观察与制品运行时配置。"""
+
+    state_history_limit: int = 200
+    diagnostic_history_limit: int = 200
+    observation_history_limit: int = 100
+    perception_history_limit: int = 100
+    localization_history_limit: int = 100
+    map_history_limit: int = 100
+    navigation_history_limit: int = 100
+    memory_history_limit: int = 200
+    memory_db_path: str = ""
+    memory_embedding_model: str = "hashing-v1"
+    memory_embedding_dimension: int = 256
+    memory_image_embedding_model: str = "disabled"
+    memory_image_embedding_dimension: int = 512
+    memory_vector_store_backend: str = "sqlite_named_vectors"
+    artifact_retention_days: int = 7
+    artifact_max_count: int = 1000
+    artifact_max_total_bytes: int = 1073741824
+    artifact_cleanup_batch_size: int = 200
+
+
+@dataclass
 class NuwaxRobotBridgeConfig:
     """项目总配置。"""
 
     base_dir: str
     logging: LoggingConfig
     tcp: TcpServerConfig
+    gateway: "GatewayServerConfig"
+    relay: "RelayServerConfig"
+    runtime_data: RuntimeDataConfig
     dds: DDSConfig
     low_level: LowLevelControlConfig
     tts: TTSPlayerConfig
     doubao: DoubaoConfig
     log_tts: TTSLogBridgeConfig
     volume: VolumeControlConfig
+    perception: PerceptionConfig
+
+
+@dataclass
+class GatewayServerConfig:
+    """宿主机网关配置。"""
+
+    host: str = "0.0.0.0"
+    port: int = 8766
+    public_base_url: str = "http://host.docker.internal:8766"
+    artifact_dir: str = ""
+    agent_tokens: Tuple[str, ...] = ()
+    admin_tokens: Tuple[str, ...] = ()
+    agent_high_risk_allowlist: Tuple[str, ...] = ()
+    allowed_source_cidrs: Tuple[str, ...] = ("127.0.0.1/32",)
+    allow_unknown_client_hosts: bool = True
+    sse_keepalive_sec: float = 10.0
+    ws_ping_interval_sec: float = 15.0
+
+
+@dataclass
+class RelayServerConfig:
+    """容器内边车转发器配置。"""
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 9766
+    upstream_base_url: str = "http://host.docker.internal:8766"
+    incoming_tokens: Tuple[str, ...] = ()
+    upstream_token: str = ""
 
 
 def load_config() -> NuwaxRobotBridgeConfig:
     """统一加载配置。"""
 
-    log_dir = _cfg_str("GO2_PROXY_LOG_DIR", str(BASE_DIR))
-    log_file = _cfg_str("GO2_PROXY_LOG_FILE", str(Path(log_dir) / "go2_proxy.log"))
+    log_dir = _cfg_str("NUWAX_LOG_DIR", _cfg_str("GO2_PROXY_LOG_DIR", str(BASE_DIR)))
+    log_file = _cfg_str(
+        "NUWAX_LOG_FILE",
+        _cfg_str("GO2_PROXY_LOG_FILE", str(Path(log_dir) / "nuwax_robot_bridge.log")),
+    )
 
     local_playback = LocalPlaybackConfig(
         preferred_backend=_cfg_str("TTS_PLAYER_PREFERRED_BACKEND", "aplay"),
@@ -361,6 +472,40 @@ def load_config() -> NuwaxRobotBridgeConfig:
         audio_command_timeout=_cfg_float("GO2_AUDIO_COMMAND_TIMEOUT", 1.0),
     )
 
+    perception = PerceptionConfig(
+        default_detector_backend=_cfg_str("NUWAX_PERCEPTION_DEFAULT_DETECTOR_BACKEND", "yolo_local"),
+        default_scene_backend=_cfg_str("NUWAX_PERCEPTION_DEFAULT_SCENE_BACKEND", "hybrid_scene"),
+        yolo=PerceptionYoloConfig(
+            enabled=_cfg_bool("NUWAX_PERCEPTION_YOLO_ENABLED", True),
+            backend_name=_cfg_str("NUWAX_PERCEPTION_YOLO_BACKEND_NAME", "yolo_local"),
+            model_name=_cfg_str("NUWAX_PERCEPTION_YOLO_MODEL", "yolo26n.pt"),
+            device=_cfg_str("NUWAX_PERCEPTION_YOLO_DEVICE", ""),
+            image_size=max(32, _cfg_int("NUWAX_PERCEPTION_YOLO_IMAGE_SIZE", 640)),
+            confidence_threshold=max(
+                0.0,
+                min(1.0, _cfg_float("NUWAX_PERCEPTION_YOLO_CONFIDENCE", 0.25)),
+            ),
+            iou_threshold=max(
+                0.0,
+                min(1.0, _cfg_float("NUWAX_PERCEPTION_YOLO_IOU", 0.45)),
+            ),
+            max_detections=max(1, _cfg_int("NUWAX_PERCEPTION_YOLO_MAX_DETECTIONS", 100)),
+        ),
+        openai_vision=PerceptionOpenAIVisionConfig(
+            enabled=_cfg_bool("NUWAX_PERCEPTION_OPENAI_ENABLED", False),
+            backend_name=_cfg_str("NUWAX_PERCEPTION_OPENAI_BACKEND_NAME", "openai_vision"),
+            base_url=_cfg_str("NUWAX_PERCEPTION_OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            api_key=_cfg_str(
+                "NUWAX_PERCEPTION_OPENAI_API_KEY",
+                _cfg_str("OPENAI_API_KEY", ""),
+            ),
+            model_name=_cfg_str("NUWAX_PERCEPTION_OPENAI_MODEL", ""),
+            timeout_sec=max(1.0, _cfg_float("NUWAX_PERCEPTION_OPENAI_TIMEOUT_SEC", 20.0)),
+            max_tokens=max(128, _cfg_int("NUWAX_PERCEPTION_OPENAI_MAX_TOKENS", 700)),
+            temperature=max(0.0, _cfg_float("NUWAX_PERCEPTION_OPENAI_TEMPERATURE", 0.0)),
+        ),
+    )
+
     dds = DDSConfig(
         cyclone_dds_uri=_cfg_str(
             "CYCLONEDDS_URI",
@@ -378,30 +523,104 @@ def load_config() -> NuwaxRobotBridgeConfig:
         control_interval_sec=_cfg_float("GO2_LOW_LEVEL_INTERVAL_SEC", 0.002),
     )
 
+    gateway_host = _cfg_str("NUWAX_GATEWAY_HOST", "0.0.0.0")
+    gateway_port = _cfg_int("NUWAX_GATEWAY_PORT", 8766)
+    default_public_base_url = f"http://host.docker.internal:{gateway_port}"
+    gateway = GatewayServerConfig(
+        host=gateway_host,
+        port=gateway_port,
+        public_base_url=_cfg_str("NUWAX_GATEWAY_PUBLIC_BASE_URL", default_public_base_url),
+        artifact_dir=_cfg_str("NUWAX_GATEWAY_ARTIFACT_DIR", str(BASE_DIR / "artifacts")),
+        agent_tokens=_cfg_csv("NUWAX_GATEWAY_AGENT_TOKENS", ("dev-agent-token",)),
+        admin_tokens=_cfg_csv("NUWAX_GATEWAY_ADMIN_TOKENS", ("dev-admin-token",)),
+        agent_high_risk_allowlist=_cfg_csv("NUWAX_GATEWAY_AGENT_HIGH_RISK_ALLOWLIST", ()),
+        allowed_source_cidrs=_cfg_csv("NUWAX_GATEWAY_ALLOWED_SOURCE_CIDRS", ("127.0.0.1/32", "172.17.0.0/16")),
+        allow_unknown_client_hosts=_cfg_bool("NUWAX_GATEWAY_ALLOW_UNKNOWN_CLIENT_HOSTS", True),
+        sse_keepalive_sec=_cfg_float("NUWAX_GATEWAY_SSE_KEEPALIVE_SEC", 10.0),
+        ws_ping_interval_sec=_cfg_float("NUWAX_GATEWAY_WS_PING_INTERVAL_SEC", 15.0),
+    )
+
+    relay = RelayServerConfig(
+        enabled=_cfg_bool("NUWAX_RELAY_ENABLED", False),
+        host=_cfg_str("NUWAX_RELAY_HOST", "127.0.0.1"),
+        port=_cfg_int("NUWAX_RELAY_PORT", 9766),
+        upstream_base_url=_cfg_str("NUWAX_RELAY_UPSTREAM_BASE_URL", gateway.public_base_url),
+        incoming_tokens=_cfg_csv("NUWAX_RELAY_INCOMING_TOKENS", gateway.agent_tokens),
+        upstream_token=_cfg_str(
+            "NUWAX_RELAY_UPSTREAM_TOKEN",
+            gateway.agent_tokens[0] if gateway.agent_tokens else "",
+        ),
+    )
+
+    runtime_data = RuntimeDataConfig(
+        state_history_limit=max(1, _cfg_int("NUWAX_STATE_HISTORY_LIMIT", 200)),
+        diagnostic_history_limit=max(1, _cfg_int("NUWAX_DIAGNOSTIC_HISTORY_LIMIT", 200)),
+        observation_history_limit=max(1, _cfg_int("NUWAX_OBSERVATION_HISTORY_LIMIT", 100)),
+        perception_history_limit=max(1, _cfg_int("NUWAX_PERCEPTION_HISTORY_LIMIT", 100)),
+        localization_history_limit=max(1, _cfg_int("NUWAX_LOCALIZATION_HISTORY_LIMIT", 100)),
+        map_history_limit=max(1, _cfg_int("NUWAX_MAP_HISTORY_LIMIT", 100)),
+        navigation_history_limit=max(1, _cfg_int("NUWAX_NAVIGATION_HISTORY_LIMIT", 100)),
+        memory_history_limit=max(1, _cfg_int("NUWAX_MEMORY_HISTORY_LIMIT", 200)),
+        memory_db_path=_cfg_str(
+            "NUWAX_MEMORY_DB_PATH",
+            str(BASE_DIR / "runtime_data" / "memory" / "vector_memory.db"),
+        ),
+        # 兼容旧部署的通用变量名，但新配置统一应使用
+        # NUWAX_MEMORY_TEXT_EMBEDDING_* 与 NUWAX_MEMORY_IMAGE_EMBEDDING_*。
+        memory_embedding_model=_cfg_str(
+            "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL",
+            _cfg_str("NUWAX_MEMORY_EMBEDDING_MODEL", "hashing-v1"),
+        ),
+        memory_embedding_dimension=max(
+            8,
+            _cfg_int(
+                "NUWAX_MEMORY_TEXT_EMBEDDING_DIM",
+                _cfg_int("NUWAX_MEMORY_EMBEDDING_DIM", 256),
+            ),
+        ),
+        memory_image_embedding_model=_cfg_str("NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL", "disabled"),
+        memory_image_embedding_dimension=max(8, _cfg_int("NUWAX_MEMORY_IMAGE_EMBEDDING_DIM", 512)),
+        memory_vector_store_backend=_cfg_str("NUWAX_MEMORY_VECTOR_STORE_BACKEND", "sqlite_named_vectors"),
+        artifact_retention_days=max(1, _cfg_int("NUWAX_ARTIFACT_RETENTION_DAYS", 7)),
+        artifact_max_count=max(1, _cfg_int("NUWAX_ARTIFACT_MAX_COUNT", 1000)),
+        artifact_max_total_bytes=max(1, _cfg_int("NUWAX_ARTIFACT_MAX_TOTAL_BYTES", 1073741824)),
+        artifact_cleanup_batch_size=max(1, _cfg_int("NUWAX_ARTIFACT_CLEANUP_BATCH_SIZE", 200)),
+    )
+
     return NuwaxRobotBridgeConfig(
         base_dir=str(BASE_DIR),
         logging=LoggingConfig(
             log_dir=log_dir,
             log_file=log_file,
-            level=_cfg_str("GO2_PROXY_LOG_LEVEL", "INFO"),
-            max_lines=max(0, _cfg_int("GO2_PROXY_LOG_MAX_LINES", 100000)),
-            trim_check_interval=max(1, _cfg_int("GO2_PROXY_LOG_TRIM_CHECK_INTERVAL", 200)),
+            level=_cfg_str("NUWAX_LOG_LEVEL", _cfg_str("GO2_PROXY_LOG_LEVEL", "INFO")),
+            max_lines=max(0, _cfg_int("NUWAX_LOG_MAX_LINES", _cfg_int("GO2_PROXY_LOG_MAX_LINES", 100000))),
+            trim_check_interval=max(
+                1,
+                _cfg_int(
+                    "NUWAX_LOG_TRIM_CHECK_INTERVAL",
+                    _cfg_int("GO2_PROXY_LOG_TRIM_CHECK_INTERVAL", 200),
+                ),
+            ),
         ),
         tcp=TcpServerConfig(
             host=_cfg_str("GO2_PROXY_TCP_HOST", "0.0.0.0"),
             port=_cfg_int("GO2_PROXY_TCP_PORT", 8765),
         ),
+        gateway=gateway,
+        relay=relay,
+        runtime_data=runtime_data,
         dds=dds,
         low_level=low_level,
         tts=tts_player,
         doubao=doubao,
         log_tts=log_tts,
         volume=volume,
+        perception=perception,
     )
 
 
 class _NoisyLogFilter(logging.Filter):
-    """过滤第三方库的高频低价值日志，避免 proxy.log 爆量。"""
+    """过滤第三方库的高频低价值日志，避免运行日志爆量。"""
 
     _DROP_PATTERNS = (
         "Received message on data channel:",
@@ -470,7 +689,7 @@ class _LineLimitedFileHandler(logging.FileHandler):
             if not path.exists():
                 return
 
-            tail_lines: deque[str] = deque(maxlen=self.max_lines)
+            tail_lines: Deque[str] = deque(maxlen=self.max_lines)
             total_lines = 0
             with path.open("r", encoding=self.encoding or "utf-8", errors="ignore") as stream:
                 for raw_line in stream:
@@ -508,6 +727,13 @@ def _configure_third_party_logger_levels() -> None:
         "websockets",
     ):
         logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+    # Uvicorn（ASGI 服务器）默认会挂自己的 handler。
+    # 这里统一改成向根日志传播，确保文件日志和控制台日志口径一致。
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        logger = logging.getLogger(logger_name)
+        logger.handlers = []
+        logger.propagate = True
 
 
 def configure_logging(config: LoggingConfig) -> None:

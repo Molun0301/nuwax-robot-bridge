@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Dict, List, Optional, Tuple, Any
 
 from settings import APP_CONFIG, DoubaoConfig, TTSLogBridgeConfig
 from .doubao_ws import (
@@ -58,7 +58,7 @@ class SpeechSettings:
     explicit_language: str = ""
     model: str = ""
     interrupt: bool = True
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -80,12 +80,12 @@ class SessionState:
     connection_started: asyncio.Event = field(default_factory=asyncio.Event)
     session_started: asyncio.Event = field(default_factory=asyncio.Event)
     session_finished: asyncio.Event = field(default_factory=asyncio.Event)
-    task: asyncio.Task | None = None
+    task: Optional[asyncio.Task] = None
 
 
 def speech_settings_from_log_config(
     config: TTSLogBridgeConfig,
-    credentials: DoubaoConfig | None = None,
+    credentials: Optional[DoubaoConfig] = None,
 ) -> SpeechSettings:
     """将日志桥接配置映射为豆包会话参数。"""
 
@@ -198,7 +198,7 @@ class DoubaoRealtimeClient:
         self.logger.info("本地 Doubao 流式客户端已停止")
         return True
 
-    def status(self) -> dict[str, Any]:
+    def status(self) -> Dict[str, Any]:
         return {
             "running": self._thread is not None and self._thread.is_alive(),
             "active_session_id": self.active_session_id,
@@ -209,7 +209,7 @@ class DoubaoRealtimeClient:
             "default_speaker": self.credentials.default_speaker,
         }
 
-    def start_stream(self, settings: SpeechSettings, session_id: str | None = None) -> str:
+    def start_stream(self, settings: SpeechSettings, session_id: Optional[str] = None) -> str:
         self._ensure_started()
         future = asyncio.run_coroutine_threadsafe(
             self._start_stream_async(settings, session_id=session_id),
@@ -284,7 +284,7 @@ class DoubaoRealtimeClient:
     async def _start_stream_async(
         self,
         settings: SpeechSettings,
-        session_id: str | None = None,
+        session_id: Optional[str] = None,
     ) -> str:
         new_session_id = (session_id or "").strip() or uuid.uuid4().hex
         existing = self.sessions.get(new_session_id)
@@ -407,7 +407,7 @@ class DoubaoRealtimeClient:
         finally:
             await self._cleanup_session(state)
 
-    async def _run_session_once(self, state: SessionState, headers: dict[str, str]) -> None:
+    async def _run_session_once(self, state: SessionState, headers: Dict[str, str]) -> None:
         async with websockets.connect(
             TTS_BIDIRECTIONAL_URL,
             **self._doubao_connect_kwargs(headers),
@@ -509,7 +509,7 @@ class DoubaoRealtimeClient:
             if not event_task.done():
                 event_task.cancel()
 
-    def _doubao_connect_kwargs(self, headers: dict[str, str]) -> dict[str, Any]:
+    def _doubao_connect_kwargs(self, headers: Dict[str, str]) -> Dict[str, Any]:
         params = inspect.signature(websockets.connect).parameters
         kwargs = {
             "max_size": None,
@@ -526,7 +526,7 @@ class DoubaoRealtimeClient:
             raise RuntimeError("当前 websockets.connect 不支持额外请求头参数")
         return kwargs
 
-    def _extract_ws_error_details(self, exc: Exception) -> tuple[int | None, dict[str, str]]:
+    def _extract_ws_error_details(self, exc: Exception) -> Tuple[Optional[int], Dict[str, str]]:
         status_code = getattr(exc, "status_code", None)
         headers_obj = getattr(exc, "headers", None)
 
@@ -557,7 +557,7 @@ class DoubaoRealtimeClient:
 
         return status_code, headers
 
-    def _resource_id_candidates(self, resource_id: str) -> list[str]:
+    def _resource_id_candidates(self, resource_id: str) -> List[str]:
         normalized = resource_id.strip()
         if not normalized:
             return ["seed-tts-1.0", "volc.service_type.10029"]
@@ -709,7 +709,7 @@ class DoubaoRealtimeClient:
         self,
         state: SessionState,
         reason: str,
-        extra: dict[str, Any] | None = None,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         payload = {"forced_finish": True, "reason": reason}
         if extra:
@@ -736,7 +736,7 @@ class DoubaoRealtimeClient:
 
 def build_doubao_realtime_client(
     playback_manager: Any,
-    config: DoubaoConfig | None = None,
+    config: Optional[DoubaoConfig] = None,
 ) -> DoubaoRealtimeClient:
     """从统一配置创建本地 Doubao 流式客户端。"""
 

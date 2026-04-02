@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  nuwax-relay:
+    image: python:3.12-slim
+    container_name: nuwax-relay
+    working_dir: /workspace/nuwax_robot_bridge
+    volumes:
+      - ../:/workspace/nuwax_robot_bridge:ro
+    command:
+      - python
+      - -m
+      - uvicorn
+      - gateways.app:create_relay_app_from_env
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9766"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      NUWAX_RELAY_ENABLED: "true"
+      NUWAX_RELAY_HOST: "0.0.0.0"
+      NUWAX_RELAY_PORT: "9766"
+      NUWAX_RELAY_UPSTREAM_BASE_URL: "http://host.docker.internal:8766"
+      NUWAX_RELAY_INCOMING_TOKENS: "${NUWAX_RELAY_TOKEN}"
+      NUWAX_RELAY_UPSTREAM_TOKEN: "${NUWAX_GATEWAY_AGENT_TOKEN}"
+    restart: unless-stopped

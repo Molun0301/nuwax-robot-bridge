@@ -1,16 +1,26 @@
-# nuwax_robot_bridge Python runtime dependencies
+# `nuwax_robot_bridge` 的 Python 运行时依赖
 #
-# This file records the Python package side of the runtime.
-# You still need host-level prerequisites that pip cannot provide, including:
-# - CycloneDDS native shared library for cyclonedds / unitree_sdk2py
-# - ALSA / Pulse / PipeWire commands for local playback and volume fallback
+# 本文件只记录 Python 包层面的依赖。
+# 宿主机仍然需要自行准备 pip 无法提供的系统依赖，包括：
+# - 供 `cyclonedds` / `unitree_sdk2py` 使用的 CycloneDDS 原生动态库
+# - 供本地播放和音量回退链路使用的 ALSA / Pulse / PipeWire 命令
 #
-# If you use a local Unitree SDK checkout via GO2_SDK_PATH, keep these packages
-# installed and ensure unitree_sdk2py is importable in the active interpreter.
+# 当前主线已回收到 Python 3.8.10 兼容。
+# Jetson + JetPack 场景建议优先使用系统自带的 Python 3.8.10，
+# 避免破坏 CUDA / TensorRT / NVIDIA 相关预编译环境。
+#
+# 如果通过 `GO2_SDK_PATH` 使用本地 Unitree SDK，请保持这些依赖已安装，
+# 并确保当前解释器可以直接导入 `unitree_sdk2py`。
 
 websockets==10.4
 unitree_sdk2py==1.0.1
-cyclonedds==0.10.5
-numpy==2.4.3
+cyclonedds==0.10.2
+numpy==1.24.4
 opencv-python==4.10.0.84
 unitree_webrtc_connect_leshy==2.0.7
+pydantic==2.10.6
+fastapi==0.115.14
+uvicorn==0.30.6
+httpx==0.27.2
+openai==1.60.2
+ultralytics==8.4.33

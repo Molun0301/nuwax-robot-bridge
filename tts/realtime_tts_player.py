@@ -29,7 +29,7 @@ import time
 import wave
 from dataclasses import replace
 from io import BytesIO
-from typing import Any
+from typing import Dict, List, Optional, Set, Any
 
 from settings import APP_CONFIG, LocalPlaybackConfig, RobotWebRTCPlaybackConfig, TTSPlayerConfig
 from .robot_webrtc_audio import RobotWebRTCAudioHubClient
@@ -227,7 +227,7 @@ class LocalAudioBackend:
     def get_volume(self) -> float:
         return self._volume
 
-    def status(self) -> dict[str, Any]:
+    def status(self) -> Dict[str, Any]:
         return {
             "backend_name": self.backend_name,
             "audio_format": self.audio_format,
@@ -313,7 +313,7 @@ class LocalAudioBackend:
             ]
         raise RuntimeError("非PCM播放需要ffplay")
 
-    def _aplay_command(self, sample_rate: int, channels: int, audio_device: str | None = None):
+    def _aplay_command(self, sample_rate: int, channels: int, audio_device: Optional[str] = None):
         command = ["aplay", "-q"]
         device = audio_device if audio_device is not None else self.config.audio_device
         if device:
@@ -420,7 +420,7 @@ class LocalAudioBackend:
                 return device
         return ""
 
-    def _alsa_pcm_names(self) -> set[str]:
+    def _alsa_pcm_names(self) -> Set[str]:
         if not shutil.which("aplay"):
             return set()
         try:
@@ -478,7 +478,7 @@ class LocalAudioBackend:
             mute_text or "-",
         )
 
-    def _pulse_sink_names(self) -> list[str]:
+    def _pulse_sink_names(self) -> List[str]:
         text = self._pactl_read_text(["pactl", "list", "sinks", "short"])
         if not text:
             return []
@@ -492,7 +492,7 @@ class LocalAudioBackend:
                 names.append(parts[1])
         return names
 
-    def _pactl_read_text(self, command: list[str]) -> str:
+    def _pactl_read_text(self, command: List[str]) -> str:
         try:
             result = subprocess.run(
                 command,
@@ -552,7 +552,7 @@ class LocalAudioBackend:
 
         return device
 
-    def _ape_controls(self) -> set[str]:
+    def _ape_controls(self) -> Set[str]:
         try:
             result = subprocess.run(
                 ["amixer", "-c", self.config.ape_card, "scontrols"],
@@ -576,7 +576,7 @@ class LocalAudioBackend:
                 controls.add(line[start:end])
         return controls
 
-    def _amixer_cset_command(self, control_name: str, value: str) -> list[str]:
+    def _amixer_cset_command(self, control_name: str, value: str) -> List[str]:
         return ["amixer", "-c", self.config.ape_card, "cset", "name=%s" % control_name, str(value)]
 
     def _ffplay_command(self, sample_rate: int, channels: int, raw_pcm: bool):
@@ -935,7 +935,7 @@ class RobotSpeakerBackend:
     def get_volume(self) -> float:
         return self._volume
 
-    def status(self) -> dict[str, Any]:
+    def status(self) -> Dict[str, Any]:
         client_status = self.client.status()
         return {
             "backend_name": self.backend_name,
@@ -986,7 +986,7 @@ class RobotSpeakerBackend:
         total_frames = payload_len / float(frame_size)
         return total_frames / float(self.sample_rate)
 
-    def _take_segment(self, force: bool) -> dict[str, Any] | None:
+    def _take_segment(self, force: bool) -> Optional[Dict[str, Any]]:
         with self._segment_lock:
             if not self._pcm_buffer:
                 return None
@@ -1050,7 +1050,7 @@ class RobotSpeakerBackend:
         self._segment_queue = None
         self._sentence_segment_enabled = False
 
-    def _upload_segment_with_retry(self, segment: dict[str, Any]) -> dict[str, Any]:
+    def _upload_segment_with_retry(self, segment: Dict[str, Any]) -> Dict[str, Any]:
         last_exc = None
         for attempt in range(2):
             try:
@@ -1140,7 +1140,7 @@ class RealtimeTTSPlayer:
         audio_format: str,
         sample_rate: int,
         channels: int = 1,
-        metadata: dict[str, Any] | None = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         del metadata
         if not self._running:
@@ -1167,7 +1167,7 @@ class RealtimeTTSPlayer:
             return
         self._current_backend.write(payload)
 
-    def finish_session(self, session_id: str, payload: dict[str, Any] | None = None) -> None:
+    def finish_session(self, session_id: str, payload: Optional[Dict[str, Any]] = None) -> None:
         del payload
         if self._current_session_id != session_id:
             return
@@ -1194,13 +1194,13 @@ class RealtimeTTSPlayer:
         with self._lock:
             self._current_session_id = None
 
-    def handle_subtitle(self, session_id: str, payload: dict[str, Any]) -> None:
+    def handle_subtitle(self, session_id: str, payload: Dict[str, Any]) -> None:
         if self._current_session_id != session_id:
             return
         if self.config.print_subtitle:
             logger.info("TTS字幕: %s", json.dumps(payload, ensure_ascii=False))
 
-    def handle_sentence_end(self, session_id: str, payload: dict[str, Any]) -> None:
+    def handle_sentence_end(self, session_id: str, payload: Dict[str, Any]) -> None:
         del payload
         if self._current_session_id != session_id:
             return
@@ -1221,7 +1221,7 @@ class RealtimeTTSPlayer:
             with self._lock:
                 self._current_session_id = None
 
-    def status(self) -> dict[str, Any]:
+    def status(self) -> Dict[str, Any]:
         backend_status = {}
         if self._current_backend is not None:
             backend_status = self._current_backend.status()
@@ -1314,7 +1314,7 @@ class RealtimeTTSPlayer:
         self._active_backend_mode = mode
 
 
-def build_player_from_config(config: TTSPlayerConfig | None = None) -> RealtimeTTSPlayer:
+def build_player_from_config(config: Optional[TTSPlayerConfig] = None) -> RealtimeTTSPlayer:
     player_config = replace(config or APP_CONFIG.tts)
     return RealtimeTTSPlayer(player_config)
 

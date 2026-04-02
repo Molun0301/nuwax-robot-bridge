@@ -1,0 +1,626 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from contracts.artifacts import ArtifactRetentionPolicy
+from contracts.capabilities import (
+    CapabilityAvailability,
+    CapabilityDescriptor,
+    CapabilityExecutionMode,
+    CapabilityMatrix,
+    CapabilityRiskLevel,
+)
+from contracts.events import RuntimeEventCategory
+from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
+from contracts.image import CameraInfo, ImageEncoding, ImageFrame
+from contracts.maps import OccupancyGrid, SemanticMap, SemanticRegion
+from contracts.memory import MemoryPayloadFilter, MemoryRecordKind
+from contracts.runtime_views import SceneObjectSummary, SceneSummary
+from contracts.skills import SkillCategory, SkillDescriptor
+from core import CapabilityRegistry, EventBus, StateNamespace, StateStore
+from gateways.artifacts import LocalArtifactStore
+from providers import ImageProvider, LocalizationProvider, MapProvider
+from services import ArtifactService, AudioService, ObservationService, PerceptionService
+from services.localization import LocalizationService
+from services.mapping import MappingService
+from services.memory import MemoryService
+from services.perception import DetectorPipeline, MetadataDrivenDetectorBackend, SceneDescriptionBackend, SceneDescriptionBackendSpec
+from services.memory.vectorizer import HashingTextEmbedder, VisionLanguageEmbedder
+from settings import load_config
+from skills import SkillRegistry
+from typing import Dict, Optional
+
+
+class _ProviderBundle(ImageProvider, LocalizationProvider, MapProvider):
+    """记忆与技能测试用的统一假提供器。"""
+
+    provider_name = "memory_skill_test_bundle"
+    provider_version = "0.1.0"
+
+    def __init__(self) -> None:
+        self.current_pose = Pose(
+            frame_id="map",
+            position=Vector3(x=1.2, y=0.4, z=0.0),
+            orientation=Quaternion(w=1.0),
+        )
+
+    def is_available(self) -> bool:
+        return True
+
+    def capture_image(self, camera_id: Optional[str] = None) -> ImageFrame:
+        camera = camera_id or "front_camera"
+        return ImageFrame(
+            camera_id=camera,
+            frame_id=f"world/test/{camera}",
+            width_px=320,
+            height_px=240,
+            encoding=ImageEncoding.JPEG,
+            data=b"person charger charging_dock supply_station",
+            metadata={
+                "detections_2d": [
+                    {
+                        "label": "person",
+                        "score": 0.96,
+                        "bbox": {"x_px": 32, "y_px": 40, "width_px": 88, "height_px": 140},
+                    },
+                    {
+                        "label": "charger",
+                        "score": 0.84,
+                        "bbox": {"x_px": 210, "y_px": 90, "width_px": 60, "height_px": 120},
+                    },
+                ]
+            },
+        )
+
+    def get_camera_info(self, camera_id: Optional[str] = None) -> CameraInfo:
+        camera = camera_id or "front_camera"
+        return CameraInfo(
+            camera_id=camera,
+            frame_id=f"world/test/{camera}",
+            width_px=320,
+            height_px=240,
+            fx=120.0,
+            fy=120.0,
+            cx=160.0,
+            cy=120.0,
+        )
+
+    def get_current_pose(self) -> Optional[Pose]:
+        return self.current_pose
+
+    def get_frame_tree(self) -> Optional[FrameTree]:
+        return FrameTree(
+            root_frame_id="world",
+            transforms=[
+                Transform(
+                    parent_frame_id="world",
+                    child_frame_id="map",
+                    translation=Vector3(x=0.0, y=0.0, z=0.0),
+                    rotation=Quaternion(w=1.0),
+                    authority="test_localization",
+                )
+            ],
+        )
+
+    def get_occupancy_grid(self) -> Optional[OccupancyGrid]:
+        return OccupancyGrid(
+            map_id="test_map",
+            frame_id="map",
+            width=2,
+            height=2,
+            resolution_m=0.1,
+            origin=Pose(frame_id="map", position=Vector3(x=0.0, y=0.0, z=0.0)),
+            data=[0, 0, 10, 100],
+        )
+
+    def get_cost_map(self):
+        return None
+
+    def get_semantic_map(self) -> Optional[SemanticMap]:
+        return SemanticMap(
+            map_id="semantic_test_map",
+            frame_id="map",
+            regions=[
+                SemanticRegion(
+                    region_id="charging_dock",
+                    label="charging_dock",
+                    centroid=Pose(frame_id="map", position=Vector3(x=1.2, y=0.4, z=0.0)),
+                    attributes={"aliases": ["补给点", "dock"]},
+                )
+            ],
+        )
+
+
+class _ProviderOwner:
+    """简单提供器宿主。"""
+
+    def __init__(self, providers) -> None:
+        self.providers = providers
+
+
+class _FakeVisionLanguageEmbedder(VisionLanguageEmbedder):
+    """测试用假图文共享空间向量化器。"""
+
+    def __init__(self) -> None:
+        self.model_name = "fake_clip"
+        self.dimension = 32
+        self._delegate = HashingTextEmbedder(model_name="fake_clip_hashing", dimension=self.dimension)
+
+    def embed_image_bytes(self, image_bytes: bytes):
+        return self._delegate.embed_text(image_bytes.decode("utf-8", errors="ignore"))
+
+    def embed_text(self, text: str):
+        return self._delegate.embed_text(text)
+
+
+class _FakeAudioRobot:
+    """音频服务测试用假机器人。"""
+
+    def __init__(self) -> None:
+        self.volume = 0.4
+        self.switch_enabled = False
+
+    def get_vui_volume_info(self) -> Dict[str, object]:
+        return {
+            "volume": self.volume,
+            "backend": "fake_vui",
+            "switch_enabled": self.switch_enabled,
+        }
+
+    def set_vui_volume_ratio(self, volume: float, auto_enable_switch: bool) -> Dict[str, object]:
+        self.volume = max(0.0, min(1.0, float(volume)))
+        if auto_enable_switch:
+            self.switch_enabled = True
+        return self.get_vui_volume_info()
+
+
+class _SemanticSceneBackend(SceneDescriptionBackend):
+    """测试用语义增强场景后端。"""
+
+    def __init__(self) -> None:
+        self.spec = SceneDescriptionBackendSpec(
+            name="semantic_scene_backend",
+            backend_kind="openai_compatible_multimodal",
+        )
+
+    def describe(
+        self,
+        *,
+        camera_id: str,
+        detections_2d,
+        detections_3d,
+        tracks,
+        image_frame,
+        camera_info=None,
+    ) -> SceneSummary:
+        del detections_3d, tracks, image_frame, camera_info
+        return SceneSummary(
+            headline="画面中一名人员站在红色补给架旁边。",
+            details=["补给架位于人物右侧。", "适合作为补给点复核参考。"],
+            objects=[
+                SceneObjectSummary(
+                    label="person",
+                    count=1,
+                    tracked_count=1,
+                    max_score=0.96,
+                    camera_ids=[camera_id],
+                    track_ids=["trk_person"],
+                    attributes={"display_name_zh": "人员"},
+                ),
+                SceneObjectSummary(
+                    label="charger",
+                    count=1,
+                    tracked_count=0,
+                    max_score=0.84,
+                    camera_ids=[camera_id],
+                    track_ids=[],
+                    attributes={"display_name_zh": "补给架", "color": "red"},
+                ),
+            ],
+            detection_count=len(detections_2d),
+            active_track_count=1,
+            metadata={
+                "semantic_tags": ["红色补给架", "补给点", "人员附近"],
+                "semantic_relations": ["person_beside_charger"],
+                "visual_labels": ["person", "charger"],
+                "cloud_vision_model": "fake-vision-model",
+                "scene_backend_chain": ["simple_scene_describer", "semantic_scene_backend"],
+            },
+        )
+
+
+def _build_memory_stack(
+    tmp_path: Path,
+    *,
+    scene_description_backend: Optional[SceneDescriptionBackend] = None,
+) -> Dict[str, object]:
+    providers = _ProviderBundle()
+    provider_owner = _ProviderOwner(providers)
+    state_store = StateStore()
+    event_bus = EventBus()
+    artifact_service = ArtifactService(
+        LocalArtifactStore(str(tmp_path / "artifacts"), "http://testserver"),
+        retention_policy=ArtifactRetentionPolicy(
+            retention_days=7,
+            max_count=20,
+            max_total_bytes=1024 * 1024,
+            cleanup_batch_size=10,
+        ),
+    )
+    observation_service = ObservationService(
+        provider_owner=provider_owner,
+        artifact_service=artifact_service,
+        state_store=state_store,
+        event_bus=event_bus,
+        history_limit=10,
+    )
+    localization_service = LocalizationService(
+        provider_owner=provider_owner,
+        state_store=state_store,
+        event_bus=event_bus,
+        history_limit=10,
+    )
+    mapping_service = MappingService(
+        provider_owner=provider_owner,
+        state_store=state_store,
+        event_bus=event_bus,
+        history_limit=10,
+    )
+    perception_service = PerceptionService(
+        provider_owner=provider_owner,
+        artifact_service=artifact_service,
+        state_store=state_store,
+        detector_pipeline=DetectorPipeline((MetadataDrivenDetectorBackend(),)),
+        scene_description_backend=scene_description_backend,
+        event_bus=event_bus,
+        history_limit=10,
+        pipeline_name="memory_skill_test_pipeline",
+    )
+    memory_service = MemoryService(
+        localization_service=localization_service,
+        mapping_service=mapping_service,
+        observation_service=observation_service,
+        perception_service=perception_service,
+        state_store=state_store,
+        event_bus=event_bus,
+        artifact_store=artifact_service._store,
+        history_limit=10,
+        memory_db_path=str(tmp_path / "memory" / "vector_memory.db"),
+        embedding_model="hashing-v1",
+        embedding_dimension=128,
+        vision_language_embedder=_FakeVisionLanguageEmbedder(),
+    )
+    localization_service.refresh()
+    mapping_service.refresh()
+    return {
+        "providers": providers,
+        "state_store": state_store,
+        "event_bus": event_bus,
+        "observation_service": observation_service,
+        "localization_service": localization_service,
+        "mapping_service": mapping_service,
+        "perception_service": perception_service,
+        "memory_service": memory_service,
+    }
+
+
+def test_memory_service_can_tag_location_and_write_memory(tmp_path: Path) -> None:
+    """记忆服务应把地点、观察和语义记忆串成统一记录。"""
+
+    stack = _build_memory_stack(tmp_path)
+    observation_service = stack["observation_service"]
+    perception_service = stack["perception_service"]
+    memory_service = stack["memory_service"]
+    state_store = stack["state_store"]
+
+    observation_service.capture_observation(camera_id="front_camera")
+    perception_service.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+    tagged_location, memory_entry = memory_service.tag_location(
+        "补给点",
+        aliases=["充电位", "dock"],
+        description="前方补给位置。",
+        camera_id="front_camera",
+    )
+
+    location_entry = state_store.read(StateNamespace.MEMORY, f"location:{tagged_location.location_id}")
+    semantic_entry = state_store.read(StateNamespace.MEMORY, f"memory:{memory_entry.memory_id}")
+    summary = memory_service.get_summary()
+
+    assert tagged_location.normalized_name == "补给点"
+    assert tagged_location.aliases == ["充电位", "dock"]
+    assert memory_entry is not None
+    assert memory_entry.kind == MemoryRecordKind.NOTE
+    assert location_entry is not None
+    assert semantic_entry is not None
+    assert summary.tagged_location_count == 1
+    assert summary.semantic_memory_count == 1
+    assert summary.metadata["store_mode"] == "multimodal_named_vector"
+    assert summary.metadata["named_vector_counts"]["text_dense"] >= 1
+    assert summary.metadata["named_vector_counts"]["image_dense"] >= 1
+
+
+def test_memory_service_can_query_locations_and_semantic_entries(tmp_path: Path) -> None:
+    """地点查询与语义检索应共享同一批结构化记忆。"""
+
+    stack = _build_memory_stack(tmp_path)
+    observation_service = stack["observation_service"]
+    perception_service = stack["perception_service"]
+    memory_service = stack["memory_service"]
+
+    observation_service.capture_observation(camera_id="front_camera")
+    perception_service.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+    tagged_location, _ = memory_service.tag_location(
+        "补给点",
+        aliases=["充电位"],
+        description="靠近充电底座。",
+        camera_id="front_camera",
+    )
+    scene_entry = memory_service.remember_current_scene(
+        title="人工巡检记录",
+        camera_id="front_camera",
+        metadata={"source": "unit_test"},
+    )
+
+    location_result = memory_service.query_location("充电位", similarity_threshold=0.2)
+    semantic_result = memory_service.query_semantic_memory("person", similarity_threshold=0.1)
+    resolved = memory_service.resolve_tagged_location("补给点")
+
+    assert location_result.matches
+    assert location_result.matches[0].tagged_location is not None
+    assert location_result.matches[0].tagged_location.location_id == tagged_location.location_id
+    assert semantic_result.matches
+    assert any(match.navigation_candidate is not None for match in semantic_result.matches)
+    assert any(match.semantic_instance is not None for match in semantic_result.matches)
+    assert any(
+        match.semantic_memory is not None and match.semantic_memory.memory_id in {
+            scene_entry.memory_id,
+            tagged_location.memory_id,
+        }
+        for match in semantic_result.matches
+    )
+    assert semantic_result.metadata["retrieval_mode"] == "text_recall_then_filter_then_multimodal_rerank"
+    assert semantic_result.matches[0].metadata["text_recall_score"] >= 0.0
+    assert semantic_result.matches[0].metadata["image_score"] >= 0.0
+    assert resolved is not None
+    assert resolved.name == "补给点"
+
+
+def test_memory_service_persists_vector_memories_across_restart(tmp_path: Path) -> None:
+    """向量记忆库应在服务重建后保留地点、语义记忆和对象实例。"""
+
+    first_stack = _build_memory_stack(tmp_path)
+    first_observation = first_stack["observation_service"]
+    first_perception = first_stack["perception_service"]
+    first_memory = first_stack["memory_service"]
+
+    first_observation.capture_observation(camera_id="front_camera")
+    first_perception.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+    tagged_location, memory_entry = first_memory.tag_location(
+        "大厅休息区",
+        aliases=["沙发区"],
+        description="大厅靠窗位置有红色沙发。",
+        camera_id="front_camera",
+    )
+
+    second_stack = _build_memory_stack(tmp_path)
+    second_memory = second_stack["memory_service"]
+
+    summary = second_memory.get_summary()
+    location_result = second_memory.query_location("沙发区", similarity_threshold=0.15)
+    semantic_result = second_memory.query_semantic_memory("红色沙发 靠窗", similarity_threshold=0.1)
+
+    assert summary.tagged_location_count >= 1
+    assert summary.semantic_memory_count >= 1
+    assert summary.metadata["named_vector_counts"]["text_dense"] >= 1
+    assert summary.metadata["collection_counts"]["object_instances"] >= 1
+    assert summary.metadata["collection_counts"]["episodic_observations"] >= 1
+    assert location_result.matches
+    assert location_result.matches[0].tagged_location is not None
+    assert location_result.matches[0].tagged_location.location_id == tagged_location.location_id
+    assert semantic_result.matches
+    assert any(
+        match.semantic_memory is not None and match.semantic_memory.memory_id == memory_entry.memory_id
+        for match in semantic_result.matches
+    )
+
+
+def test_memory_service_supports_payload_filters_navigation_and_arrival_verification(tmp_path: Path) -> None:
+    """记忆服务应支持空间过滤、对象 inspection pose 导航和到点复核。"""
+
+    stack = _build_memory_stack(tmp_path)
+    providers = stack["providers"]
+    observation_service = stack["observation_service"]
+    perception_service = stack["perception_service"]
+    memory_service = stack["memory_service"]
+
+    observation_service.capture_observation(camera_id="front_camera")
+    perception_service.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+    tagged_location, scene_memory = memory_service.tag_location(
+        "补给点",
+        aliases=["充电位"],
+        description="靠近 charging dock 的位置。",
+        camera_id="front_camera",
+    )
+    assert tagged_location.location_id
+    assert scene_memory is not None
+
+    far_filter = MemoryPayloadFilter(
+        near_pose=Pose(frame_id="map", position=Vector3(x=9.0, y=9.0, z=0.0)),
+        max_distance_m=0.5,
+    )
+    filtered_result = memory_service.query_semantic_memory(
+        "charging dock",
+        similarity_threshold=0.05,
+        payload_filter=far_filter,
+    )
+    assert filtered_result.matches == []
+
+    providers.current_pose = Pose(frame_id="map", position=Vector3(x=1.1, y=0.45, z=0.0), orientation=Quaternion(w=1.0))
+    navigation_candidate = memory_service.resolve_navigation_candidate("charging dock")
+    assert navigation_candidate is not None
+    assert navigation_candidate.record_id != tagged_location.location_id
+    assert navigation_candidate.target_pose.frame_id == "map"
+
+    verification = memory_service.verify_arrival(
+        "charging dock",
+        navigation_candidate=navigation_candidate,
+        camera_id="front_camera",
+        similarity_threshold=0.1,
+    )
+    assert verification.verified is True
+    assert verification.score >= 0.1
+
+
+def test_memory_service_deeply_integrates_visual_semantics_into_vector_memory(tmp_path: Path) -> None:
+    """视觉语义标签应进入实例、观察事件和语义记忆的联合检索链路。"""
+
+    stack = _build_memory_stack(tmp_path, scene_description_backend=_SemanticSceneBackend())
+    observation_service = stack["observation_service"]
+    perception_service = stack["perception_service"]
+    memory_service = stack["memory_service"]
+
+    observation_service.capture_observation(camera_id="front_camera")
+    perception_service.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+    memory_entry = memory_service.remember_current_scene(
+        title="补给区巡检",
+        camera_id="front_camera",
+    )
+
+    semantic_result = memory_service.query_semantic_memory("红色补给架", similarity_threshold=0.05)
+    visual_filter_result = memory_service.query_semantic_memory(
+        "补给点",
+        similarity_threshold=0.05,
+        payload_filter=MemoryPayloadFilter(
+            visual_labels_any=["charger"],
+            vision_tags_any=["person beside charger"],
+        ),
+    )
+
+    assert "charger" in memory_entry.metadata["visual_labels"]
+    assert "红色补给架" in memory_entry.metadata["vision_tags"]
+    assert semantic_result.matches
+    assert any(match.semantic_instance is not None for match in semantic_result.matches)
+    assert any(
+        match.semantic_memory is not None and match.semantic_memory.memory_id == memory_entry.memory_id
+        for match in semantic_result.matches
+    )
+    assert visual_filter_result.matches
+    assert any(
+        (match.semantic_instance is not None or match.observation_event is not None)
+        for match in visual_filter_result.matches
+    )
+
+
+def test_skill_registry_builds_runtime_views_from_capabilities() -> None:
+    """技能注册表应能把能力矩阵转换为对外工具视图。"""
+
+    capability_registry = CapabilityRegistry()
+    capability_registry.register(
+        CapabilityDescriptor(
+            name="tag_location",
+            display_name="标记当前位置",
+            description="写入地点记忆。",
+            execution_mode=CapabilityExecutionMode.SYNC,
+            risk_level=CapabilityRiskLevel.LOW,
+            input_schema={"type": "object", "properties": {"name": {"type": "string"}}},
+            output_schema={"type": "object", "properties": {"tagged_location": {"type": "object"}}},
+        ),
+        handler=lambda payload: payload,
+        owner="unit_test",
+    )
+    capability_registry.register(
+        CapabilityDescriptor(
+            name="switch_control_mode",
+            display_name="切换控制模式",
+            description="管理员能力。",
+            execution_mode=CapabilityExecutionMode.SYNC,
+            risk_level=CapabilityRiskLevel.ADMIN,
+            exposed_to_agent=False,
+        ),
+        handler=lambda payload: payload,
+        owner="unit_test",
+    )
+    capability_registry.bind_robot_capability_matrix(
+        CapabilityMatrix(
+            robot_model="test_robot",
+            capabilities=[
+                CapabilityAvailability(name="tag_location", supported=True),
+                CapabilityAvailability(name="switch_control_mode", supported=False, reason="仅管理员可用。"),
+            ],
+        )
+    )
+
+    registry = SkillRegistry()
+    registry.register(
+        SkillDescriptor(
+            name="tag_location",
+            display_name="标记当前位置",
+            description="把当前位置写入地点记忆。",
+            category=SkillCategory.MEMORY,
+            capability_name="tag_location",
+        )
+    )
+    registry.register(
+        SkillDescriptor(
+            name="switch_control_mode",
+            display_name="切换控制模式",
+            description="管理员技能。",
+            category=SkillCategory.ADMIN,
+            capability_name="switch_control_mode",
+            exposed_to_agent=False,
+        )
+    )
+
+    agent_views = registry.build_runtime_views(
+        capability_registry,
+        robot_model="test_robot",
+        exposed_only=True,
+        include_unsupported=False,
+    )
+    all_views = registry.build_runtime_views(
+        capability_registry,
+        robot_model="test_robot",
+        exposed_only=None,
+        include_unsupported=True,
+    )
+
+    assert [view.descriptor.name for view in agent_views] == ["tag_location"]
+    assert [view.descriptor.name for view in all_views] == ["switch_control_mode", "tag_location"]
+    assert all_views[0].supported is False
+    assert all_views[0].reason == "仅管理员可用。"
+
+
+def test_audio_service_supports_volume_and_record_only_speech() -> None:
+    """未配置实时语音时，音频服务仍应支持音量与记录模式播报。"""
+
+    config = load_config()
+    config.doubao.app_id = ""
+    config.doubao.access_key = ""
+    config.doubao.default_speaker = ""
+    config.log_tts.speaker = ""
+    config.tts.initial_volume = 0.5
+
+    event_bus = EventBus()
+    service = AudioService(
+        config=config,
+        robot=_FakeAudioRobot(),
+        event_bus=event_bus,
+        history_limit=5,
+    )
+
+    updated = service.set_volume(0.75)
+    speech = service.speak_text("你好，开始巡检。", metadata={"source": "unit_test"})
+    history = service.list_speech_history(limit=5)
+    events = event_bus.replay(after_cursor=0, categories=[RuntimeEventCategory.SYSTEM])
+
+    assert updated["volume"] == pytest.approx(0.75)
+    assert updated["robot_volume"]["volume"] == pytest.approx(0.75)
+    assert speech["accepted"] is True
+    assert speech["mode"] == "record_only"
+    assert history[0]["text"] == "你好，开始巡检。"
+    assert [event.event_type for event in events][-2:] == [
+        "audio.volume_changed",
+        "audio.speech_requested",
+    ]

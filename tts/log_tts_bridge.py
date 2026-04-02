@@ -21,7 +21,7 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Any
+from typing import Dict, List, Optional, Any
 
 from settings import APP_CONFIG, DoubaoConfig, TTSLogBridgeConfig
 from .doubao_realtime_client import DoubaoRealtimeClient, speech_settings_from_log_config
@@ -125,7 +125,7 @@ class LogTTSBridge:
         config: BridgeConfig,
         tts_client: DoubaoRealtimeClient,
         doubao_config: DoubaoConfig,
-        stop_event: threading.Event | None = None,
+        stop_event: Optional[threading.Event] = None,
     ) -> None:
         self.config = config
         self.tts_client = tts_client
@@ -237,7 +237,7 @@ class LogTTSBridge:
             if stop_reason == "end_turn":
                 self._request_finish_for_single_recent_session("acp_result_end_turn")
 
-    def _extract_json_payload(self, line: str) -> dict[str, Any] | None:
+    def _extract_json_payload(self, line: str) -> Optional[Dict[str, Any]]:
         marker = "📥 "
         if marker not in line:
             return None
@@ -251,7 +251,7 @@ class LogTTSBridge:
             return None
         return value if isinstance(value, dict) else None
 
-    def _extract_update_text(self, update: dict[str, Any]) -> str:
+    def _extract_update_text(self, update: Dict[str, Any]) -> str:
         content = update.get("content")
         if isinstance(content, dict):
             if content.get("type") == "text":
@@ -282,7 +282,7 @@ class LogTTSBridge:
         buffer.last_chunk_at = time.time()
         buffer.finish_requested = False
 
-    def _handle_prompt_completed_block(self, lines: list[str]) -> None:
+    def _handle_prompt_completed_block(self, lines: List[str]) -> None:
         block = "\n".join(lines)
         session_match = re.search(r"sessionId:\s*'([^']+)'", block)
         reason_match = re.search(r"stopReason:\s*'([^']+)'", block)
@@ -613,7 +613,7 @@ class LogTTSBridgeService:
         self._thread = None
         LOGGER.info("日志转TTS桥接已停止")
 
-    def status(self) -> dict[str, Any]:
+    def status(self) -> Dict[str, Any]:
         return {
             "enabled": self.config.enabled,
             "running": self._thread is not None and self._thread.is_alive(),
@@ -628,9 +628,9 @@ class LogTTSBridgeService:
 
 
 def build_log_tts_bridge_from_config(
-    config: TTSLogBridgeConfig | None,
+    config: Optional[TTSLogBridgeConfig],
     tts_client: DoubaoRealtimeClient,
-    doubao_config: DoubaoConfig | None = None,
+    doubao_config: Optional[DoubaoConfig] = None,
 ) -> LogTTSBridgeService:
     """从统一配置创建日志桥接服务。"""
 

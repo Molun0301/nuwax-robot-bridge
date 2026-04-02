@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import threading
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
+
+from contracts.base import MetadataDict
+from contracts.events import RuntimeEvent, RuntimeEventCategory, RuntimeEventSeverity
+from contracts.naming import build_event_id
+from contracts.tasks import TaskEvent
+
+
+@dataclass(frozen=True)
+class EventSubscription:
+    """事件订阅条目。"""
+
+    subscription_id: str
+    callback: Callable[[RuntimeEvent], None]
+    categories: Optional[FrozenSet[RuntimeEventCategory]] = None
+    event_types: Optional[FrozenSet[str]] = None
+
+
+class EventBus:
+    """支持游标续播的内存事件总线。"""
+
+    def __init__(self, retention_limit: int = 1000) -> None:
+        self._retention_limit = max(1, retention_limit)
+        self._events: List[RuntimeEvent] = []
+        self._subscriptions: Dict[str, EventSubscription] = {}
+        self._next_cursor = 1
+        self._next_subscription_seq = 1
+        self._lock = threading.RLock()
+
+    def latest_cursor(self) -> int:
+        """返回最新游标。"""
+
+        with self._lock:
+            return self._next_cursor - 1
+
+    def build_event(
+        self,
+        event_type: str,
+        *,
+        category: RuntimeEventCategory,
+        source: str,
+        subject_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        severity: RuntimeEventSeverity = RuntimeEventSeverity.INFO,
+        message: Optional[str] = None,
+        payload: Optional[MetadataDict] = None,
+        metadata: Optional[MetadataDict] = None,
+    ) -> RuntimeEvent:
+        """构造统一事件对象。"""
+
+        return RuntimeEvent(
+            event_id=build_event_id(event_type),
+            event_type=event_type,
+            category=category,
+            source=source,
+            subject_id=subject_id,
+            task_id=task_id,
+            severity=severity,
+            message=message,
+            payload=dict(payload or {}),
+            metadata=dict(metadata or {}),
+        )
+
+    def publish(self, event: RuntimeEvent) -> RuntimeEvent:
+        """发布一条运行时事件。"""
+
+        with self._lock:
+            stored_event = event.model_copy(update={"cursor": self._next_cursor})
+            self._next_cursor += 1
+            self._events.append(stored_event)
+            if len(self._events) > self._retention_limit:
+                self._events = self._events[-self._retention_limit :]
+            subscriptions = tuple(self._subscriptions.values())
+
+        for subscription in subscriptions:
+            if self._matches(subscription, stored_event):
+                subscription.callback(stored_event)
+
+        return stored_event
+
+    def publish_task_event(self, task_event: TaskEvent, *, source: str = "task_manager") -> RuntimeEvent:
+        """把任务事件转换为统一运行时事件并发布。"""
+
+        payload = dict(task_event.payload)
+        if task_event.state is not None:
+            payload["state"] = task_event.state.value
+        return self.publish(
+            self.build_event(
+                task_event.event_type,
+                category=RuntimeEventCategory.TASK,
+                source=source,
+                task_id=task_event.task_id,
+                message=task_event.message,
+                payload=payload,
+                metadata={"task_event_id": task_event.event_id},
+            )
+        )
+
+    def subscribe(
+        self,
+        callback: Callable[[RuntimeEvent], None],
+        *,
+        categories: Optional[Iterable[RuntimeEventCategory]] = None,
+        event_types: Optional[Iterable[str]] = None,
+    ) -> str:
+        """订阅事件。"""
+
+        with self._lock:
+            subscription_id = f"sub_{self._next_subscription_seq:04d}"
+            self._next_subscription_seq += 1
+            subscription = EventSubscription(
+                subscription_id=subscription_id,
+                callback=callback,
+                categories=frozenset(categories) if categories is not None else None,
+                event_types=frozenset(event_types) if event_types is not None else None,
+            )
+            self._subscriptions[subscription_id] = subscription
+            return subscription_id
+
+    def unsubscribe(self, subscription_id: str) -> None:
+        """取消订阅。"""
+
+        with self._lock:
+            self._subscriptions.pop(subscription_id, None)
+
+    def replay(
+        self,
+        *,
+        after_cursor: int = 0,
+        limit: Optional[int] = None,
+        categories: Optional[Iterable[RuntimeEventCategory]] = None,
+        event_types: Optional[Iterable[str]] = None,
+    ) -> Tuple[RuntimeEvent, ...]:
+        """按游标回放事件。"""
+
+        category_filter = frozenset(categories) if categories is not None else None
+        event_type_filter = frozenset(event_types) if event_types is not None else None
+        with self._lock:
+            events = [
+                event
+                for event in self._events
+                if event.cursor is not None
+                and event.cursor > after_cursor
+                and (category_filter is None or event.category in category_filter)
+                and (event_type_filter is None or event.event_type in event_type_filter)
+            ]
+        if limit is not None:
+            events = events[:limit]
+        return tuple(events)
+
+    def _matches(self, subscription: EventSubscription, event: RuntimeEvent) -> bool:
+        if subscription.categories is not None and event.category not in subscription.categories:
+            return False
+        if subscription.event_types is not None and event.event_type not in subscription.event_types:
+            return False
+        return True
