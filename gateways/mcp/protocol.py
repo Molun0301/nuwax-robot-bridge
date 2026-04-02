@@ -81,6 +81,7 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                     descriptor = runtime.capability_registry.get_descriptor(view.capability_name)
                     description = (
                         f"{view.descriptor.description}\n"
+                        f"{descriptor.description}\n"
                         f"执行模式: {descriptor.execution_mode.value}；"
                         f"风险级别: {descriptor.risk_level.value}。"
                     )

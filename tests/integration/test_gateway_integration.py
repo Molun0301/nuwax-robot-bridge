@@ -833,11 +833,21 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
             json={"jsonrpc": "2.0", "id": "tools", "method": "tools/list"},
         )
         assert tools.status_code == 200
-        tool_names = {item["name"] for item in tools.json()["result"]["tools"]}
+        tool_items = tools.json()["result"]["tools"]
+        tool_names = {item["name"] for item in tool_items}
         assert "speak_text" in tool_names
         assert "execute_sport_command" in tool_names
         assert "follow_target" in tool_names
         assert "inspect_target" in tool_names
+
+        execute_sport_tool = next(item for item in tool_items if item["name"] == "execute_sport_command")
+        action_schema = execute_sport_tool["inputSchema"]["properties"]["action"]
+        action_catalog = execute_sport_tool["inputSchema"]["x-nuwax-action-catalog"]
+        assert "sit" in action_schema["enum"]
+        assert "damp" in action_schema["enum"]
+        assert "stand_up" in action_schema["enum"]
+        assert action_catalog["switch_joystick"]["params_schema"]["properties"]["on"]["type"] == "boolean"
+        assert "switch_control_mode" in execute_sport_tool["description"]
 
         robot_status = client.post(
             "/mcp",
@@ -957,6 +967,23 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
         assert set_body_pose.status_code == 200
         assert set_speed.status_code == 200
         assert [item[0] for item in robot.action_history][-3:] == ["stand_up", "euler", "speed_level"]
+
+        list_capabilities = client.post(
+            "/mcp",
+            headers=_agent_headers(),
+            json={
+                "jsonrpc": "2.0",
+                "id": "list_capabilities",
+                "method": "tools/call",
+                "params": {"name": "list_capabilities", "arguments": {}},
+            },
+        )
+        assert list_capabilities.status_code == 200
+        capability_items = list_capabilities.json()["result"]["structuredContent"]["result"]["capabilities"]
+        execute_sport_capability = next(item for item in capability_items if item["descriptor"]["name"] == "execute_sport_command")
+        capability_action_schema = execute_sport_capability["descriptor"]["input_schema"]["properties"]["action"]
+        assert "sit" in capability_action_schema["enum"]
+        assert "balance_stand" in capability_action_schema["enum"]
 
         navigation_task = client.post(
             "/api/capabilities/navigate_to_pose/invoke",

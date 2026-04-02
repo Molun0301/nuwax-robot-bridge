@@ -22,6 +22,11 @@ from contracts.skills import SkillCategory, SkillDescriptor
 from contracts.navigation import ExploreAreaRequest, NavigationGoal, NavigationStatus
 from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateNamespace, StateStore, TaskManager
 from drivers.robots.common.assembly import RobotAssemblyBase
+from drivers.robots.go2.capabilities import (
+    GO2_SPORT_COMMAND_NAMES,
+    build_go2_sport_command_description,
+    build_go2_sport_command_input_schema,
+)
 from gateways.artifacts import LocalArtifactStore
 from gateways.errors import GatewayError
 from gateways.serialization import to_jsonable
@@ -786,16 +791,10 @@ class GatewayRuntime:
             _descriptor(
                 "execute_sport_command",
                 "执行机身动作",
-                "执行机器人入口已实现的高层动作命令。",
+                build_go2_sport_command_description(),
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.MEDIUM,
-                input_schema=_schema_object(
-                    {
-                        "action": {"type": "string"},
-                        "params": {"type": "object"},
-                    },
-                    required=("action",),
-                ),
+                input_schema=build_go2_sport_command_input_schema(),
                 output_schema=_schema_object({"code": {"type": "integer"}, "result": {"type": "object"}}),
             ),
             _descriptor(
@@ -1883,6 +1882,18 @@ class GatewayRuntime:
         if not hasattr(self.robot, "execute_action"):
             raise GatewayError("当前机器人入口未实现 execute_action。")
         action = self._require_str(arguments, "action")
+        if action not in GO2_SPORT_COMMAND_NAMES:
+            raise GatewayError(
+                "execute_sport_command 当前只支持已公开的 Go2 高层机身动作命令。",
+                error_code="invalid_action",
+                http_status=422,
+                jsonrpc_code=-32602,
+                details={
+                    "action": action,
+                    "supported_actions": list(GO2_SPORT_COMMAND_NAMES),
+                    "hint": "姿态、速度档位、控制模式和低层关节控制请使用专用工具。",
+                },
+            )
         params = arguments.get("params") or {}
         if not isinstance(params, dict):
             raise GatewayError(
