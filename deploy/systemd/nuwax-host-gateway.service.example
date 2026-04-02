@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=unitree
 Group=unitree
-WorkingDirectory=/home/unitree/nuwax_robot_bridge
+WorkingDirectory=/home/unitree/nuwax-robot-bridge
 # 默认会读取 WorkingDirectory 下的 .env。
 # 如果你想把配置独立放到 /etc，再取消下一行注释并准备对应文件。
 # EnvironmentFile=/etc/nuwax_robot_bridge/gateway.env
