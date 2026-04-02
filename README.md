@@ -58,6 +58,9 @@
    Go2 的端侧定位、地图、Nav2、探索启动入口与专属配置也固定放在 `drivers/robots/go2/`，
    例如 `drivers/robots/go2/data_plane.py`、`drivers/robots/go2/data_plane_entry.py`、
    `drivers/robots/go2/settings.py`、`drivers/robots/go2/data_plane.env.example`。
+   同时仓库内已经内置 `drivers/robots/go2/ros2_ws/`，其中包含 Go2 端侧 ROS2（机器人操作系统 2）工作空间、
+   激光雷达建图 vendor 包、`Nav2`（导航栈）示例配置，以及 `build_ros2_workspace.sh`、
+   `launch_ros2_stack.sh` 这两个 Go2 示例脚本。
 7. `gateways/`
    对外通信入口，包括 MCP、HTTP、事件流、relay 和兼容策略说明。
 8. `providers/`
@@ -87,8 +90,15 @@
 18. `drivers/robots/go2/data_plane.env.example`
     Go2 端侧定位、地图、Nav2 与探索能力的专属配置示例。
 19. `drivers/robots/go2/data_plane_entry.py`
-    Go2 端侧数据面的独立启动入口，可单独拉起 `lidar-dev + Nav2` 相关数据面，再由平台装配接入。
-20. `requirements.txt`
+    Go2 端侧数据面的独立启动入口，可单独拉起 Go2 端侧定位、地图、Nav2、探索相关数据面，再由平台装配接入。
+20. `drivers/robots/go2/ros2_ws/`
+    Go2 示例 ROS2 工作空间，内含 `unitree_lidar_ros2`、`point_lio`、`elevation_mapping_cupy` 相关 vendor 包和
+    `nuwax_go2_bringup` 启动包。
+21. `drivers/robots/go2/build_ros2_workspace.sh`
+    构建 Go2 端侧 ROS2 工作空间的示例脚本。
+22. `drivers/robots/go2/launch_ros2_stack.sh`
+    一键启动 Go2 端侧激光雷达、Point-LIO（点激光惯导）、高程建图与 Nav2 的示例脚本。
+23. `requirements.txt`
     Python 运行时依赖。
 
 ## 推荐阅读顺序

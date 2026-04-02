@@ -1,0 +1,35 @@
+elevation_mapping_node:
+  ros__parameters:
+    map_frame: "odom"
+    corrected_map_frame: "odom"
+    base_frame: "body"
+    initialize_frame_id: ["body"]
+    initialize_tf_offset: [0.0, 0.0, 0.0, 0.0]
+    update_pose_fps: 15.0
+    map_acquire_fps: 5.0
+    recordable_fps: 3.0
+    enable_pointcloud_publishing: false
+    enable_drift_corrected_TF_publishing: false
+
+    pointcloud_channel_fusions:
+      rgb: "color"
+      default: "average"
+
+    image_channel_fusions:
+      rgb: "color"
+      default: "exponential"
+
+    subscribers:
+      body_lidar:
+        topic_name: "/cloud_registered_body"
+        data_type: pointcloud
+
+    publishers:
+      elevation_map_raw:
+        layers: ["elevation", "traversability", "variance", "rgb"]
+        basic_layers: ["elevation"]
+        fps: 5.0
+      elevation_map_filter:
+        layers: ["min_filter", "smooth", "inpaint", "elevation"]
+        basic_layers: ["min_filter"]
+        fps: 3.0

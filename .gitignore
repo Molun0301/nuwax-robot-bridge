@@ -1,4 +1,5 @@
 .env
+drivers/robots/go2/data_plane.env
 go2_proxy.log
 nuwax_robot_bridge.log
 __pycache__/

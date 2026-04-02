@@ -7,6 +7,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import threading
 import time
@@ -1087,10 +1088,13 @@ class Go2DataPlaneRuntime:
                     )
                 )
         if self.config.nav2.enabled and self.config.nav2.auto_launch and self.config.nav2.launch_command.strip():
+            nav2_command = self.config.nav2.launch_command
+            if self.config.dds_iface.strip() and "dds_iface:=" not in nav2_command:
+                nav2_command = f"{nav2_command} dds_iface:={shlex.quote(self.config.dds_iface)}"
             processes.append(
                 ManagedRos2Process(
                     name="go2_nav2",
-                    command=self.config.nav2.launch_command,
+                    command=nav2_command,
                     setup_script=self.config.nav2.setup_script or self.config.setup_script,
                 )
             )

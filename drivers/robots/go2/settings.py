@@ -9,6 +9,11 @@ from typing import Dict, Tuple
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _ENV_FILE = _PROJECT_ROOT / ".env"
 _LEGACY_CONFIG_FILE = _PROJECT_ROOT / ".config"
+_GO2_ENV_FILE = Path(__file__).resolve().with_name("data_plane.env")
+_GO2_ROS2_WS_DIR = Path(__file__).resolve().parent / "ros2_ws"
+_DEFAULT_GO2_SETUP_SCRIPT = str(_GO2_ROS2_WS_DIR / "install" / "setup.bash")
+_DEFAULT_GO2_LIDAR_LAUNCH_COMMAND = "ros2 launch nuwax_go2_bringup go2_lidar_mapping.launch.py"
+_DEFAULT_GO2_NAV2_LAUNCH_COMMAND = "ros2 launch nuwax_go2_bringup go2_nav2.launch.py"
 
 
 def _strip_quotes(value: str) -> str:
@@ -20,7 +25,7 @@ def _strip_quotes(value: str) -> str:
 
 def _load_file_values() -> Dict[str, str]:
     values: Dict[str, str] = {}
-    for file_path in (_LEGACY_CONFIG_FILE, _ENV_FILE):
+    for file_path in (_LEGACY_CONFIG_FILE, _ENV_FILE, _GO2_ENV_FILE):
         if not file_path.exists():
             continue
         for raw_line in file_path.read_text(encoding="utf-8").splitlines():
@@ -87,11 +92,9 @@ class Go2LidarPipelineConfig:
 
     enabled: bool = False
     auto_launch: bool = False
-    setup_script: str = "/home/ml/lidar-dev/install/setup.bash"
+    setup_script: str = _DEFAULT_GO2_SETUP_SCRIPT
     launch_commands: Tuple[str, ...] = (
-        "ros2 launch unitree_lidar_ros2 launch.py",
-        "ros2 launch point_lio_ros2 mapping_unilidar_l2.launch.py",
-        "ros2 launch elevation_mapping_cupy elevation_mapping.launch.py robot_config:=unitree_dog/unitree_dog_param.yaml",
+        _DEFAULT_GO2_LIDAR_LAUNCH_COMMAND,
     )
     launch_stagger_sec: float = 2.0
 
@@ -130,8 +133,8 @@ class Go2Nav2Config:
 
     enabled: bool = False
     auto_launch: bool = False
-    setup_script: str = ""
-    launch_command: str = "ros2 launch nav2_bringup navigation_launch.py use_sim_time:=false"
+    setup_script: str = _DEFAULT_GO2_SETUP_SCRIPT
+    launch_command: str = _DEFAULT_GO2_NAV2_LAUNCH_COMMAND
     action_wait_timeout_sec: float = 8.0
     launch_stabilize_sec: float = 5.0
 
@@ -156,6 +159,7 @@ class Go2DataPlaneConfig:
     enabled: bool = False
     setup_script: str = ""
     require_ros2: bool = False
+    dds_iface: str = ""
     topics: Go2Ros2TopicsConfig = field(default_factory=Go2Ros2TopicsConfig)
     map_synthesis: Go2MapSynthesisConfig = field(default_factory=Go2MapSynthesisConfig)
     lidar_pipeline: Go2LidarPipelineConfig = field(default_factory=Go2LidarPipelineConfig)
@@ -168,8 +172,9 @@ def load_go2_data_plane_config() -> Go2DataPlaneConfig:
 
     return Go2DataPlaneConfig(
         enabled=_cfg_bool("GO2_DATA_PLANE_ENABLED", False),
-        setup_script=_cfg_str("GO2_DATA_PLANE_SETUP_SCRIPT", ""),
+        setup_script=_cfg_str("GO2_DATA_PLANE_SETUP_SCRIPT", _DEFAULT_GO2_SETUP_SCRIPT),
         require_ros2=_cfg_bool("GO2_DATA_PLANE_REQUIRE_ROS2", False),
+        dds_iface=_cfg_str("GO2_DATA_PLANE_DDS_IFACE", _cfg_str("GO2_DDS_IFACE", "")),
         topics=Go2Ros2TopicsConfig(
             odom_topic=_cfg_str("GO2_DATA_PLANE_ODOM_TOPIC", "/odom_lio"),
             tf_topic=_cfg_str("GO2_DATA_PLANE_TF_TOPIC", "/tf"),
@@ -193,16 +198,13 @@ def load_go2_data_plane_config() -> Go2DataPlaneConfig:
         lidar_pipeline=Go2LidarPipelineConfig(
             enabled=_cfg_bool("GO2_LIDAR_PIPELINE_ENABLED", False),
             auto_launch=_cfg_bool("GO2_LIDAR_PIPELINE_AUTO_LAUNCH", False),
-            setup_script=_cfg_str("GO2_LIDAR_PIPELINE_SETUP_SCRIPT", "/home/ml/lidar-dev/install/setup.bash"),
+            setup_script=_cfg_str("GO2_LIDAR_PIPELINE_SETUP_SCRIPT", _DEFAULT_GO2_SETUP_SCRIPT),
             launch_commands=tuple(
                 command
                 for command in (
-                    _cfg_str("GO2_LIDAR_PIPELINE_LAUNCH_1", "ros2 launch unitree_lidar_ros2 launch.py"),
-                    _cfg_str("GO2_LIDAR_PIPELINE_LAUNCH_2", "ros2 launch point_lio_ros2 mapping_unilidar_l2.launch.py"),
-                    _cfg_str(
-                        "GO2_LIDAR_PIPELINE_LAUNCH_3",
-                        "ros2 launch elevation_mapping_cupy elevation_mapping.launch.py robot_config:=unitree_dog/unitree_dog_param.yaml",
-                    ),
+                    _cfg_str("GO2_LIDAR_PIPELINE_LAUNCH_1", _DEFAULT_GO2_LIDAR_LAUNCH_COMMAND),
+                    _cfg_str("GO2_LIDAR_PIPELINE_LAUNCH_2", ""),
+                    _cfg_str("GO2_LIDAR_PIPELINE_LAUNCH_3", ""),
                 )
                 if command.strip()
             ),
@@ -211,10 +213,10 @@ def load_go2_data_plane_config() -> Go2DataPlaneConfig:
         nav2=Go2Nav2Config(
             enabled=_cfg_bool("GO2_NAV2_ENABLED", False),
             auto_launch=_cfg_bool("GO2_NAV2_AUTO_LAUNCH", False),
-            setup_script=_cfg_str("GO2_NAV2_SETUP_SCRIPT", ""),
+            setup_script=_cfg_str("GO2_NAV2_SETUP_SCRIPT", _DEFAULT_GO2_SETUP_SCRIPT),
             launch_command=_cfg_str(
                 "GO2_NAV2_LAUNCH_COMMAND",
-                "ros2 launch nav2_bringup navigation_launch.py use_sim_time:=false",
+                _DEFAULT_GO2_NAV2_LAUNCH_COMMAND,
             ),
             action_wait_timeout_sec=max(0.1, _cfg_float("GO2_NAV2_ACTION_WAIT_TIMEOUT_SEC", 8.0)),
             launch_stabilize_sec=max(0.0, _cfg_float("GO2_NAV2_LAUNCH_STABILIZE_SEC", 5.0)),
