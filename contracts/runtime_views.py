@@ -99,6 +99,23 @@ class PerceptionContext(TimestampedContract):
     metadata: MetadataDict = Field(default_factory=dict, description="附加上下文。")
 
 
+class PerceptionRuntimeStatus(TimestampedContract):
+    """持续视频感知运行时状态。"""
+
+    enabled: bool = Field(default=False, description="当前是否启用持续感知功能。")
+    auto_start: bool = Field(default=False, description="运行时启动时是否自动拉起。")
+    running: bool = Field(default=False, description="后台感知线程是否正在运行。")
+    camera_id: str = Field(default="front_camera", description="当前持续处理的相机标识。")
+    interval_sec: float = Field(default=0.5, ge=0.05, description="连续抓帧周期。")
+    detector_backend: str = Field(default="", description="当前持续感知使用的检测后端。")
+    source_name: str = Field(default="", description="当前图像来源名称。")
+    processed_frames: int = Field(default=0, ge=0, description="累计处理帧数。")
+    failure_count: int = Field(default=0, ge=0, description="累计失败次数。")
+    last_success_message: Optional[str] = Field(default=None, description="最近一次成功处理说明。")
+    last_error: Optional[str] = Field(default=None, description="最近一次错误信息。")
+    metadata: MetadataDict = Field(default_factory=dict, description="附加状态元数据。")
+
+
 class LocalizationSnapshot(TimestampedContract):
     """定位服务快照。"""
 

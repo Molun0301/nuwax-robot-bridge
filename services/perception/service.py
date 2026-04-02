@@ -170,6 +170,7 @@ class PerceptionService:
         camera_id: Optional[str] = None,
         requested_by: Optional[str] = None,
         detector_backend_name: Optional[str] = None,
+        store_artifact: bool = True,
     ) -> PerceptionContext:
         """从当前图像提供器抓取一帧并完成完整感知。"""
 
@@ -177,10 +178,12 @@ class PerceptionService:
         image_frame = image_provider.capture_image(camera_id)
         resolved_camera_id = image_frame.camera_id
         camera_info = image_provider.get_camera_info(resolved_camera_id)
-        image_artifact = self._artifact_service.save_image_frame(
-            image_frame,
-            metadata={"requested_by": requested_by or "unknown", "service": "perception_service"},
-        )
+        image_artifact = None
+        if store_artifact:
+            image_artifact = self._artifact_service.save_image_frame(
+                image_frame,
+                metadata={"requested_by": requested_by or "unknown", "service": "perception_service"},
+            )
         return self.process_image(
             image_frame,
             camera_info,

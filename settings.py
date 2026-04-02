@@ -263,7 +263,11 @@ class PerceptionYoloConfig:
     enabled: bool = True
     backend_name: str = "yolo_local"
     model_name: str = "yolo26n.pt"
+    runtime_preference: str = "tensorrt"
+    engine_path: str = ""
     device: str = ""
+    half: bool = True
+    int8: bool = False
     image_size: int = 640
     confidence_threshold: float = 0.25
     iou_threshold: float = 0.45
@@ -285,6 +289,27 @@ class PerceptionOpenAIVisionConfig:
 
 
 @dataclass
+class PerceptionStreamRuntimeConfig:
+    """持续视频感知运行时配置。"""
+
+    enabled: bool = True
+    auto_start: bool = True
+    camera_id: str = "front_camera"
+    interval_sec: float = 0.5
+    detector_backend_name: str = ""
+    store_artifact: bool = False
+    failure_backoff_sec: float = 2.0
+    keyframe_min_interval_sec: float = 1.0
+    keyframe_max_interval_sec: float = 5.0
+    keyframe_translation_threshold_m: float = 0.75
+    keyframe_yaw_threshold_deg: float = 20.0
+    remember_keyframes: bool = True
+    remember_min_interval_sec: float = 15.0
+    burst_frame_count: int = 4
+    burst_interval_sec: float = 0.08
+
+
+@dataclass
 class PerceptionConfig:
     """统一视觉感知配置。"""
 
@@ -292,6 +317,7 @@ class PerceptionConfig:
     default_scene_backend: str = "hybrid_scene"
     yolo: PerceptionYoloConfig = field(default_factory=PerceptionYoloConfig)
     openai_vision: PerceptionOpenAIVisionConfig = field(default_factory=PerceptionOpenAIVisionConfig)
+    stream_runtime: PerceptionStreamRuntimeConfig = field(default_factory=PerceptionStreamRuntimeConfig)
 
 
 @dataclass
@@ -479,7 +505,14 @@ def load_config() -> NuwaxRobotBridgeConfig:
             enabled=_cfg_bool("NUWAX_PERCEPTION_YOLO_ENABLED", True),
             backend_name=_cfg_str("NUWAX_PERCEPTION_YOLO_BACKEND_NAME", "yolo_local"),
             model_name=_cfg_str("NUWAX_PERCEPTION_YOLO_MODEL", "yolo26n.pt"),
+            runtime_preference=_cfg_str("NUWAX_PERCEPTION_YOLO_RUNTIME", "tensorrt"),
+            engine_path=_cfg_str(
+                "NUWAX_PERCEPTION_YOLO_ENGINE_PATH",
+                str(BASE_DIR / "runtime_data" / "models" / "yolo26n.engine"),
+            ),
             device=_cfg_str("NUWAX_PERCEPTION_YOLO_DEVICE", ""),
+            half=_cfg_bool("NUWAX_PERCEPTION_YOLO_HALF", True),
+            int8=_cfg_bool("NUWAX_PERCEPTION_YOLO_INT8", False),
             image_size=max(32, _cfg_int("NUWAX_PERCEPTION_YOLO_IMAGE_SIZE", 640)),
             confidence_threshold=max(
                 0.0,
@@ -503,6 +536,23 @@ def load_config() -> NuwaxRobotBridgeConfig:
             timeout_sec=max(1.0, _cfg_float("NUWAX_PERCEPTION_OPENAI_TIMEOUT_SEC", 20.0)),
             max_tokens=max(128, _cfg_int("NUWAX_PERCEPTION_OPENAI_MAX_TOKENS", 700)),
             temperature=max(0.0, _cfg_float("NUWAX_PERCEPTION_OPENAI_TEMPERATURE", 0.0)),
+        ),
+        stream_runtime=PerceptionStreamRuntimeConfig(
+            enabled=_cfg_bool("NUWAX_PERCEPTION_STREAM_ENABLED", True),
+            auto_start=_cfg_bool("NUWAX_PERCEPTION_STREAM_AUTO_START", True),
+            camera_id=_cfg_str("NUWAX_PERCEPTION_STREAM_CAMERA_ID", "front_camera"),
+            interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_STREAM_INTERVAL_SEC", 0.5)),
+            detector_backend_name=_cfg_str("NUWAX_PERCEPTION_STREAM_DETECTOR_BACKEND", ""),
+            store_artifact=_cfg_bool("NUWAX_PERCEPTION_STREAM_STORE_ARTIFACT", False),
+            failure_backoff_sec=max(0.1, _cfg_float("NUWAX_PERCEPTION_STREAM_FAILURE_BACKOFF_SEC", 2.0)),
+            keyframe_min_interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_KEYFRAME_MIN_INTERVAL_SEC", 1.0)),
+            keyframe_max_interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_KEYFRAME_MAX_INTERVAL_SEC", 5.0)),
+            keyframe_translation_threshold_m=max(0.0, _cfg_float("NUWAX_PERCEPTION_KEYFRAME_TRANSLATION_M", 0.75)),
+            keyframe_yaw_threshold_deg=max(0.0, _cfg_float("NUWAX_PERCEPTION_KEYFRAME_YAW_DEG", 20.0)),
+            remember_keyframes=_cfg_bool("NUWAX_PERCEPTION_KEYFRAME_REMEMBER_ENABLED", True),
+            remember_min_interval_sec=max(0.0, _cfg_float("NUWAX_PERCEPTION_KEYFRAME_REMEMBER_MIN_INTERVAL_SEC", 15.0)),
+            burst_frame_count=max(1, _cfg_int("NUWAX_PERCEPTION_BURST_FRAME_COUNT", 4)),
+            burst_interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_BURST_INTERVAL_SEC", 0.08)),
         ),
     )
 

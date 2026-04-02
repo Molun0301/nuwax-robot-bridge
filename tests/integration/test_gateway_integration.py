@@ -407,6 +407,8 @@ def _build_test_config(tmp_path: Path):
     config.runtime_data.memory_embedding_model = "hashing-v1"
     config.runtime_data.memory_embedding_dimension = 128
     config.runtime_data.memory_image_embedding_model = "disabled"
+    config.perception.stream_runtime.enabled = True
+    config.perception.stream_runtime.auto_start = False
     config.relay.enabled = True
     config.relay.incoming_tokens = ("relay-token",)
     config.relay.upstream_base_url = "http://upstream.test"
@@ -646,6 +648,32 @@ def test_gateway_perception_capabilities_and_history(tmp_path: Path) -> None:
         history_payload = history.json()
         assert len(history_payload["history"]) >= 1
         assert history_payload["latest_contexts"][0]["detector_backend"] == "metadata_detector"
+
+
+def test_gateway_perception_runtime_status_and_control(tmp_path: Path) -> None:
+    """宿主机网关应暴露关键帧持续感知运行时状态与启停接口。"""
+
+    app, runtime, _, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        initial_status = client.get("/api/perception/runtime", headers=_agent_headers())
+        assert initial_status.status_code == 200
+        assert initial_status.json()["perception_runtime"]["running"] is False
+
+        started = client.post("/api/perception/runtime/start", headers=_agent_headers())
+        assert started.status_code == 200
+        assert started.json()["perception_runtime"]["enabled"] is True
+
+        time.sleep(0.15)
+        status_payload = client.get("/api/perception/runtime", headers=_agent_headers()).json()["perception_runtime"]
+        assert status_payload["processed_frames"] >= 1
+        assert status_payload["metadata"]["capture_mode"] == "keyframe"
+
+        capability_status = runtime._handle_get_perception_runtime_status({})
+        assert capability_status["perception_runtime"].processed_frames >= 1
+
+        stopped = client.post("/api/perception/runtime/stop", headers=_agent_headers())
+        assert stopped.status_code == 200
+        assert stopped.json()["perception_runtime"]["running"] is False
 
 
 def test_gateway_localization_mapping_navigation_and_exploration(tmp_path: Path) -> None:

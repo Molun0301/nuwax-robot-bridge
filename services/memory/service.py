@@ -516,11 +516,13 @@ class MemoryService:
             if legacy_candidate is not None and legacy_candidate.verification_query
             else query
         )
-        perception_context = self._perception_service.describe_current_scene(
-            camera_id=camera_id,
-            refresh=True,
-            requested_by="memory_arrival_verify",
-        )
+        perception_context = self._perception_service.get_latest_perception(camera_id)
+        if perception_context is None or (utc_now() - perception_context.timestamp) > timedelta(seconds=2):
+            perception_context = self._perception_service.describe_current_scene(
+                camera_id=camera_id,
+                refresh=True,
+                requested_by="memory_arrival_verify",
+            )
         scene_text = " ".join(
             [
                 perception_context.scene_summary.headline,

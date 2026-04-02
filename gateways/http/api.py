@@ -268,6 +268,21 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
             "latest_contexts": to_jsonable(runtime.perception_service.list_latest_contexts()),
         }
 
+    @router.get("/api/perception/runtime")
+    async def api_perception_runtime(request: Request) -> Dict[str, Any]:
+        access_manager.authenticate_http(request)
+        return {"perception_runtime": to_jsonable(runtime.perception_video_runtime.get_status())}
+
+    @router.post("/api/perception/runtime/start")
+    async def api_perception_runtime_start(request: Request) -> Dict[str, Any]:
+        access_manager.authenticate_http(request)
+        return {"perception_runtime": to_jsonable(runtime.perception_video_runtime.start())}
+
+    @router.post("/api/perception/runtime/stop")
+    async def api_perception_runtime_stop(request: Request) -> Dict[str, Any]:
+        access_manager.authenticate_http(request)
+        return {"perception_runtime": to_jsonable(runtime.perception_video_runtime.stop())}
+
     @router.get("/api/localization/latest")
     async def api_localization_latest(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)

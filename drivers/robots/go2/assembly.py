@@ -189,7 +189,11 @@ class Go2RobotAssembly(RobotAssemblyBase):
                 UltralyticsYoloDetectorBackend(
                     name=self.config.perception.yolo.backend_name,
                     weights=self.config.perception.yolo.model_name,
+                    runtime_preference=self.config.perception.yolo.runtime_preference,
+                    engine_path=self.config.perception.yolo.engine_path,
                     device=self.config.perception.yolo.device,
+                    half=self.config.perception.yolo.half,
+                    int8=self.config.perception.yolo.int8,
                     confidence_threshold=self.config.perception.yolo.confidence_threshold,
                     iou_threshold=self.config.perception.yolo.iou_threshold,
                     image_size=self.config.perception.yolo.image_size,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import Any, Iterable, List, Optional, Tuple
 
 from contracts.image import CameraInfo, ImageFrame
@@ -7,6 +9,9 @@ from contracts.perception import BoundingBox2D, Detection2D, Detection3D
 from gateways.errors import GatewayError
 from services.perception.base import DetectionBundle, DetectorBackend, DetectorBackendSpec
 from services.perception.image_utils import decode_image_frame_to_bgr
+
+
+DETECTOR_LOGGER = logging.getLogger("nuwax_robot_bridge.perception.detectors")
 
 
 def _clamp_score(value: object) -> float:
@@ -161,32 +166,52 @@ class MetadataDrivenDetectorBackend(DetectorBackend):
 
 
 class UltralyticsYoloDetectorBackend(DetectorBackend):
-    """基于 Ultralytics YOLO 的生产级本地检测后端。"""
+    """基于 Ultralytics YOLO 的生产级本地检测后端。
+
+    默认优先使用 TensorRT 引擎文件：
+    1. 若明确给出 `.engine`，直接按 TensorRT 方式加载；
+    2. 若给出 `.pt` 且存在同名或显式指定的 `.engine`，优先加载 `.engine`；
+    3. 若 TensorRT 引擎不存在，则自动回退到 `.pt`，避免宿主机启动失败。
+    """
 
     def __init__(
         self,
         *,
         name: str = "yolo_local",
         weights: str = "yolo26n.pt",
+        runtime_preference: str = "tensorrt",
+        engine_path: str = "",
         device: str = "",
+        half: bool = True,
+        int8: bool = False,
         confidence_threshold: float = 0.25,
         iou_threshold: float = 0.45,
         image_size: int = 640,
         max_detections: int = 100,
     ) -> None:
         self._weights = str(weights).strip() or "yolo26n.pt"
+        self._runtime_preference = str(runtime_preference or "tensorrt").strip().lower()
+        self._engine_path = str(engine_path).strip()
         self._device = str(device).strip()
+        self._half = bool(half)
+        self._int8 = bool(int8)
         self._confidence_threshold = max(0.0, min(1.0, float(confidence_threshold)))
         self._iou_threshold = max(0.0, min(1.0, float(iou_threshold)))
         self._image_size = max(32, int(image_size))
         self._max_detections = max(1, int(max_detections))
         self._model = None
+        self._resolved_model_source = ""
+        self._resolved_backend_kind = "ultralytics_yolo"
         self.spec = DetectorBackendSpec(
             name=name,
             backend_kind="ultralytics_yolo",
             metadata={
                 "weights": self._weights,
+                "runtime_preference": self._runtime_preference,
+                "engine_path": self._engine_path,
                 "device": self._device or "auto",
+                "half": self._half,
+                "int8": self._int8,
                 "supports_runtime_switch": True,
                 "input_contract": "ImageFrame/CameraInfo",
             },
@@ -207,9 +232,11 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
             detections_3d=(),
             metadata={
                 "backend_name": self.spec.name,
-                "backend_kind": self.spec.backend_kind,
+                "backend_kind": self._resolved_backend_kind or self.spec.backend_kind,
                 "raw_detection_count": len(detections_2d),
                 "weights": self._weights,
+                "model_source": self._resolved_model_source,
+                "runtime_preference": self._runtime_preference,
                 "device": self._device or "auto",
             },
         )
@@ -236,8 +263,43 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
             raise RuntimeError(
                 "当前环境未安装 ultralytics，无法启用本地 YOLO 检测。"
             ) from exc
-        self._model = YOLO(self._weights)
+        model_source, backend_kind = self._resolve_model_source()
+        self._model = YOLO(model_source)
+        self._resolved_model_source = model_source
+        self._resolved_backend_kind = backend_kind
+        DETECTOR_LOGGER.info(
+            "YOLO 本地检测后端已加载 source=%s backend=%s preference=%s",
+            model_source,
+            backend_kind,
+            self._runtime_preference,
+        )
         return self._model
+
+    def _resolve_model_source(self) -> Tuple[str, str]:
+        weights_path = Path(self._weights)
+        explicit_engine_path = Path(self._engine_path) if self._engine_path else None
+
+        if weights_path.suffix.lower() == ".engine":
+            return str(weights_path), "ultralytics_yolo_tensorrt"
+
+        engine_candidates = []
+        if explicit_engine_path is not None:
+            engine_candidates.append(explicit_engine_path)
+        if weights_path.suffix:
+            engine_candidates.append(weights_path.with_suffix(".engine"))
+
+        if self._runtime_preference in ("tensorrt", "auto"):
+            for candidate in engine_candidates:
+                if candidate.exists():
+                    return str(candidate), "ultralytics_yolo_tensorrt"
+            if self._runtime_preference == "tensorrt":
+                DETECTOR_LOGGER.warning(
+                    "未找到 TensorRT 引擎，已回退到原始权重 source=%s candidates=%s",
+                    self._weights,
+                    [str(item) for item in engine_candidates],
+                )
+
+        return self._weights, "ultralytics_yolo_pytorch"
 
     def _normalize_yolo_result(
         self,
@@ -269,8 +331,8 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
             label = self._resolve_label(names, class_id)
             attributes = {
                 "backend_name": self.spec.name,
-                "backend_kind": self.spec.backend_kind,
-                "model_name": self._weights,
+                "backend_kind": self._resolved_backend_kind or self.spec.backend_kind,
+                "model_name": self._resolved_model_source or self._weights,
                 "class_id": class_id,
                 "relative_area": round((width * height) / float(image_frame.width_px * image_frame.height_px), 6),
                 "center_x_ratio": round(((x1 + x2) * 0.5) / float(image_frame.width_px), 6),
@@ -343,6 +405,12 @@ class DetectorPipeline:
         """返回当前所有已注册检测后端规范。"""
 
         return tuple(backend.spec for backend in self._backends.values())
+
+    @property
+    def default_backend_name(self) -> str:
+        """返回默认检测后端名称。"""
+
+        return self._default_backend_name
 
     def detect(
         self,

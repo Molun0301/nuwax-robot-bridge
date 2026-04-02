@@ -39,7 +39,13 @@ from services.memory import MemoryService
 from services.navigation import NavigationService
 from services.observation_service import ObservationService
 from services.perception import PerceptionService
-from services.perception import Basic2DTrackerBackend, DetectorPipeline, MetadataDrivenDetectorBackend, SimpleSceneDescriptionBackend
+from services.perception import (
+    Basic2DTrackerBackend,
+    DetectorPipeline,
+    MetadataDrivenDetectorBackend,
+    PerceptionVideoRuntime,
+    SimpleSceneDescriptionBackend,
+)
 from services.robot_state_service import RobotStateService
 from skills import SkillRegistry
 from settings import NuwaxRobotBridgeConfig
@@ -202,6 +208,29 @@ class GatewayRuntime:
             history_limit=config.runtime_data.perception_history_limit,
             pipeline_name=str(perception_components["pipeline_name"]),
         )
+        self.perception_video_runtime = PerceptionVideoRuntime(
+            perception_service=self.perception_service,
+            state_store=self.state_store,
+            localization_service=self.localization_service,
+            mapping_service=self.mapping_service,
+            event_bus=self.event_bus,
+            enabled=config.perception.stream_runtime.enabled,
+            auto_start=config.perception.stream_runtime.auto_start,
+            camera_id=config.perception.stream_runtime.camera_id,
+            interval_sec=config.perception.stream_runtime.interval_sec,
+            detector_backend_name=config.perception.stream_runtime.detector_backend_name,
+            store_artifact=config.perception.stream_runtime.store_artifact,
+            failure_backoff_sec=config.perception.stream_runtime.failure_backoff_sec,
+            keyframe_min_interval_sec=config.perception.stream_runtime.keyframe_min_interval_sec,
+            keyframe_max_interval_sec=config.perception.stream_runtime.keyframe_max_interval_sec,
+            keyframe_translation_threshold_m=config.perception.stream_runtime.keyframe_translation_threshold_m,
+            keyframe_yaw_threshold_deg=config.perception.stream_runtime.keyframe_yaw_threshold_deg,
+            remember_keyframes=config.perception.stream_runtime.remember_keyframes,
+            remember_min_interval_sec=config.perception.stream_runtime.remember_min_interval_sec,
+            burst_frame_count=config.perception.stream_runtime.burst_frame_count,
+            burst_interval_sec=config.perception.stream_runtime.burst_interval_sec,
+            memory_service=None,
+        )
         self.audio_service = AudioService(
             config=config,
             robot=robot,
@@ -222,6 +251,7 @@ class GatewayRuntime:
             image_embedding_model=config.runtime_data.memory_image_embedding_model,
             image_embedding_dimension=config.runtime_data.memory_image_embedding_dimension,
         )
+        self.perception_video_runtime._memory_service = self.memory_service
         self.navigation_service = NavigationService(
             provider_owner=robot,
             localization_service=self.localization_service,
@@ -279,6 +309,11 @@ class GatewayRuntime:
                 self.navigation_service.refresh_exploration()
         except Exception:
             pass
+        try:
+            if self.perception_video_runtime.should_auto_start():
+                self.perception_video_runtime.start()
+        except Exception:
+            RUNTIME_LOGGER.exception("自动启动持续视频感知运行时失败。")
 
         self.event_bus.publish(
             self.event_bus.build_event(
@@ -304,6 +339,7 @@ class GatewayRuntime:
             self.safety_guard.stop_all_motion("宿主机网关关闭。")
             self.task_manager.shutdown(wait=False)
             self.audio_service.stop()
+            self.perception_video_runtime.stop()
             self.robot.stop()
             self._started = False
 
@@ -373,6 +409,7 @@ class GatewayRuntime:
                         "assembly_status": {"type": "object"},
                         "robot_state": {"type": "object"},
                         "safety_state": {"type": "object"},
+                        "perception_runtime": {"type": "object"},
                     }
                 ),
             ),
@@ -524,6 +561,30 @@ class GatewayRuntime:
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object({"camera_id": {"type": "string"}}),
                 output_schema=_schema_object({"perception_context": {"type": "object"}}),
+            ),
+            _descriptor(
+                "get_perception_runtime_status",
+                "获取持续感知状态",
+                "读取关键帧驱动的视频感知运行时状态，包括关键帧原因、帧处理计数和最近错误。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                output_schema=_schema_object({"perception_runtime": {"type": "object"}}),
+            ),
+            _descriptor(
+                "start_perception_runtime",
+                "启动持续感知",
+                "启动关键帧驱动的视频感知运行时。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                output_schema=_schema_object({"perception_runtime": {"type": "object"}}),
+            ),
+            _descriptor(
+                "stop_perception_runtime",
+                "停止持续感知",
+                "停止关键帧驱动的视频感知运行时。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                output_schema=_schema_object({"perception_runtime": {"type": "object"}}),
             ),
             _descriptor(
                 "get_localization_snapshot",
@@ -888,6 +949,9 @@ class GatewayRuntime:
             "perceive_current_scene": self._handle_perceive_current_scene,
             "describe_current_scene": self._handle_describe_current_scene,
             "get_latest_perception": self._handle_get_latest_perception,
+            "get_perception_runtime_status": self._handle_get_perception_runtime_status,
+            "start_perception_runtime": self._handle_start_perception_runtime,
+            "stop_perception_runtime": self._handle_stop_perception_runtime,
             "get_localization_snapshot": self._handle_get_localization_snapshot,
             "get_map_snapshot": self._handle_get_map_snapshot,
             "get_navigation_snapshot": self._handle_get_navigation_snapshot,
@@ -1009,6 +1073,13 @@ class GatewayRuntime:
                 description="返回当前场景的中文摘要和结构化感知结果。",
                 category=SkillCategory.OBSERVATION,
                 capability_name="describe_current_scene",
+            ),
+            SkillDescriptor(
+                name="get_perception_runtime_status",
+                display_name="获取持续感知状态",
+                description="读取关键帧驱动的视频感知运行时状态。",
+                category=SkillCategory.OBSERVATION,
+                capability_name="get_perception_runtime_status",
             ),
             SkillDescriptor(
                 name="get_joint_state",
@@ -1250,6 +1321,7 @@ class GatewayRuntime:
             "latest_map": self._serialize(self.mapping_service.get_latest_snapshot()),
             "latest_observation": self._serialize(self.observation_service.get_latest_observation()),
             "latest_perception": self._serialize(self.perception_service.get_latest_perception()),
+            "perception_runtime": self._serialize(self.perception_video_runtime.get_status()),
             "latest_navigation": self._serialize(self.navigation_service.get_latest_navigation_context()),
             "latest_exploration": self._serialize(self.navigation_service.get_latest_exploration_context()),
             "memory_summary": self.memory_service.get_summary().model_dump(mode="json"),
@@ -1276,7 +1348,9 @@ class GatewayRuntime:
     def _handle_get_robot_status(self, _: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
         del requested_by
         snapshot = self.robot_state_service.refresh()
-        return snapshot.model_dump(mode="json")
+        payload = snapshot.model_dump(mode="json")
+        payload["perception_runtime"] = self._serialize(self.perception_video_runtime.get_status())
+        return payload
 
     def _handle_get_active_tasks(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
         del requested_by
@@ -1403,6 +1477,33 @@ class GatewayRuntime:
         if context is None:
             raise GatewayError("当前还没有可用的感知缓存。")
         return {"perception_context": context}
+
+    def _handle_get_perception_runtime_status(
+        self,
+        _: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        return {"perception_runtime": self.perception_video_runtime.get_status()}
+
+    def _handle_start_perception_runtime(
+        self,
+        _: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        return {"perception_runtime": self.perception_video_runtime.start()}
+
+    def _handle_stop_perception_runtime(
+        self,
+        _: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        return {"perception_runtime": self.perception_video_runtime.stop()}
 
     def _handle_get_localization_snapshot(
         self,
@@ -1598,6 +1699,12 @@ class GatewayRuntime:
             requested_by=requested_by,
             completion_callback=(
                 (lambda _navigation_context: {
+                    "burst_messages": self.perception_video_runtime.run_burst(
+                        frame_count=3,
+                        interval_sec=0.05,
+                        requested_reason="arrival_verify",
+                        store_artifact=False,
+                    ),
                     "arrival_verification": self.memory_service.verify_arrival(
                         target_name,
                         navigation_candidate=navigation_candidate,
@@ -1680,12 +1787,20 @@ class GatewayRuntime:
                     ),
                 )
                 context.ensure_active()
-                perception_context = self.perception_service.describe_current_scene(
-                    camera_id=camera_id,
-                    refresh=True,
-                    requested_by=requested_by,
-                    detector_backend_name=detector_backend,
+                self.perception_video_runtime.run_burst(
+                    frame_count=5,
+                    interval_sec=0.12,
+                    requested_reason="inspect_target_verify",
+                    store_artifact=False,
                 )
+                perception_context = self.perception_service.get_latest_perception(camera_id)
+                if perception_context is None:
+                    perception_context = self.perception_service.describe_current_scene(
+                        camera_id=camera_id,
+                        refresh=True,
+                        requested_by=requested_by,
+                        detector_backend_name=detector_backend,
+                    )
                 matched_object = self._find_scene_object(query, perception_context)
 
             if matched_object is None:
@@ -1753,6 +1868,7 @@ class GatewayRuntime:
                         camera_id=camera_id,
                         requested_by=requested_by,
                         detector_backend_name=detector_backend,
+                        store_artifact=False,
                     )
                     detection = self._find_best_detection(query, perception_context)
                     if detection is None:
@@ -2212,6 +2328,18 @@ class GatewayRuntime:
             "get_latest_perception": (
                 self._has_provider(ImageProvider),
                 "当前机器人入口未提供图像采集提供器。",
+            ),
+            "get_perception_runtime_status": (
+                self._has_provider(ImageProvider),
+                "当前机器人入口未提供图像采集提供器。",
+            ),
+            "start_perception_runtime": (
+                self._has_provider(ImageProvider) and self.perception_video_runtime.is_enabled(),
+                "当前机器人入口未提供图像采集提供器，或持续感知功能未启用。",
+            ),
+            "stop_perception_runtime": (
+                self._has_provider(ImageProvider) and self.perception_video_runtime.is_enabled(),
+                "当前机器人入口未提供图像采集提供器，或持续感知功能未启用。",
             ),
             "get_localization_snapshot": (
                 self.localization_service.is_available(),

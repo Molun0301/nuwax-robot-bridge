@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 import pytest
 
 from contracts.artifacts import ArtifactRetentionPolicy
+from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
+from contracts.runtime_views import LocalizationSnapshot
 from contracts.perception import TrackState
 from contracts.runtime_views import SceneObjectSummary, SceneSummary
 from core import EventBus, StateNamespace, StateStore
@@ -18,6 +21,7 @@ from services.perception import (
     HybridSceneDescriptionBackend,
     MetadataDrivenDetectorBackend,
     PerceptionService,
+    PerceptionVideoRuntime,
     SceneDescriptionBackend,
     SceneDescriptionBackendSpec,
     SimpleSceneDescriptionBackend,
@@ -224,6 +228,40 @@ class _StubCloudSceneBackend(SceneDescriptionBackend):
         )
 
 
+class _StaticLocalizationService:
+    """测试用定位服务。"""
+
+    def __init__(self) -> None:
+        self.pose = Pose(
+            frame_id="map",
+            position=Vector3(x=0.0, y=0.0, z=0.0),
+            orientation=Quaternion(w=1.0),
+        )
+
+    def get_latest_snapshot(self):
+        return LocalizationSnapshot(
+            source_name="test_localization",
+            current_pose=self.pose,
+        )
+
+    def is_available(self) -> bool:
+        return True
+
+    def refresh(self):
+        return self.get_latest_snapshot()
+
+
+class _FakeMemoryService:
+    """测试用记忆服务。"""
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    def remember_current_scene(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        return {"ok": True}
+
+
 def test_perception_service_requires_standard_imageframe_and_camerainfo(tmp_path: Path) -> None:
     """感知服务必须只接受标准 ImageFrame/CameraInfo。"""
 
@@ -297,6 +335,80 @@ def test_yolo_detector_backend_normalizes_ultralytics_results() -> None:
     assert detection.score == pytest.approx(0.93)
     assert detection.attributes["model_name"] == "yolo26n.pt"
     assert detection.attributes["class_id"] == 0
+
+
+def test_yolo_detector_backend_prefers_engine_when_available(tmp_path: Path) -> None:
+    """当 TensorRT 引擎存在时，YOLO 后端应优先加载 .engine。"""
+
+    weights_path = tmp_path / "yolo26n.pt"
+    engine_path = tmp_path / "yolo26n.engine"
+    weights_path.write_bytes(b"fake-pt")
+    engine_path.write_bytes(b"fake-engine")
+
+    backend = UltralyticsYoloDetectorBackend(
+        weights=str(weights_path),
+        engine_path=str(engine_path),
+        runtime_preference="tensorrt",
+    )
+    resolved_source, backend_kind = backend._resolve_model_source()
+
+    assert resolved_source == str(engine_path)
+    assert backend_kind == "ultralytics_yolo_tensorrt"
+
+
+def test_perception_video_runtime_uses_keyframes_and_burst_without_memory_flooding(tmp_path: Path) -> None:
+    """关键帧应写记忆，burst 复核默认不应把每帧都写入记忆。"""
+
+    provider_owner = _ProviderOwner(UsbCameraBundle())
+    service, state_store = _build_perception_service(tmp_path, provider_owner)
+    localization_service = _StaticLocalizationService()
+    memory_service = _FakeMemoryService()
+    runtime = PerceptionVideoRuntime(
+        perception_service=service,
+        state_store=state_store,
+        localization_service=localization_service,
+        mapping_service=None,
+        memory_service=memory_service,
+        enabled=True,
+        auto_start=False,
+        camera_id="front_camera",
+        interval_sec=0.1,
+        store_artifact=False,
+        keyframe_min_interval_sec=0.1,
+        keyframe_max_interval_sec=2.0,
+        keyframe_translation_threshold_m=0.3,
+        keyframe_yaw_threshold_deg=10.0,
+        remember_keyframes=True,
+        remember_min_interval_sec=0.1,
+        burst_frame_count=2,
+        burst_interval_sec=0.01,
+    )
+
+    first_message = runtime.run_once()
+    assert first_message is not None
+    assert len(memory_service.calls) == 1
+
+    skipped_message = runtime.run_once()
+    assert skipped_message is None
+    assert len(memory_service.calls) == 1
+
+    time.sleep(0.12)
+    localization_service.pose = Pose(
+        frame_id="map",
+        position=Vector3(x=0.5, y=0.0, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+    second_message = runtime.run_once()
+    assert second_message is not None
+    assert len(memory_service.calls) == 2
+
+    burst_messages = runtime.run_burst(frame_count=2, interval_sec=0.01, remember_result=False)
+    assert len(burst_messages) == 2
+    assert len(memory_service.calls) == 2
+
+    status = runtime.get_status()
+    assert status.processed_frames >= 4
+    assert status.metadata["camera_id"] == "front_camera"
 
 
 def test_tracker_lifecycle_flows_from_tentative_to_removed(tmp_path: Path) -> None:
