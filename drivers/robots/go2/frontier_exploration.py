@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import IntEnum
 import math
 from typing import List, Optional, Sequence, Tuple, TYPE_CHECKING
 
@@ -15,6 +16,20 @@ if TYPE_CHECKING:
 
 
 Cell2D = Tuple[int, int]
+
+
+class ExplorationSafetyStatus(IntEnum):
+    SAFE = 0
+    WARNING = 1
+    DANGER = 2
+
+
+@dataclass
+class Go2ExplorationSafetyResult:
+    status: ExplorationSafetyStatus
+    min_obstacle_distance_m: float
+    recommended_speed_mps: float
+    stop_required: bool
 
 
 @dataclass
@@ -45,6 +60,76 @@ class Go2FrontierExplorer:
 
     def __init__(self, config: "Go2ExplorationConfig") -> None:
         self.config = config
+        self._last_scan_ranges: Optional[np.ndarray] = None
+        self._exploration_active: bool = False
+
+    def check_exploration_safety(
+        self,
+        current_pose: Pose,
+        scan_ranges: Optional[np.ndarray] = None,
+    ) -> Go2ExplorationSafetyResult:
+        """检测探索期间的安全性，返回是否需要停止或减速。"""
+        if scan_ranges is None:
+            if self._last_scan_ranges is None:
+                return Go2ExplorationSafetyResult(
+                    status=ExplorationSafetyStatus.SAFE,
+                    min_obstacle_distance_m=999.0,
+                    recommended_speed_mps=0.35,
+                    stop_required=False,
+                )
+            scan_ranges = self._last_scan_ranges
+
+        self._last_scan_ranges = scan_ranges
+
+        valid_mask = (scan_ranges >= 0.05) & (scan_ranges <= 25.0)
+        if not np.any(valid_mask):
+            return Go2ExplorationSafetyResult(
+                status=ExplorationSafetyStatus.SAFE,
+                min_obstacle_distance_m=999.0,
+                recommended_speed_mps=0.35,
+                stop_required=False,
+            )
+
+        valid_ranges = scan_ranges[valid_mask]
+        min_distance = float(np.min(valid_ranges))
+
+        front_arc = scan_ranges[len(scan_ranges)//3:2*len(scan_ranges)//3]
+        front_min = float(np.min(front_arc)) if len(front_arc) > 0 else min_distance
+
+        if front_min <= 0.3 or min_distance <= 0.25:
+            return Go2ExplorationSafetyResult(
+                status=ExplorationSafetyStatus.DANGER,
+                min_obstacle_distance_m=min(front_min, min_distance),
+                recommended_speed_mps=0.0,
+                stop_required=True,
+            )
+        elif front_min <= 0.6 or min_distance <= 0.4:
+            return Go2ExplorationSafetyResult(
+                status=ExplorationSafetyStatus.WARNING,
+                min_obstacle_distance_m=min(front_min, min_distance),
+                recommended_speed_mps=0.15,
+                stop_required=False,
+            )
+
+        return Go2ExplorationSafetyResult(
+            status=ExplorationSafetyStatus.SAFE,
+            min_obstacle_distance_m=min(front_min, min_distance),
+            recommended_speed_mps=0.25,
+            stop_required=False,
+        )
+
+    def start_exploration(self) -> None:
+        """开始探索，必须先调用此方法。"""
+        self._exploration_active = True
+        self._last_scan_ranges = None
+
+    def stop_exploration(self) -> None:
+        """停止探索。"""
+        self._exploration_active = False
+
+    @property
+    def is_exploration_active(self) -> bool:
+        return self._exploration_active
 
     def select_candidates(
         self,

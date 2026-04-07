@@ -227,23 +227,71 @@ class Go2MapSynthesisConfig:
     global_map_free_log_odds_delta: float = 0.35
     global_map_log_odds_min: float = -4.0
     global_map_log_odds_max: float = 4.0
-    global_map_occupied_log_odds_threshold: float = 0.75
-    global_map_inflation_radius_m: float = 0.25
-    local_map_enabled: bool = True
-    local_map_resolution_m: float = 0.10
-    local_map_width: int = 200
-    local_map_height: int = 200
-    local_map_update_interval_sec: float = 0.5
-    local_map_max_scans: int = 12
-    local_map_max_scan_age_sec: float = 20.0
-    local_map_min_obstacle_height_m: float = -0.20
-    local_map_max_obstacle_height_m: float = 1.20
-    local_map_max_range_m: float = 8.0
-    local_map_inflation_radius_m: float = 0.25
-    lidar_offset_x_m: float = 0.0
-    lidar_offset_y_m: float = 0.0
-    lidar_offset_z_m: float = 0.0
-    lidar_yaw_offset_rad: float = 0.0
+
+
+@dataclass
+class Go2CollisionDetectorConfig:
+    """Go2 实时碰撞检测配置。"""
+
+    enabled: bool = True
+    min_lidar_range_m: float = 0.05
+    max_lidar_range_m: float = 25.0
+    warning_distance_m: float = 0.60
+    danger_distance_m: float = 0.25
+    front_arc_half_angle_rad: float = 1.05
+
+
+@dataclass
+class Go2CostMapperConfig:
+    """Go2 3D点云到2D代价地图转换配置。"""
+
+    enabled: bool = True
+    width: int = 200
+    height: int = 200
+    resolution_m: float = 0.10
+    frame_id: str = "odom"
+    height_diff_threshold_m: float = 0.10
+    max_height_m: float = 1.20
+    min_height_m: float = -0.20
+    obstacle_inflation_radius_m: float = 0.35
+    traversability_threshold: float = 0.55
+    max_gradient_rad: float = 0.75
+
+
+@dataclass
+class Go2VoxelMapperConfig:
+    """Go2 体素地图构建配置。"""
+
+    enabled: bool = True
+    voxel_size: float = 0.05
+    block_count: int = 2_000_000
+    device: str = "CUDA:0"
+    carve_columns: bool = True
+    frame_id: str = "odom"
+    publish_interval_sec: float = 0.5
+    min_z_m: float = -0.20
+    max_z_m: float = 1.20
+
+
+@dataclass
+class Go2LocalPlanningConfig:
+    """Go2 DWA局部动态避障规划器配置。"""
+
+    enabled: bool = True
+    max_linear_velocity_mps: float = 0.35
+    max_angular_velocity_rps: float = 0.8
+    min_linear_velocity_mps: float = 0.08
+    max_samples_vx: int = 8
+    max_samples_vy: int = 5
+    max_samples_omega: int = 11
+    trajectory_horizon_sec: float = 1.0
+    control_frequency_hz: float = 10.0
+    orientation_tolerance_rad: float = 0.35
+    goal_tolerance_m: float = 0.45
+    path_deviation_tolerance_m: float = 0.75
+    obstacle_weight: float = 1.5
+    path_weight: float = 0.8
+    velocity_weight: float = 0.3
 
 
 @dataclass
@@ -288,6 +336,10 @@ class Go2DataPlaneConfig:
     official: Go2OfficialBackendConfig = field(default_factory=Go2OfficialBackendConfig)
     navigation: Go2NavigationBackendConfig = field(default_factory=Go2NavigationBackendConfig)
     map_synthesis: Go2MapSynthesisConfig = field(default_factory=Go2MapSynthesisConfig)
+    collision_detector: Go2CollisionDetectorConfig = field(default_factory=Go2CollisionDetectorConfig)
+    cost_mapper: Go2CostMapperConfig = field(default_factory=Go2CostMapperConfig)
+    voxel_mapper: Go2VoxelMapperConfig = field(default_factory=Go2VoxelMapperConfig)
+    local_planning: Go2LocalPlanningConfig = field(default_factory=Go2LocalPlanningConfig)
     exploration: Go2ExplorationConfig = field(default_factory=Go2ExplorationConfig)
 
 
@@ -441,6 +493,55 @@ def load_go2_data_plane_config() -> Go2DataPlaneConfig:
             lidar_offset_y_m=_cfg_float("GO2_DATA_PLANE_LIDAR_OFFSET_Y_M", 0.0),
             lidar_offset_z_m=_cfg_float("GO2_DATA_PLANE_LIDAR_OFFSET_Z_M", 0.0),
             lidar_yaw_offset_rad=_cfg_float("GO2_DATA_PLANE_LIDAR_YAW_OFFSET_RAD", 0.0),
+        ),
+        collision_detector=Go2CollisionDetectorConfig(
+            enabled=_cfg_bool("GO2_COLLISION_DETECTOR_ENABLED", True),
+            min_lidar_range_m=max(0.01, _cfg_float("GO2_COLLISION_DETECTOR_MIN_LIDAR_RANGE_M", 0.05)),
+            max_lidar_range_m=max(1.0, _cfg_float("GO2_COLLISION_DETECTOR_MAX_LIDAR_RANGE_M", 25.0)),
+            warning_distance_m=max(0.1, _cfg_float("GO2_COLLISION_DETECTOR_WARNING_DISTANCE_M", 0.60)),
+            danger_distance_m=max(0.05, _cfg_float("GO2_COLLISION_DETECTOR_DANGER_DISTANCE_M", 0.25)),
+            front_arc_half_angle_rad=max(0.1, _cfg_float("GO2_COLLISION_DETECTOR_FRONT_ARC_HALF_ANGLE_RAD", 1.05)),
+        ),
+        cost_mapper=Go2CostMapperConfig(
+            enabled=_cfg_bool("GO2_COST_MAPPER_ENABLED", True),
+            width=max(20, _cfg_int("GO2_COST_MAPPER_WIDTH", 200)),
+            height=max(20, _cfg_int("GO2_COST_MAPPER_HEIGHT", 200)),
+            resolution_m=max(0.02, _cfg_float("GO2_COST_MAPPER_RESOLUTION_M", 0.10)),
+            frame_id=_cfg_str("GO2_COST_MAPPER_FRAME_ID", "odom"),
+            height_diff_threshold_m=max(0.01, _cfg_float("GO2_COST_MAPPER_HEIGHT_DIFF_THRESHOLD_M", 0.10)),
+            max_height_m=_cfg_float("GO2_COST_MAPPER_MAX_HEIGHT_M", 1.20),
+            min_height_m=_cfg_float("GO2_COST_MAPPER_MIN_HEIGHT_M", -0.20),
+            obstacle_inflation_radius_m=max(0.05, _cfg_float("GO2_COST_MAPPER_OBSTACLE_INFLATION_RADIUS_M", 0.35)),
+            traversability_threshold=max(0.1, min(1.0, _cfg_float("GO2_COST_MAPPER_TRAVERSABILITY_THRESHOLD", 0.55))),
+            max_gradient_rad=max(0.1, _cfg_float("GO2_COST_MAPPER_MAX_GRADIENT_RAD", 0.75)),
+        ),
+        voxel_mapper=Go2VoxelMapperConfig(
+            enabled=_cfg_bool("GO2_VOXEL_MAPPER_ENABLED", True),
+            voxel_size=max(0.01, _cfg_float("GO2_VOXEL_MAPPER_VOXEL_SIZE", 0.05)),
+            block_count=max(10000, _cfg_int("GO2_VOXEL_MAPPER_BLOCK_COUNT", 2000000)),
+            device=_cfg_str("GO2_VOXEL_MAPPER_DEVICE", "CUDA:0"),
+            carve_columns=_cfg_bool("GO2_VOXEL_MAPPER_CARVE_COLUMNS", True),
+            frame_id=_cfg_str("GO2_VOXEL_MAPPER_FRAME_ID", "odom"),
+            publish_interval_sec=max(0.1, _cfg_float("GO2_VOXEL_MAPPER_PUBLISH_INTERVAL_SEC", 0.5)),
+            min_z_m=_cfg_float("GO2_VOXEL_MAPPER_MIN_Z_M", -0.20),
+            max_z_m=_cfg_float("GO2_VOXEL_MAPPER_MAX_Z_M", 1.20),
+        ),
+        local_planning=Go2LocalPlanningConfig(
+            enabled=_cfg_bool("GO2_LOCAL_PLANNING_ENABLED", True),
+            max_linear_velocity_mps=max(0.05, _cfg_float("GO2_LOCAL_PLANNING_MAX_LINEAR_VELOCITY_MPS", 0.35)),
+            max_angular_velocity_rps=max(0.1, _cfg_float("GO2_LOCAL_PLANNING_MAX_ANGULAR_VELOCITY_RPS", 0.8)),
+            min_linear_velocity_mps=max(0.01, _cfg_float("GO2_LOCAL_PLANNING_MIN_LINEAR_VELOCITY_MPS", 0.08)),
+            max_samples_vx=max(3, _cfg_int("GO2_LOCAL_PLANNING_MAX_SAMPLES_VX", 8)),
+            max_samples_vy=max(3, _cfg_int("GO2_LOCAL_PLANNING_MAX_SAMPLES_VY", 5)),
+            max_samples_omega=max(5, _cfg_int("GO2_LOCAL_PLANNING_MAX_SAMPLES_OMEGA", 11)),
+            trajectory_horizon_sec=max(0.3, _cfg_float("GO2_LOCAL_PLANNING_TRAJECTORY_HORIZON_SEC", 1.0)),
+            control_frequency_hz=max(1.0, _cfg_float("GO2_LOCAL_PLANNING_CONTROL_FREQUENCY_HZ", 10.0)),
+            orientation_tolerance_rad=max(0.05, _cfg_float("GO2_LOCAL_PLANNING_ORIENTATION_TOLERANCE_RAD", 0.35)),
+            goal_tolerance_m=max(0.1, _cfg_float("GO2_LOCAL_PLANNING_GOAL_TOLERANCE_M", 0.45)),
+            path_deviation_tolerance_m=max(0.2, _cfg_float("GO2_LOCAL_PLANNING_PATH_DEVIATION_TOLERANCE_M", 0.75)),
+            obstacle_weight=max(0.1, _cfg_float("GO2_LOCAL_PLANNING_OBSTACLE_WEIGHT", 1.5)),
+            path_weight=max(0.1, _cfg_float("GO2_LOCAL_PLANNING_PATH_WEIGHT", 0.8)),
+            velocity_weight=max(0.05, _cfg_float("GO2_LOCAL_PLANNING_VELOCITY_WEIGHT", 0.3)),
         ),
         exploration=Go2ExplorationConfig(
             enabled=_cfg_bool("GO2_EXPLORATION_ENABLED", False),

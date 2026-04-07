@@ -26,6 +26,10 @@ from contracts.robot_state import IMUState
 from drivers.robots.go2.frontier_exploration import Go2FrontierExplorer
 from drivers.robots.go2.global_map import Go2GlobalMapBuildResult, Go2SparseGlobalMapBuilder
 from drivers.robots.go2.navigation_backend import Go2GridNavigationPlanner, Go2NavigationSession
+from drivers.robots.go2.collision_detector import Go2CollisionDetector, Go2CollisionDetectorConfig, CollisionStatus
+from drivers.robots.go2.cost_mapper import Go2CostMapper, Go2CostMapperConfig, Go2CostMapperResult
+from drivers.robots.go2.voxel_mapper import Go2VoxelMapper, Go2VoxelMapperConfig, Go2VoxelMapperResult
+from drivers.robots.go2.local_planner import Go2DWALocalPlanner, Go2LocalPlannerConfig, Go2VelocityCommand, LocalPlannerState
 
 if TYPE_CHECKING:
     from drivers.robots.go2.settings import Go2DataPlaneConfig
@@ -292,6 +296,14 @@ class RclpyGo2RosBridge:
         self._last_global_map_update_monotonic = 0.0
         self._last_local_map_update_monotonic = 0.0
 
+        self._collision_detector = Go2CollisionDetector(self.config.collision_detector)
+        self._cost_mapper = Go2CostMapper(self.config.cost_mapper)
+        self._voxel_mapper = Go2VoxelMapper(self.config.voxel_mapper)
+        self._local_planner = Go2DWALocalPlanner(self.config.local_planning)
+        self._frontier_explorer: Optional[Go2FrontierExplorer] = None
+        self._last_collision_status = CollisionStatus.SAFE
+        self._last_local_velocity_cmd: Optional[Go2VelocityCommand] = None
+
     def start(self) -> None:
         """启动 Go2 数据桥。"""
 
@@ -480,6 +492,70 @@ class RclpyGo2RosBridge:
                 or self._latest_cost_from_local_cloud
             )
             return cost_map.model_copy(deep=True) if cost_map is not None else None
+
+    def get_collision_status(
+        self,
+        current_pose: Pose,
+        scan_ranges: Optional[np.ndarray] = None,
+    ) -> CollisionStatus:
+        """实时碰撞检测。"""
+        return self._collision_detector.check_collision(current_pose, scan_ranges)
+
+    def process_pointcloud_for_costmap(
+        self,
+        points_xyz: np.ndarray,
+        sensor_x: float,
+        sensor_y: float,
+    ) -> Optional[Go2CostMapperResult]:
+        """将3D点云转换为2D代价地图。"""
+        return self._cost_mapper.process_pointcloud(points_xyz, sensor_x, sensor_y)
+
+    def add_pointcloud_to_voxel_map(
+        self,
+        points_xyz: np.ndarray,
+        timestamp: float = 0.0,
+    ) -> Optional[Go2VoxelMapperResult]:
+        """添加一帧点云到体素地图。"""
+        return self._voxel_mapper.add_frame(points_xyz, timestamp)
+
+    def compute_local_velocity(
+        self,
+        current_pose: Pose,
+        global_plan: List[Tuple[float, float]],
+        cost_map: Optional[np.ndarray] = None,
+        scan_ranges: Optional[np.ndarray] = None,
+    ) -> Go2VelocityCommand:
+        """用DWA计算局部动态避障速度。"""
+        return self._local_planner.compute_velocity(
+            current_pose, global_plan, cost_map, scan_ranges
+        )
+
+    def check_exploration_safety(
+        self,
+        current_pose: Pose,
+        scan_ranges: Optional[np.ndarray] = None,
+    ):
+        """检测探索期间的安全性。"""
+        if self._frontier_explorer is None:
+            from drivers.robots.go2.settings import Go2ExplorationConfig
+            self._frontier_explorer = Go2FrontierExplorer(Go2ExplorationConfig())
+        return self._frontier_explorer.check_exploration_safety(current_pose, scan_ranges)
+
+    def get_voxel_map_pointcloud(self) -> Optional[np.ndarray]:
+        """获取体素地图生成的全局点云。"""
+        return self._voxel_mapper.get_global_pointcloud()
+
+    def get_voxel_map_count(self) -> int:
+        """获取当前体素数量。"""
+        return self._voxel_mapper.get_voxel_count()
+
+    def get_local_planner_state(self) -> LocalPlannerState:
+        """获取局部规划器状态。"""
+        return self._local_planner.state
+
+    def reset_local_planner(self) -> None:
+        """重置局部规划器。"""
+        self._local_planner.reset()
 
     def get_semantic_map(self) -> Optional[SemanticMap]:
         """读取语义地图。"""
