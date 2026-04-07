@@ -444,6 +444,56 @@ def _wait_for_condition(predicate, *, timeout_sec: float = 1.0) -> None:
     raise AssertionError("条件在超时时间内未满足。")
 
 
+def _enable_memory_library(
+    client: TestClient,
+    *,
+    library_name: str = "集成测试记忆库",
+    load_history: bool = True,
+    reset_library: bool = False,
+) -> dict:
+    response = client.post(
+        "/api/capabilities/enable_memory_library/invoke",
+        headers=_agent_headers(),
+        json={
+            "arguments": {
+                "library_name": library_name,
+                "load_history": load_history,
+                "reset_library": reset_library,
+            }
+        },
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
+def _create_memory_library(
+    client: TestClient,
+    *,
+    library_name: str,
+) -> dict:
+    response = client.post(
+        "/api/capabilities/create_memory_library/invoke",
+        headers=_agent_headers(),
+        json={"arguments": {"library_name": library_name}},
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
+def _delete_memory_library(
+    client: TestClient,
+    *,
+    library_name: str,
+) -> dict:
+    response = client.post(
+        "/api/capabilities/delete_memory_library/invoke",
+        headers=_agent_headers(),
+        json={"arguments": {"library_name": library_name}},
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
 def test_gateway_mcp_http_and_auth_behaviour(tmp_path: Path) -> None:
     """宿主机网关应同时支持 MCP、HTTP 和角色鉴权。"""
 
@@ -468,7 +518,12 @@ def test_gateway_mcp_http_and_auth_behaviour(tmp_path: Path) -> None:
         )
         tool_names = {item["name"] for item in tools.json()["result"]["tools"]}
         assert "capture_image" in tool_names
+        assert "get_latest_observation" in tool_names
+        assert "perceive_current_scene" in tool_names
         assert "describe_current_scene" in tool_names
+        assert "get_latest_perception" in tool_names
+        assert "start_perception_runtime" in tool_names
+        assert "stop_perception_runtime" in tool_names
         assert "get_joint_state" in tool_names
         assert "get_imu_state" in tool_names
         assert "get_localization_snapshot" in tool_names
@@ -478,6 +533,7 @@ def test_gateway_mcp_http_and_auth_behaviour(tmp_path: Path) -> None:
         assert "navigate_to_named_location" in tool_names
         assert "explore_area" in tool_names
         assert "relative_move" in tool_names
+        assert "get_task_status" in tool_names
         assert "switch_control_mode" not in tool_names
 
         forbidden = client.post(
@@ -676,6 +732,45 @@ def test_gateway_perception_runtime_status_and_control(tmp_path: Path) -> None:
         assert stopped.json()["perception_runtime"]["running"] is False
 
 
+def test_gateway_perception_runtime_auto_start_waits_for_memory_enable(tmp_path: Path) -> None:
+    """持续视觉不应在记忆库未启用时自动启动；启用后才自动拉起。"""
+
+    config = _build_test_config(tmp_path)
+    config.perception.stream_runtime.auto_start = True
+    robot = FakeRobotAssembly()
+    runtime = create_default_gateway_runtime(config, robot)
+    app = create_gateway_app(runtime, config, start_runtime_on_lifespan=True)
+
+    with TestClient(app) as client:
+        initial_status = client.get("/api/perception/runtime", headers=_agent_headers())
+        assert initial_status.status_code == 200
+        assert initial_status.json()["perception_runtime"]["running"] is False
+
+        enable_memory = client.post(
+            "/api/capabilities/enable_memory_library/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {"library_name": "自动启动记忆库", "load_history": False, "reset_library": False}},
+        )
+        assert enable_memory.status_code == 200
+
+        _wait_for_condition(
+            lambda: client.get("/api/perception/runtime", headers=_agent_headers()).json()["perception_runtime"]["running"] is True,
+            timeout_sec=1.0,
+        )
+
+        disable_memory = client.post(
+            "/api/capabilities/disable_memory_library/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {}},
+        )
+        assert disable_memory.status_code == 200
+
+        _wait_for_condition(
+            lambda: client.get("/api/perception/runtime", headers=_agent_headers()).json()["perception_runtime"]["running"] is False,
+            timeout_sec=1.0,
+        )
+
+
 def test_gateway_localization_mapping_navigation_and_exploration(tmp_path: Path) -> None:
     """宿主机网关应暴露定位、地图、导航和探索主链路。"""
 
@@ -737,6 +832,7 @@ def test_gateway_memory_tools_and_named_navigation(tmp_path: Path) -> None:
 
     app, _, robot, _ = _build_host_app(tmp_path)
     with TestClient(app) as client:
+        _enable_memory_library(client, library_name="网关记忆链路")
         tools = client.get("/api/tools", headers=_agent_headers())
         admin_tools = client.get("/api/tools", headers=_admin_headers())
 
@@ -745,9 +841,20 @@ def test_gateway_memory_tools_and_named_navigation(tmp_path: Path) -> None:
         tool_names = {item["descriptor"]["name"] for item in tools.json()["tools"]}
         admin_tool_names = {item["descriptor"]["name"] for item in admin_tools.json()["tools"]}
         assert "tag_location" in tool_names
+        assert "list_memory_libraries" in tool_names
+        assert "create_memory_library" in tool_names
+        assert "enable_memory_library" in tool_names
+        assert "disable_memory_library" in tool_names
+        assert "delete_memory_library" in tool_names
         assert "remember_current_scene" in tool_names
         assert "switch_control_mode" not in tool_names
         assert "switch_control_mode" in admin_tool_names
+
+        create_result = _create_memory_library(client, library_name="预创建记忆库")
+        create_payload = create_result["result"]
+        assert create_payload["create_result"]["created"] is True
+        assert create_payload["memory_summary"]["metadata"]["memory_enabled"] is True
+        assert any(item["library_name"] == "预创建记忆库" for item in create_payload["libraries"])
 
         nav_pose = client.post(
             "/api/capabilities/navigate_to_pose/invoke",
@@ -846,8 +953,20 @@ def test_gateway_memory_tools_and_named_navigation(tmp_path: Path) -> None:
         assert list_capabilities.status_code == 200
         structured = list_capabilities.json()["result"]["structuredContent"]["result"]
         skill_names = {item["descriptor"]["name"] for item in structured["skills"]}
+        assert "list_memory_libraries" in skill_names
+        assert "create_memory_library" in skill_names
+        assert "enable_memory_library" in skill_names
+        assert "disable_memory_library" in skill_names
+        assert "delete_memory_library" in skill_names
         assert "tag_location" in skill_names
         assert "navigate_to_named_location" in skill_names
+
+        delete_result = _delete_memory_library(client, library_name="网关记忆链路")
+        delete_payload = delete_result["result"]
+        assert delete_payload["delete_result"]["deleted"] is True
+        assert delete_payload["delete_result"]["was_active"] is True
+        assert delete_payload["memory_summary"]["metadata"]["memory_enabled"] is False
+        assert all(item["library_name"] != "网关记忆链路" for item in delete_payload["libraries"])
 
 
 def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
@@ -1083,6 +1202,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
         assert robot.move_commands
         assert robot.stop_count >= 1
 
+        _enable_memory_library(client, library_name="巡检记忆库")
         inspect = client.post(
             "/api/capabilities/inspect_target/invoke",
             headers=_agent_headers(),
@@ -1099,6 +1219,65 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
         )
         assert memory_query.status_code == 200
         assert memory_query.json()["result"]["query_result"]["matches"]
+
+
+def test_gateway_memory_starts_disabled_until_explicitly_enabled(tmp_path: Path) -> None:
+    """平台启动后不应默认启用记忆库。"""
+
+    app, _, _, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        summary = client.get("/api/memory/summary", headers=_agent_headers())
+        libraries = client.get("/api/memory/libraries", headers=_agent_headers())
+        query = client.post(
+            "/api/capabilities/query_semantic_memory/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {"query": "person", "similarity_threshold": 0.1}},
+        )
+
+        assert summary.status_code == 200
+        assert summary.json()["memory_summary"]["metadata"]["memory_enabled"] is False
+        assert libraries.status_code == 200
+        assert libraries.json()["libraries"] == []
+        assert query.status_code == 409
+        assert query.json()["error"]["code"] == "memory_disabled"
+
+
+def test_gateway_named_memory_library_can_choose_history_loading(tmp_path: Path) -> None:
+    """命名记忆库应支持显式选择是否加载历史。"""
+
+    app, _, _, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        _enable_memory_library(client, library_name="大厅巡检记忆")
+
+        describe = client.post(
+            "/api/capabilities/describe_current_scene/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {"camera_id": "front_camera"}},
+        )
+        assert describe.status_code == 200
+
+        tag_location = client.post(
+            "/api/capabilities/tag_location/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {"name": "大厅补给点", "camera_id": "front_camera"}},
+        )
+        assert tag_location.status_code == 200
+
+    second_app, _, _, _ = _build_host_app(tmp_path)
+    with TestClient(second_app) as client:
+        _enable_memory_library(client, library_name="大厅巡检记忆", load_history=False)
+        summary_without_history = client.get("/api/memory/summary", headers=_agent_headers())
+        libraries = client.get("/api/memory/libraries", headers=_agent_headers())
+
+        assert summary_without_history.status_code == 200
+        assert summary_without_history.json()["memory_summary"]["tagged_location_count"] == 0
+        assert libraries.status_code == 200
+        assert libraries.json()["libraries"][0]["library_name"] == "大厅巡检记忆"
+
+        _enable_memory_library(client, library_name="大厅巡检记忆", load_history=True)
+        summary_with_history = client.get("/api/memory/summary", headers=_agent_headers())
+        assert summary_with_history.status_code == 200
+        assert summary_with_history.json()["memory_summary"]["tagged_location_count"] >= 1
 
 
 def test_gateway_navigation_task_cancel_and_timeout(tmp_path: Path) -> None:

@@ -250,6 +250,9 @@ class GatewayRuntime:
             embedding_dimension=config.runtime_data.memory_embedding_dimension,
             image_embedding_model=config.runtime_data.memory_image_embedding_model,
             image_embedding_dimension=config.runtime_data.memory_image_embedding_dimension,
+            embedding_api_key=config.runtime_data.memory_embedding_api_key,
+            embedding_base_url=config.runtime_data.memory_embedding_base_url,
+            embedding_timeout_sec=config.runtime_data.memory_embedding_timeout_sec,
         )
         self.perception_video_runtime._memory_service = self.memory_service
         self.navigation_service = NavigationService(
@@ -263,6 +266,8 @@ class GatewayRuntime:
         self._lock = threading.RLock()
         self._started = False
         self._event_log_subscription_id = self.event_bus.subscribe(self._log_runtime_event)
+        self._base_capability_matrix = robot.manifest.capability_matrix
+        self._gateway_capability_names: Tuple[str, ...] = ()
 
         self.capability_registry.bind_robot_capability_matrix(robot.manifest.capability_matrix)
         self.safety_guard.register_stop_handler("robot_entry", self._safe_stop_robot)
@@ -314,6 +319,7 @@ class GatewayRuntime:
                 self.perception_video_runtime.start()
         except Exception:
             RUNTIME_LOGGER.exception("自动启动持续视频感知运行时失败。")
+        self._refresh_dynamic_capability_matrix()
 
         self.event_bus.publish(
             self.event_bus.build_event(
@@ -612,6 +618,78 @@ class GatewayRuntime:
                     {
                         "navigation_context": {"type": "object"},
                         "exploration_context": {"type": "object"},
+                    }
+                ),
+            ),
+            _descriptor(
+                "list_memory_libraries",
+                "列出记忆库",
+                "列出当前可用的命名记忆库及其摘要，供上层选择正确记忆。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                output_schema=_schema_object({"libraries": {"type": "array"}, "memory_summary": {"type": "object"}}),
+            ),
+            _descriptor(
+                "create_memory_library",
+                "创建记忆库",
+                "按名称创建命名记忆库目录，但不自动切换为当前激活库。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object(
+                    {
+                        "library_name": {"type": "string"},
+                    },
+                    required=("library_name",),
+                ),
+                output_schema=_schema_object(
+                    {
+                        "create_result": {"type": "object"},
+                        "memory_summary": {"type": "object"},
+                        "libraries": {"type": "array"},
+                    }
+                ),
+            ),
+            _descriptor(
+                "enable_memory_library",
+                "启用记忆库",
+                "按名称启用一个命名记忆库，并决定是否加载历史或清空后重建。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object(
+                    {
+                        "library_name": {"type": "string"},
+                        "load_history": {"type": "boolean", "default": True},
+                        "reset_library": {"type": "boolean", "default": False},
+                    },
+                    required=("library_name",),
+                ),
+                output_schema=_schema_object({"memory_summary": {"type": "object"}, "libraries": {"type": "array"}}),
+            ),
+            _descriptor(
+                "disable_memory_library",
+                "停用记忆库",
+                "停用当前激活的记忆库，并释放激活态向量缓存。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                output_schema=_schema_object({"memory_summary": {"type": "object"}, "libraries": {"type": "array"}}),
+            ),
+            _descriptor(
+                "delete_memory_library",
+                "删除记忆库",
+                "按名称删除命名记忆库及其历史记录；若当前激活的正是该库，则会一并停用。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object(
+                    {
+                        "library_name": {"type": "string"},
+                    },
+                    required=("library_name",),
+                ),
+                output_schema=_schema_object(
+                    {
+                        "delete_result": {"type": "object"},
+                        "memory_summary": {"type": "object"},
+                        "libraries": {"type": "array"},
                     }
                 ),
             ),
@@ -955,6 +1033,11 @@ class GatewayRuntime:
             "get_localization_snapshot": self._handle_get_localization_snapshot,
             "get_map_snapshot": self._handle_get_map_snapshot,
             "get_navigation_snapshot": self._handle_get_navigation_snapshot,
+            "list_memory_libraries": self._handle_list_memory_libraries,
+            "create_memory_library": self._handle_create_memory_library,
+            "enable_memory_library": self._handle_enable_memory_library,
+            "disable_memory_library": self._handle_disable_memory_library,
+            "delete_memory_library": self._handle_delete_memory_library,
             "tag_location": self._handle_tag_location,
             "query_location": self._handle_query_location,
             "query_semantic_memory": self._handle_query_semantic_memory,
@@ -981,24 +1064,8 @@ class GatewayRuntime:
                 owner="gateway_runtime",
                 overwrite=True,
             )
-
-        existing_matrix = self.robot.manifest.capability_matrix
-        merged_capabilities = {item.name: item for item in existing_matrix.capabilities}
-        for descriptor in capabilities:
-            merged_capabilities[descriptor.name] = self._build_gateway_capability_availability(
-                descriptor.name,
-                fallback=merged_capabilities.get(descriptor.name),
-            )
-        self.capability_registry.bind_robot_capability_matrix(
-            CapabilityMatrix(
-                robot_model=self.robot.manifest.robot_model,
-                capabilities=list(merged_capabilities.values()),
-                metadata={
-                    **dict(existing_matrix.metadata),
-                    "runtime_gateway": "enabled",
-                },
-            )
-        )
+        self._gateway_capability_names = tuple(descriptor.name for descriptor in capabilities)
+        self._refresh_dynamic_capability_matrix()
 
     def register_default_skills(self) -> None:
         """注册首版技能工具面。"""
@@ -1024,6 +1091,13 @@ class GatewayRuntime:
                 description="返回当前活动任务与最近历史任务。",
                 category=SkillCategory.SYSTEM,
                 capability_name="get_active_tasks",
+            ),
+            SkillDescriptor(
+                name="get_task_status",
+                display_name="获取任务状态",
+                description="按任务 ID 读取后台任务状态和结果摘要。",
+                category=SkillCategory.SYSTEM,
+                capability_name="get_task_status",
             ),
             SkillDescriptor(
                 name="cancel_task",
@@ -1068,6 +1142,20 @@ class GatewayRuntime:
                 capability_name="capture_image",
             ),
             SkillDescriptor(
+                name="get_latest_observation",
+                display_name="获取最新观察",
+                description="读取最近一次图像抓取后的观察上下文。",
+                category=SkillCategory.OBSERVATION,
+                capability_name="get_latest_observation",
+            ),
+            SkillDescriptor(
+                name="perceive_current_scene",
+                display_name="感知当前场景",
+                description="触发一次场景感知并返回结构化结果。",
+                category=SkillCategory.OBSERVATION,
+                capability_name="perceive_current_scene",
+            ),
+            SkillDescriptor(
                 name="describe_current_scene",
                 display_name="描述当前场景",
                 description="返回当前场景的中文摘要和结构化感知结果。",
@@ -1075,11 +1163,32 @@ class GatewayRuntime:
                 capability_name="describe_current_scene",
             ),
             SkillDescriptor(
+                name="get_latest_perception",
+                display_name="获取最新感知",
+                description="读取最近一次场景感知结果。",
+                category=SkillCategory.OBSERVATION,
+                capability_name="get_latest_perception",
+            ),
+            SkillDescriptor(
                 name="get_perception_runtime_status",
                 display_name="获取持续感知状态",
                 description="读取关键帧驱动的视频感知运行时状态。",
                 category=SkillCategory.OBSERVATION,
                 capability_name="get_perception_runtime_status",
+            ),
+            SkillDescriptor(
+                name="start_perception_runtime",
+                display_name="启动持续感知",
+                description="启动关键帧驱动的视频感知运行时。",
+                category=SkillCategory.OBSERVATION,
+                capability_name="start_perception_runtime",
+            ),
+            SkillDescriptor(
+                name="stop_perception_runtime",
+                display_name="停止持续感知",
+                description="停止关键帧驱动的视频感知运行时。",
+                category=SkillCategory.OBSERVATION,
+                capability_name="stop_perception_runtime",
             ),
             SkillDescriptor(
                 name="get_joint_state",
@@ -1150,6 +1259,41 @@ class GatewayRuntime:
                 description="把当前位姿与最新观察写入命名地点记忆。",
                 category=SkillCategory.MEMORY,
                 capability_name="tag_location",
+            ),
+            SkillDescriptor(
+                name="list_memory_libraries",
+                display_name="列出记忆库",
+                description="列出当前可见的命名记忆库、当前激活库和摘要信息。",
+                category=SkillCategory.MEMORY,
+                capability_name="list_memory_libraries",
+            ),
+            SkillDescriptor(
+                name="create_memory_library",
+                display_name="创建记忆库",
+                description="按名称创建命名记忆库目录，但不自动切到当前激活库。",
+                category=SkillCategory.MEMORY,
+                capability_name="create_memory_library",
+            ),
+            SkillDescriptor(
+                name="enable_memory_library",
+                display_name="启用记忆库",
+                description="按名称启用一个命名记忆库，并指定是否加载历史或清空重建。",
+                category=SkillCategory.MEMORY,
+                capability_name="enable_memory_library",
+            ),
+            SkillDescriptor(
+                name="disable_memory_library",
+                display_name="停用记忆库",
+                description="停用当前激活记忆库，释放当前激活态向量缓存。",
+                category=SkillCategory.MEMORY,
+                capability_name="disable_memory_library",
+            ),
+            SkillDescriptor(
+                name="delete_memory_library",
+                display_name="删除记忆库",
+                description="按名称删除命名记忆库及其历史记录；若当前激活的是该库，则会同时停用。",
+                category=SkillCategory.MEMORY,
+                capability_name="delete_memory_library",
             ),
             SkillDescriptor(
                 name="query_location",
@@ -1223,6 +1367,7 @@ class GatewayRuntime:
     def list_capabilities(self, *, exposed_only: Optional[bool] = None) -> Tuple[CapabilityDescriptor, ...]:
         """列出运行时能力描述。"""
 
+        self._refresh_dynamic_capability_matrix()
         views = self.capability_registry.build_runtime_views(
             robot_model=self.robot.manifest.robot_model,
             exposed_only=exposed_only,
@@ -1237,6 +1382,7 @@ class GatewayRuntime:
     ):
         """列出面向上层智能体的技能工具视图。"""
 
+        self._refresh_dynamic_capability_matrix()
         return self.skill_registry.build_runtime_views(
             self.capability_registry,
             robot_model=self.robot.manifest.robot_model,
@@ -1274,6 +1420,7 @@ class GatewayRuntime:
     ) -> Dict[str, Any]:
         """调用一个网关能力。"""
 
+        self._refresh_dynamic_capability_matrix()
         registration = self.capability_registry.get_registration(capability_name)
         self.capability_registry.assert_supported(capability_name, robot_model=self.robot.manifest.robot_model)
         if registration.handler is None:
@@ -1543,6 +1690,83 @@ class GatewayRuntime:
         return {
             "navigation_context": navigation_context,
             "exploration_context": exploration_context,
+        }
+
+    def _handle_list_memory_libraries(
+        self,
+        _: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        return {
+            "libraries": self.memory_service.list_memory_libraries(),
+            "memory_summary": self.memory_service.get_summary(),
+        }
+
+    def _handle_create_memory_library(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        library_name = self._require_str(arguments, "library_name")
+        create_result = self.memory_service.create_memory_library(library_name=library_name)
+        return {
+            "create_result": create_result,
+            "libraries": self.memory_service.list_memory_libraries(),
+            "memory_summary": self.memory_service.get_summary(),
+        }
+
+    def _handle_enable_memory_library(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        library_name = self._require_str(arguments, "library_name")
+        self.memory_service.activate_memory_library(
+            library_name=library_name,
+            load_history=bool(arguments.get("load_history", True)),
+            reset_library=bool(arguments.get("reset_library", False)),
+        )
+        self._sync_perception_runtime_for_memory_state(enabled=True)
+        return {
+            "libraries": self.memory_service.list_memory_libraries(),
+            "memory_summary": self.memory_service.get_summary(),
+        }
+
+    def _handle_disable_memory_library(
+        self,
+        _: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        self.memory_service.disable_memory_library()
+        self._sync_perception_runtime_for_memory_state(enabled=False)
+        return {
+            "libraries": self.memory_service.list_memory_libraries(),
+            "memory_summary": self.memory_service.get_summary(),
+        }
+
+    def _handle_delete_memory_library(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        library_name = self._require_str(arguments, "library_name")
+        delete_result = self.memory_service.delete_memory_library(library_name=library_name)
+        if bool(delete_result.get("was_active")):
+            self._sync_perception_runtime_for_memory_state(enabled=False)
+        return {
+            "delete_result": delete_result,
+            "libraries": self.memory_service.list_memory_libraries(),
+            "memory_summary": self.memory_service.get_summary(),
         }
 
     def _handle_tag_location(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
@@ -2298,6 +2522,38 @@ class GatewayRuntime:
             angular=Vector3(x=0.0, y=0.0, z=angular_z),
         )
 
+    def _refresh_dynamic_capability_matrix(self) -> None:
+        if not self._gateway_capability_names:
+            return
+        base_matrix = self._base_capability_matrix
+        merged_capabilities = {item.name: item for item in base_matrix.capabilities}
+        for capability_name in self._gateway_capability_names:
+            merged_capabilities[capability_name] = self._build_gateway_capability_availability(
+                capability_name,
+                fallback=merged_capabilities.get(capability_name),
+            )
+        self.capability_registry.bind_robot_capability_matrix(
+            CapabilityMatrix(
+                robot_model=self.robot.manifest.robot_model,
+                capabilities=list(merged_capabilities.values()),
+                metadata={
+                    **dict(base_matrix.metadata),
+                    "runtime_gateway": "enabled",
+                },
+            )
+        )
+
+    def _sync_perception_runtime_for_memory_state(self, *, enabled: bool) -> None:
+        status = self.perception_video_runtime.get_status()
+        if not status.enabled or not status.auto_start:
+            return
+        if enabled:
+            if self.perception_video_runtime.should_auto_start():
+                self.perception_video_runtime.start()
+            return
+        if status.running:
+            self.perception_video_runtime.stop()
+
     def _build_gateway_capability_availability(
         self,
         capability_name: str,
@@ -2352,6 +2608,26 @@ class GatewayRuntime:
             "get_navigation_snapshot": (
                 self.navigation_service.is_navigation_available() or self.navigation_service.is_exploration_available(),
                 "当前机器人入口未提供导航或探索后端。",
+            ),
+            "list_memory_libraries": (
+                True,
+                None,
+            ),
+            "create_memory_library": (
+                True,
+                None,
+            ),
+            "enable_memory_library": (
+                True,
+                None,
+            ),
+            "disable_memory_library": (
+                True,
+                None,
+            ),
+            "delete_memory_library": (
+                True,
+                None,
             ),
             "tag_location": (
                 self.localization_service.is_available(),

@@ -36,13 +36,14 @@ GO2_DEFAULT_TOPICS = {
     "joint_state": "robot.go2.joint_state",
     "imu_state": "robot.go2.imu_state",
     "robot_volume": "robot.go2.audio.volume",
-    "odom_lio": "/odom_lio",
+    "robot_odom": "/utlidar/robot_odom",
+    "utlidar_imu": "/utlidar/imu",
+    "utlidar_cloud": "/utlidar/cloud",
     "tf": "/tf",
     "tf_static": "/tf_static",
     "occupancy_map": "/map",
     "grid_map": "/elevation_mapping_cupy/elevation_map_raw",
     "global_costmap": "/global_costmap/costmap",
-    "navigate_to_pose": "/navigate_to_pose",
 }
 
 GO2_DEFAULT_SENSOR_BINDINGS = (
@@ -58,7 +59,7 @@ GO2_DEFAULT_AUDIO_BINDINGS = (
 GO2_DEFAULT_ADAPTER_BINDINGS: Tuple[str, ...] = ()
 
 GO2_DEFAULT_CAMERA_INFO = CameraInfo(
-    camera_id="front",
+    camera_id="front_camera",
     frame_id=GO2_DEFAULT_FRAME_IDS["camera_front"],
     width_px=1280,
     height_px=720,

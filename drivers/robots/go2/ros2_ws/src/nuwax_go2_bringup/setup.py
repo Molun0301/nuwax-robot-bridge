@@ -23,9 +23,5 @@ setup(
     description="Go2 端侧 ROS2 工作空间启动包",
     license="MIT",
     tests_require=["pytest"],
-    entry_points={
-        "console_scripts": [
-            "go2_cmd_vel_bridge = nuwax_go2_bringup.go2_cmd_vel_bridge:main",
-        ],
-    },
+    entry_points={"console_scripts": []},
 )

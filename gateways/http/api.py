@@ -336,6 +336,36 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         access_manager.authenticate_http(request)
         return {"memory_summary": to_jsonable(runtime.memory_service.get_summary())}
 
+    @router.get("/api/memory/libraries")
+    async def api_memory_libraries(request: Request) -> Dict[str, Any]:
+        access_manager.authenticate_http(request)
+        return {
+            "libraries": to_jsonable(runtime.memory_service.list_memory_libraries()),
+            "memory_summary": to_jsonable(runtime.memory_service.get_summary()),
+        }
+
+    @router.post("/api/memory/libraries")
+    async def api_create_memory_library(request: Request) -> Dict[str, Any]:
+        access_manager.authenticate_http(request)
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            payload = {}
+        library_name = str(payload.get("library_name", "")).strip()
+        return {
+            "create_result": to_jsonable(runtime.memory_service.create_memory_library(library_name=library_name)),
+            "libraries": to_jsonable(runtime.memory_service.list_memory_libraries()),
+            "memory_summary": to_jsonable(runtime.memory_service.get_summary()),
+        }
+
+    @router.delete("/api/memory/libraries/{library_name}")
+    async def api_delete_memory_library(library_name: str, request: Request) -> Dict[str, Any]:
+        access_manager.authenticate_http(request)
+        return {
+            "delete_result": to_jsonable(runtime.memory_service.delete_memory_library(library_name=library_name)),
+            "libraries": to_jsonable(runtime.memory_service.list_memory_libraries()),
+            "memory_summary": to_jsonable(runtime.memory_service.get_summary()),
+        }
+
     @router.get("/api/memory/locations")
     async def api_memory_locations(request: Request, limit: int = 20) -> Dict[str, Any]:
         access_manager.authenticate_http(request)

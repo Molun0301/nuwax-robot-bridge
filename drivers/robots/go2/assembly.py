@@ -222,6 +222,7 @@ class Go2RobotAssembly(RobotAssemblyBase):
                 model=self.config.perception.openai_vision.model_name,
                 api_key=self.config.perception.openai_vision.api_key,
                 base_url=self.config.perception.openai_vision.base_url,
+                api_style=self.config.perception.openai_vision.api_style,
                 timeout_sec=self.config.perception.openai_vision.timeout_sec,
                 max_tokens=self.config.perception.openai_vision.max_tokens,
                 temperature=self.config.perception.openai_vision.temperature,

@@ -27,6 +27,18 @@ ENV_FILE = BASE_DIR / ".env"
 LEGACY_CONFIG_FILE = BASE_DIR / ".config"
 
 
+def _default_model_dir(repo_id: str) -> str:
+    """把默认模型仓库映射到项目内固定目录。"""
+
+    return str(BASE_DIR / "runtime_data" / "models" / repo_id.replace("/", "__"))
+
+
+DEFAULT_MEMORY_TEXT_EMBEDDING_MODEL = _default_model_dir("BAAI/bge-m3")
+DEFAULT_MEMORY_IMAGE_EMBEDDING_MODEL = _default_model_dir("openai/clip-vit-base-patch32")
+DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL = "tongyi-embedding-vision-flash-2026-03-06"
+DEFAULT_MEMORY_EMBEDDING_BASE_URL = "https://dashscope.aliyuncs.com/api/v1"
+
+
 def _strip_quotes(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[:1] == value[-1:] and value[:1] in {"'", '"'}:
@@ -283,6 +295,7 @@ class PerceptionOpenAIVisionConfig:
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     model_name: str = ""
+    api_style: str = "auto"
     timeout_sec: float = 20.0
     max_tokens: int = 700
     temperature: float = 0.0
@@ -333,10 +346,13 @@ class RuntimeDataConfig:
     navigation_history_limit: int = 100
     memory_history_limit: int = 200
     memory_db_path: str = ""
-    memory_embedding_model: str = "sentence-transformers:BAAI/bge-m3"
-    memory_embedding_dimension: int = 1024
-    memory_image_embedding_model: str = "transformers-clip:openai/clip-vit-base-patch32"
-    memory_image_embedding_dimension: int = 512
+    memory_embedding_model: str = DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL
+    memory_embedding_dimension: int = 768
+    memory_image_embedding_model: str = DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL
+    memory_image_embedding_dimension: int = 768
+    memory_embedding_api_key: str = ""
+    memory_embedding_base_url: str = DEFAULT_MEMORY_EMBEDDING_BASE_URL
+    memory_embedding_timeout_sec: float = 20.0
     memory_vector_store_backend: str = "sqlite_named_vectors"
     artifact_retention_days: int = 7
     artifact_max_count: int = 1000
@@ -533,11 +549,12 @@ def load_config() -> NuwaxRobotBridgeConfig:
             base_url=_cfg_str("NUWAX_PERCEPTION_OPENAI_BASE_URL", "https://api.openai.com/v1"),
             api_key=_cfg_str(
                 "NUWAX_PERCEPTION_OPENAI_API_KEY",
-                _cfg_str("OPENAI_API_KEY", ""),
+                _cfg_str("OPENAI_API_KEY", _cfg_str("ARK_API_KEY", "")),
             ),
             model_name=_cfg_str("NUWAX_PERCEPTION_OPENAI_MODEL", ""),
+            api_style=_cfg_str("NUWAX_PERCEPTION_OPENAI_API_STYLE", "auto"),
             timeout_sec=max(1.0, _cfg_float("NUWAX_PERCEPTION_OPENAI_TIMEOUT_SEC", 20.0)),
-            max_tokens=max(128, _cfg_int("NUWAX_PERCEPTION_OPENAI_MAX_TOKENS", 700)),
+            max_tokens=max(128, _cfg_int("NUWAX_PERCEPTION_OPENAI_MAX_TOKENS", 1400)),
             temperature=max(0.0, _cfg_float("NUWAX_PERCEPTION_OPENAI_TEMPERATURE", 0.0)),
         ),
         stream_runtime=PerceptionStreamRuntimeConfig(
@@ -624,21 +641,30 @@ def load_config() -> NuwaxRobotBridgeConfig:
             "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL",
             _cfg_str(
                 "NUWAX_MEMORY_EMBEDDING_MODEL",
-                "sentence-transformers:BAAI/bge-m3",
+                DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL,
             ),
         ),
         memory_embedding_dimension=max(
             8,
             _cfg_int(
                 "NUWAX_MEMORY_TEXT_EMBEDDING_DIM",
-                _cfg_int("NUWAX_MEMORY_EMBEDDING_DIM", 1024),
+                _cfg_int("NUWAX_MEMORY_EMBEDDING_DIM", 768),
             ),
         ),
         memory_image_embedding_model=_cfg_str(
             "NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL",
-            "transformers-clip:openai/clip-vit-base-patch32",
+            DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL,
         ),
-        memory_image_embedding_dimension=max(8, _cfg_int("NUWAX_MEMORY_IMAGE_EMBEDDING_DIM", 512)),
+        memory_image_embedding_dimension=max(8, _cfg_int("NUWAX_MEMORY_IMAGE_EMBEDDING_DIM", 768)),
+        memory_embedding_api_key=_cfg_str(
+            "NUWAX_MEMORY_EMBEDDING_API_KEY",
+            _cfg_str("DASHSCOPE_API_KEY", ""),
+        ),
+        memory_embedding_base_url=_cfg_str(
+            "NUWAX_MEMORY_EMBEDDING_BASE_URL",
+            DEFAULT_MEMORY_EMBEDDING_BASE_URL,
+        ),
+        memory_embedding_timeout_sec=max(1.0, _cfg_float("NUWAX_MEMORY_EMBEDDING_TIMEOUT_SEC", 20.0)),
         memory_vector_store_backend=_cfg_str("NUWAX_MEMORY_VECTOR_STORE_BACKEND", "sqlite_named_vectors"),
         artifact_retention_days=max(1, _cfg_int("NUWAX_ARTIFACT_RETENTION_DAYS", 7)),
         artifact_max_count=max(1, _cfg_int("NUWAX_ARTIFACT_MAX_COUNT", 1000)),

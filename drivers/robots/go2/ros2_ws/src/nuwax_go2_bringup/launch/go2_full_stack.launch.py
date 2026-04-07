@@ -1,19 +1,12 @@
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import PathJoinSubstitution
-from launch_ros.substitutions import FindPackageShare
+from launch.actions import LogInfo
 
 
 def generate_launch_description() -> LaunchDescription:
-    lidar_mapping_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution([FindPackageShare("nuwax_go2_bringup"), "launch", "go2_lidar_mapping.launch.py"])
-        )
+    return LaunchDescription(
+        [
+            LogInfo(
+                msg="nuwax_go2_bringup 已移除旧的串口雷达与本地 Nav2 启动链，请直接使用 drivers/robots/go2/data_plane_entry。"
+            )
+        ]
     )
-    nav2_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution([FindPackageShare("nuwax_go2_bringup"), "launch", "go2_nav2.launch.py"])
-        )
-    )
-    return LaunchDescription([lidar_mapping_launch, nav2_launch])

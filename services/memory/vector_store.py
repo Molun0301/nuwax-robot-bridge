@@ -326,6 +326,28 @@ class SQLiteNamedVectorStore:
             ).fetchall()
         return {str(row["vector_name"]): int(row["count"]) for row in rows}
 
+    def delete_points(self, point_ids: Sequence[str]) -> int:
+        normalized_ids = [str(item).strip() for item in point_ids if str(item).strip()]
+        if not normalized_ids:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "DELETE FROM memory_named_vectors WHERE point_id = ?",
+                [(point_id,) for point_id in normalized_ids],
+            )
+            self._conn.executemany(
+                "DELETE FROM memory_vector_points WHERE point_id = ?",
+                [(point_id,) for point_id in normalized_ids],
+            )
+            self._conn.commit()
+        return len(normalized_ids)
+
+    def clear_all(self) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM memory_named_vectors")
+            self._conn.execute("DELETE FROM memory_vector_points")
+            self._conn.commit()
+
     def _select_candidate_rows(
         self,
         *,

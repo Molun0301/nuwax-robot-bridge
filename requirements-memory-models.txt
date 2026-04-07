@@ -1,12 +1,16 @@
 # `nuwax_robot_bridge` 的语义空间记忆模型依赖
 #
 # 使用场景：
-# 1. 默认文本向量模型：sentence-transformers:BAAI/bge-m3
-# 2. 默认图像向量模型：transformers-clip:openai/clip-vit-base-patch32
+# 1. 当前主线默认走百炼在线多模态向量，不依赖本文件。
+# 2. 当部署环境需要改回本地模型时，
+#    文本目录默认可使用 runtime_data/models/BAAI__bge-m3，
+#    图像目录默认可使用 runtime_data/models/openai__clip-vit-base-patch32。
 #
 # 注意：
 # 1. Jetson + JetPack 场景下，`torch` 请优先使用 NVIDIA 提供的版本。
 # 2. 在确认 `import torch` 正常后，再安装本文件。
+# 3. 如果 `torch.cuda.is_available()` 为 False，不要继续安装本文件，先按 `部署文档.md` 里的 Jetson 修复步骤替换成 GPU 版 torch。
+# 4. 安装完成后，请先运行 `python3 scripts/prepare_memory_models.py` 手工下载模型，再把 `.env` 里的 TEXT / IMAGE 模型切到本地目录。
 
 sentence-transformers==3.2.1
 transformers==4.46.3

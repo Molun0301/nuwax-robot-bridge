@@ -110,7 +110,15 @@ class MappingService:
     def is_available(self) -> bool:
         """判断地图服务当前是否可用。"""
 
-        return self._latest_snapshot is not None or self._find_map_provider() is not None
+        if self._latest_snapshot is not None:
+            return True
+        provider = self._find_map_provider()
+        if provider is None or not provider.is_available():
+            return False
+        availability_checker = getattr(provider, "is_map_available", None)
+        if callable(availability_checker):
+            return bool(availability_checker())
+        return True
 
     def _build_available_layers(self, occupancy_grid, cost_map, semantic_map) -> List[str]:
         layers: List[str] = []

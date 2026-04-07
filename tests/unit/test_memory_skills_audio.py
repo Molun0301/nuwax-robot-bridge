@@ -21,6 +21,7 @@ from contracts.runtime_views import SceneObjectSummary, SceneSummary
 from contracts.skills import SkillCategory, SkillDescriptor
 from core import CapabilityRegistry, EventBus, StateNamespace, StateStore
 from gateways.artifacts import LocalArtifactStore
+from gateways.errors import GatewayError
 from providers import ImageProvider, LocalizationProvider, MapProvider
 from services import ArtifactService, AudioService, ObservationService, PerceptionService
 from services.localization import LocalizationService
@@ -156,6 +157,24 @@ class _FakeVisionLanguageEmbedder(VisionLanguageEmbedder):
         return self._delegate.embed_text(text)
 
 
+class _FusionAwareTextEmbedder(HashingTextEmbedder):
+    """测试用图文融合文本向量器。"""
+
+    def __init__(self) -> None:
+        super().__init__(model_name="fusion_text", dimension=64)
+        self.fused_calls = []
+
+    def embed_fused_text_image(self, *, text: str, image_bytes: bytes):
+        self.fused_calls.append(
+            {
+                "text": text,
+                "size_bytes": len(image_bytes),
+            }
+        )
+        fused_text = "%s %s" % (text, image_bytes.decode("utf-8", errors="ignore"))
+        return self.embed_text(fused_text)
+
+
 class _FakeAudioRobot:
     """音频服务测试用假机器人。"""
 
@@ -236,6 +255,10 @@ def _build_memory_stack(
     tmp_path: Path,
     *,
     scene_description_backend: Optional[SceneDescriptionBackend] = None,
+    text_embedder=None,
+    vision_language_embedder=None,
+    activate_memory: bool = True,
+    library_name: str = "单元测试记忆库",
 ) -> Dict[str, object]:
     providers = _ProviderBundle()
     provider_owner = _ProviderOwner(providers)
@@ -291,10 +314,16 @@ def _build_memory_stack(
         memory_db_path=str(tmp_path / "memory" / "vector_memory.db"),
         embedding_model="hashing-v1",
         embedding_dimension=128,
-        vision_language_embedder=_FakeVisionLanguageEmbedder(),
+        text_embedder=text_embedder,
+        vision_language_embedder=vision_language_embedder or _FakeVisionLanguageEmbedder(),
     )
     localization_service.refresh()
     mapping_service.refresh()
+    if activate_memory:
+        memory_service.activate_memory_library(
+            library_name=library_name,
+            load_history=True,
+        )
     return {
         "providers": providers,
         "state_store": state_store,
@@ -305,6 +334,162 @@ def _build_memory_stack(
         "perception_service": perception_service,
         "memory_service": memory_service,
     }
+
+
+def test_memory_service_uses_fused_text_image_vector_when_artifact_exists(tmp_path: Path) -> None:
+    """写入带图像的场景记忆时，应优先走图文融合向量。"""
+
+    fusion_text_embedder = _FusionAwareTextEmbedder()
+    stack = _build_memory_stack(
+        tmp_path,
+        text_embedder=fusion_text_embedder,
+    )
+    observation_service = stack["observation_service"]
+    perception_service = stack["perception_service"]
+    memory_service = stack["memory_service"]
+
+    observation_service.capture_observation(camera_id="front_camera")
+    perception_service.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+
+    entry = memory_service.remember_current_scene(
+        title="融合记忆测试",
+        camera_id="front_camera",
+    )
+    point = memory_service._vector_store.get_point(entry.memory_id)
+
+    assert fusion_text_embedder.fused_calls
+    assert point is not None
+    assert "text_dense" in point.vectors
+
+
+def test_memory_service_starts_disabled_until_enabled(tmp_path: Path) -> None:
+    """记忆服务默认不应自动启用。"""
+
+    stack = _build_memory_stack(tmp_path, activate_memory=False)
+    memory_service = stack["memory_service"]
+
+    summary = memory_service.get_summary()
+
+    assert memory_service.is_enabled() is False
+    assert summary.tagged_location_count == 0
+    assert summary.metadata["memory_enabled"] is False
+    assert summary.metadata["active_library_name"] is None
+
+
+def test_memory_service_named_library_can_control_history_loading(tmp_path: Path) -> None:
+    """命名记忆库应支持显式选择是否加载历史。"""
+
+    first_stack = _build_memory_stack(tmp_path, library_name="大厅巡检记忆")
+    first_observation = first_stack["observation_service"]
+    first_perception = first_stack["perception_service"]
+    first_memory = first_stack["memory_service"]
+
+    first_observation.capture_observation(camera_id="front_camera")
+    first_perception.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+    first_memory.tag_location(
+        "大厅补给点",
+        camera_id="front_camera",
+    )
+
+    second_stack = _build_memory_stack(tmp_path, activate_memory=False)
+    second_memory = second_stack["memory_service"]
+    second_memory.activate_memory_library(
+        library_name="大厅巡检记忆",
+        load_history=False,
+    )
+
+    summary_without_history = second_memory.get_summary()
+    libraries = second_memory.list_memory_libraries()
+
+    assert summary_without_history.tagged_location_count == 0
+    assert any(item["library_name"] == "大厅巡检记忆" for item in libraries)
+
+    second_memory.activate_memory_library(
+        library_name="大厅巡检记忆",
+        load_history=True,
+    )
+    summary_with_history = second_memory.get_summary()
+
+    assert summary_with_history.tagged_location_count >= 1
+
+
+def test_memory_service_can_create_named_library_without_enabling(tmp_path: Path) -> None:
+    """显式创建命名记忆库时，不应自动进入激活态。"""
+
+    stack = _build_memory_stack(tmp_path, activate_memory=False)
+    memory_service = stack["memory_service"]
+
+    create_result = memory_service.create_memory_library(library_name="预创建记忆库")
+    summary = memory_service.get_summary()
+    libraries = memory_service.list_memory_libraries()
+
+    assert create_result["created"] is True
+    assert create_result["active"] is False
+    assert summary.metadata["memory_enabled"] is False
+    assert summary.metadata["active_library_name"] is None
+    assert any(item["library_name"] == "预创建记忆库" for item in libraries)
+
+
+def test_memory_service_reset_library_can_clear_history(tmp_path: Path) -> None:
+    """显式重置命名记忆库时，应清空旧历史。"""
+
+    first_stack = _build_memory_stack(tmp_path, library_name="重置测试记忆")
+    first_observation = first_stack["observation_service"]
+    first_perception = first_stack["perception_service"]
+    first_memory = first_stack["memory_service"]
+
+    first_observation.capture_observation(camera_id="front_camera")
+    first_perception.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+    first_memory.remember_current_scene(
+        title="重置前记忆",
+        camera_id="front_camera",
+    )
+
+    second_stack = _build_memory_stack(tmp_path, activate_memory=False)
+    second_memory = second_stack["memory_service"]
+    second_memory.activate_memory_library(
+        library_name="重置测试记忆",
+        load_history=True,
+        reset_library=True,
+    )
+
+    summary = second_memory.get_summary()
+
+    assert summary.semantic_memory_count == 0
+
+
+def test_memory_service_delete_library_can_clear_history_and_disable_active_state(tmp_path: Path) -> None:
+    """删除当前命名记忆库时，应清空历史并退出激活态。"""
+
+    stack = _build_memory_stack(tmp_path, library_name="删除测试记忆库")
+    observation_service = stack["observation_service"]
+    perception_service = stack["perception_service"]
+    memory_service = stack["memory_service"]
+
+    observation_service.capture_observation(camera_id="front_camera")
+    perception_service.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+    memory_service.tag_location(
+        "删除前补给点",
+        camera_id="front_camera",
+    )
+    memory_service.remember_current_scene(
+        title="删除前场景",
+        camera_id="front_camera",
+    )
+
+    delete_result = memory_service.delete_memory_library(library_name="删除测试记忆库")
+    summary = memory_service.get_summary()
+    libraries = memory_service.list_memory_libraries()
+
+    assert delete_result["deleted"] is True
+    assert delete_result["was_active"] is True
+    assert delete_result["deleted_counts"]["tagged_location_count"] >= 1
+    assert delete_result["deleted_counts"]["semantic_memory_count"] >= 1
+    assert summary.metadata["memory_enabled"] is False
+    assert summary.metadata["active_library_name"] is None
+    assert summary.tagged_location_count == 0
+    assert summary.semantic_memory_count == 0
+    assert all(item["library_name"] != "删除测试记忆库" for item in libraries)
 
 
 def test_memory_service_can_tag_location_and_write_memory(tmp_path: Path) -> None:
@@ -413,6 +598,10 @@ def test_memory_service_falls_back_when_default_embedding_dependencies_missing(
         text_embedding_dimension=1024,
         image_embedding_model="transformers-clip:openai/clip-vit-base-patch32",
         image_embedding_dimension=512,
+    )
+    memory_service.activate_memory_library(
+        library_name="回退测试记忆库",
+        load_history=False,
     )
 
     summary = memory_service.get_summary()
@@ -593,6 +782,35 @@ def test_memory_service_deeply_integrates_visual_semantics_into_vector_memory(tm
         (match.semantic_instance is not None or match.observation_event is not None)
         for match in visual_filter_result.matches
     )
+
+
+def test_memory_service_remember_current_scene_allows_missing_map_snapshot(tmp_path: Path) -> None:
+    """地图层尚未产出时，场景记忆应允许按无地图上下文继续写入。"""
+
+    stack = _build_memory_stack(tmp_path)
+    observation_service = stack["observation_service"]
+    perception_service = stack["perception_service"]
+    memory_service = stack["memory_service"]
+    mapping_service = stack["mapping_service"]
+
+    observation_service.capture_observation(camera_id="front_camera")
+    perception_service.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+
+    mapping_service.get_latest_snapshot = lambda: None
+    mapping_service.is_available = lambda: True
+
+    def _raise_empty_map_error():
+        raise GatewayError("地图快照至少需要包含 occupancy_grid、cost_map、semantic_map 之一。")
+
+    mapping_service.refresh = _raise_empty_map_error
+
+    memory_entry = memory_service.remember_current_scene(
+        title="无地图场景记忆",
+        camera_id="front_camera",
+    )
+
+    assert memory_entry.memory_id
+    assert memory_entry.map_version_id is None
 
 
 def test_skill_registry_builds_runtime_views_from_capabilities() -> None:

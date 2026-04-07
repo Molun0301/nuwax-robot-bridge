@@ -4,6 +4,7 @@ from collections import defaultdict
 import json
 import re
 
+import httpx
 from contracts.image import CameraInfo, ImageFrame
 from contracts.perception import Detection2D, Detection3D, Track, TrackState
 from contracts.runtime_views import SceneObjectSummary, SceneSummary
@@ -178,6 +179,7 @@ class OpenAICompatibleVisionSceneDescriptionBackend(SceneDescriptionBackend):
         model: str,
         api_key: str = "",
         base_url: str = "https://api.openai.com/v1",
+        api_style: str = "auto",
         timeout_sec: float = 20.0,
         max_tokens: int = 700,
         temperature: float = 0.0,
@@ -185,6 +187,7 @@ class OpenAICompatibleVisionSceneDescriptionBackend(SceneDescriptionBackend):
         self._model_name = str(model).strip()
         self._api_key = str(api_key).strip() or "EMPTY"
         self._base_url = str(base_url).strip() or "https://api.openai.com/v1"
+        self._api_style = self._normalize_api_style(api_style)
         self._timeout_sec = max(1.0, float(timeout_sec))
         self._max_tokens = max(128, int(max_tokens))
         self._temperature = max(0.0, float(temperature))
@@ -195,6 +198,7 @@ class OpenAICompatibleVisionSceneDescriptionBackend(SceneDescriptionBackend):
             metadata={
                 "model_name": self._model_name,
                 "base_url": self._base_url,
+                "api_style": self._api_style,
             },
         )
 
@@ -215,7 +219,6 @@ class OpenAICompatibleVisionSceneDescriptionBackend(SceneDescriptionBackend):
         if not self.is_enabled():
             raise RuntimeError("当前未配置云端视觉模型。")
 
-        client = self._get_client()
         prompt = self._build_prompt(
             camera_id=camera_id,
             detections_2d=detections_2d,
@@ -223,35 +226,12 @@ class OpenAICompatibleVisionSceneDescriptionBackend(SceneDescriptionBackend):
             camera_info=camera_info,
             image_frame=image_frame,
         )
-        content = [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": image_frame_to_data_url(image_frame)}},
-        ]
-        kwargs = {
-            "model": self._model_name,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "你是机器人宿主机的云端视觉语义后端。"
-                        "你必须严格输出一个 JSON 对象，不要输出 Markdown，不要补充解释。"
-                    ),
-                },
-                {"role": "user", "content": content},
-            ],
-            "temperature": self._temperature,
-            "max_tokens": self._max_tokens,
-        }
-        response = None
-        try:
-            response = client.chat.completions.create(
-                response_format={"type": "json_object"},
-                **kwargs,
-            )
-        except Exception:
-            response = client.chat.completions.create(**kwargs)
-
-        payload = self._parse_json_payload(self._extract_message_text(response))
+        use_responses_api = self._should_use_responses_api()
+        raw_text, payload = self._request_structured_scene_payload(
+            prompt=prompt,
+            image_frame=image_frame,
+            use_responses_api=use_responses_api,
+        )
         objects = tuple(self._build_scene_objects(payload.get("objects"), camera_id))
         details = _dedupe_strings(payload.get("details") or [])
         tags = _dedupe_strings(payload.get("tags") or [])
@@ -272,11 +252,184 @@ class OpenAICompatibleVisionSceneDescriptionBackend(SceneDescriptionBackend):
                 "camera_id": camera_id,
                 "cloud_vision_model": self._model_name,
                 "cloud_vision_base_url": self._base_url,
+                "cloud_vision_api_style": "responses" if use_responses_api else "chat_completions",
                 "semantic_tags": tags,
                 "semantic_relations": relations,
                 "visual_labels": [item.label for item in objects],
             },
         )
+
+    def _request_structured_scene_payload(
+        self,
+        *,
+        prompt: str,
+        image_frame: ImageFrame,
+        use_responses_api: bool,
+    ) -> Tuple[str, Dict[str, Any]]:
+        raw_text = self._request_scene_text(
+            prompt=prompt,
+            image_frame=image_frame,
+            use_responses_api=use_responses_api,
+            max_tokens=self._max_tokens,
+        )
+        payload = self._parse_json_payload(raw_text)
+        if payload or not self._looks_like_truncated_json(raw_text):
+            return raw_text, payload
+
+        retry_max_tokens = max(self._max_tokens * 2, 1400)
+        retry_text = self._request_scene_text(
+            prompt=prompt,
+            image_frame=image_frame,
+            use_responses_api=use_responses_api,
+            max_tokens=retry_max_tokens,
+        )
+        retry_payload = self._parse_json_payload(retry_text)
+        if retry_payload:
+            return retry_text, retry_payload
+        return raw_text, payload
+
+    def _request_scene_text(
+        self,
+        *,
+        prompt: str,
+        image_frame: ImageFrame,
+        use_responses_api: bool,
+        max_tokens: int,
+    ) -> str:
+        client = self._get_client()
+        if use_responses_api:
+            response = self._create_responses_api_request(
+                client,
+                prompt=prompt,
+                image_frame=image_frame,
+                max_tokens=max_tokens,
+            )
+            return self._extract_response_text(response)
+        response = self._create_chat_completion_request(
+            client,
+            prompt=prompt,
+            image_frame=image_frame,
+            max_tokens=max_tokens,
+        )
+        return self._extract_message_text(response)
+
+    def _normalize_api_style(self, value: object) -> str:
+        normalized = str(value or "").strip().lower().replace(".", "_")
+        if normalized in {"response", "responses"}:
+            return "responses"
+        if normalized in {"chat", "chat_completion", "chat_completions"}:
+            return "chat_completions"
+        return "auto"
+
+    def _should_use_responses_api(self) -> bool:
+        if self._api_style == "responses":
+            return True
+        if self._api_style == "chat_completions":
+            return False
+        base_url = self._base_url.lower()
+        model_name = self._model_name.lower()
+        return (
+            "ark." in base_url
+            or "volces.com" in base_url
+            or model_name.startswith("doubao-")
+        )
+
+    def _build_system_instruction(self) -> str:
+        return (
+            "你是机器人宿主机的云端视觉语义后端。"
+            "你必须严格输出一个 JSON 对象，不要输出 Markdown，不要补充解释。"
+        )
+
+    def _create_chat_completion_request(self, client, *, prompt: str, image_frame: ImageFrame, max_tokens: int):
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": image_frame_to_data_url(image_frame)}},
+        ]
+        kwargs = {
+            "model": self._model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": self._build_system_instruction(),
+                },
+                {"role": "user", "content": content},
+            ],
+            "temperature": self._temperature,
+            "max_tokens": max(128, int(max_tokens)),
+        }
+        try:
+            return client.chat.completions.create(
+                response_format={"type": "json_object"},
+                **kwargs,
+            )
+        except Exception:
+            return client.chat.completions.create(**kwargs)
+
+    def _create_responses_api_request(self, client, *, prompt: str, image_frame: ImageFrame, max_tokens: int):
+        responses_api = getattr(client, "responses", None)
+        input_text = "%s\n%s" % (self._build_system_instruction(), prompt)
+        request_payload = {
+            "model": self._model_name,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": image_frame_to_data_url(image_frame),
+                        },
+                        {
+                            "type": "input_text",
+                            "text": input_text,
+                        },
+                    ],
+                }
+            ],
+            "temperature": self._temperature,
+            "max_output_tokens": max(128, int(max_tokens)),
+        }
+        if responses_api is None or not hasattr(responses_api, "create"):
+            return self._create_raw_responses_http_request(request_payload)
+        try:
+            return responses_api.create(**request_payload)
+        except Exception:
+            fallback_kwargs = dict(request_payload)
+            fallback_kwargs.pop("temperature", None)
+            fallback_kwargs.pop("max_output_tokens", None)
+            return responses_api.create(**fallback_kwargs)
+
+    def _create_raw_responses_http_request(self, request_payload: Dict[str, Any]):
+        try:
+            return self._post_responses_request(request_payload)
+        except Exception:
+            fallback_payload = dict(request_payload)
+            fallback_payload.pop("temperature", None)
+            fallback_payload.pop("max_output_tokens", None)
+            return self._post_responses_request(fallback_payload)
+
+    def _post_responses_request(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
+        endpoint = self._base_url.rstrip("/") + "/responses"
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            with httpx.Client(timeout=self._timeout_sec) as raw_client:
+                response = raw_client.post(endpoint, headers=headers, json=request_payload)
+                response.raise_for_status()
+                payload = response.json()
+                if isinstance(payload, dict):
+                    return payload
+                raise RuntimeError("云端视觉 responses 接口返回了非对象 JSON。")
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text.strip()
+            if len(detail) > 400:
+                detail = detail[:400] + "..."
+            raise RuntimeError(
+                f"云端视觉 responses 接口请求失败 status={exc.response.status_code} detail={detail or '-'}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"云端视觉 responses 接口请求失败：{exc}") from exc
 
     def _get_client(self):
         if self._client is not None:
@@ -370,6 +523,51 @@ class OpenAICompatibleVisionSceneDescriptionBackend(SceneDescriptionBackend):
             return "\n".join(value for value in values if value)
         return str(content or "")
 
+    def _extract_response_text(self, response: Any) -> str:
+        output_text = getattr(response, "output_text", None)
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text
+        if isinstance(response, dict):
+            raw_text = response.get("output_text")
+            if isinstance(raw_text, str) and raw_text.strip():
+                return raw_text
+            return self._extract_response_content_text(response.get("output"))
+        raw_text = self._extract_response_content_text(getattr(response, "output", None))
+        if raw_text:
+            return raw_text
+        return self._extract_message_text(response)
+
+    def _extract_response_content_text(self, output: Any) -> str:
+        if not isinstance(output, list):
+            return ""
+        values: List[str] = []
+        for item in output:
+            content = getattr(item, "content", None)
+            if isinstance(item, dict):
+                content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                block_type = getattr(block, "type", None)
+                text_value = getattr(block, "text", None)
+                if isinstance(block, dict):
+                    block_type = block.get("type")
+                    text_value = block.get("text")
+                if block_type not in {"output_text", "text"}:
+                    continue
+                if isinstance(text_value, str):
+                    values.append(text_value)
+                    continue
+                text_value_attr = getattr(text_value, "value", None)
+                if isinstance(text_value_attr, str):
+                    values.append(text_value_attr)
+                    continue
+                if isinstance(text_value, dict):
+                    nested_value = text_value.get("value") or text_value.get("text")
+                    if isinstance(nested_value, str):
+                        values.append(nested_value)
+        return "\n".join(value for value in values if value)
+
     def _parse_json_payload(self, content: str) -> Dict[str, Any]:
         raw_content = str(content or "").strip()
         if not raw_content:
@@ -390,6 +588,16 @@ class OpenAICompatibleVisionSceneDescriptionBackend(SceneDescriptionBackend):
             except json.JSONDecodeError:
                 return {}
         return {}
+
+    def _looks_like_truncated_json(self, content: str) -> bool:
+        raw_content = str(content or "").strip()
+        if not raw_content or "{" not in raw_content:
+            return False
+        if raw_content.endswith((",", ":", "{", "[")):
+            return True
+        if raw_content.count("{") == raw_content.count("}") and raw_content.endswith("}"):
+            return False
+        return raw_content.rfind("{") > raw_content.rfind("}") or raw_content.count("{") != raw_content.count("}")
 
     def _build_scene_objects(self, payload: Any, camera_id: str) -> List[SceneObjectSummary]:
         objects: List[SceneObjectSummary] = []

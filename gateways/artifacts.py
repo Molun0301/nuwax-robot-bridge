@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Iterable
@@ -167,6 +168,26 @@ class LocalArtifactStore:
             freed_bytes=sum(int(ref.size_bytes or 0) for ref in removed_refs),
             removed_artifact_ids=[ref.artifact_id for ref in removed_refs],
             summary=summary,
+        )
+
+    def clear_all(self) -> ArtifactCleanupResult:
+        """清空当前制品目录下的全部制品。"""
+
+        removed_ids = [ref.artifact_id for ref in self.list_refs()]
+        if self._base_dir.exists():
+            for child in list(self._base_dir.iterdir()):
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                elif child.exists():
+                    child.unlink()
+        self._base_dir.mkdir(parents=True, exist_ok=True)
+        self._refs.clear()
+        self._paths.clear()
+        return ArtifactCleanupResult(
+            removed_count=len(removed_ids),
+            freed_bytes=0,
+            removed_artifact_ids=removed_ids,
+            summary=self.build_summary(()),
         )
 
     def _find_meta_path(self, artifact_id: str) -> Optional[Path]:

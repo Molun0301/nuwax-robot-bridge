@@ -12,6 +12,98 @@ from services.perception.image_utils import decode_image_frame_to_bgr
 
 
 DETECTOR_LOGGER = logging.getLogger("nuwax_robot_bridge.perception.detectors")
+_TORCHVISION_NMS_PATCHED = False
+
+
+def _box_iou_for_nms(boxes_left, boxes_right):
+    """计算两组框的 IoU（交并比）。"""
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("当前环境未安装 torch，无法执行 NMS 回退。") from exc
+
+    if boxes_left.numel() == 0 or boxes_right.numel() == 0:
+        return torch.zeros(
+            (boxes_left.shape[0], boxes_right.shape[0]),
+            dtype=boxes_left.dtype,
+            device=boxes_left.device,
+        )
+
+    left_top = torch.maximum(boxes_left[:, None, :2], boxes_right[None, :, :2])
+    right_bottom = torch.minimum(boxes_left[:, None, 2:], boxes_right[None, :, 2:])
+    wh = (right_bottom - left_top).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+
+    area_left = ((boxes_left[:, 2] - boxes_left[:, 0]).clamp(min=0)) * (
+        (boxes_left[:, 3] - boxes_left[:, 1]).clamp(min=0)
+    )
+    area_right = ((boxes_right[:, 2] - boxes_right[:, 0]).clamp(min=0)) * (
+        (boxes_right[:, 3] - boxes_right[:, 1]).clamp(min=0)
+    )
+    union = area_left[:, None] + area_right[None, :] - inter
+    return inter / union.clamp(min=1e-12)
+
+
+def _torch_nms_fallback(boxes, scores, iou_threshold):
+    """使用纯 torch 实现 NMS，避免依赖 torchvision 的 C++ 扩展。"""
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("当前环境未安装 torch，无法执行 NMS 回退。") from exc
+
+    if boxes.ndim != 2 or boxes.shape[-1] != 4:
+        raise RuntimeError("NMS 输入框张量必须是 [N, 4] 形状。")
+    if scores.ndim != 1 or scores.shape[0] != boxes.shape[0]:
+        raise RuntimeError("NMS 分数张量必须与框数量一致。")
+    if boxes.numel() == 0:
+        return torch.empty((0,), dtype=torch.int64, device=boxes.device)
+
+    order = scores.argsort(descending=True)
+    keep = []
+    while order.numel() > 0:
+        current = order[0]
+        keep.append(current)
+        if order.numel() == 1:
+            break
+        remaining = order[1:]
+        current_box = boxes[current].unsqueeze(0)
+        iou = _box_iou_for_nms(current_box, boxes[remaining]).squeeze(0)
+        order = remaining[iou <= float(iou_threshold)]
+
+    return torch.stack(keep).to(dtype=torch.int64)
+
+
+def _ensure_torchvision_nms_fallback() -> None:
+    """在 torchvision NMS 不可用时安装纯 torch 回退实现。"""
+
+    global _TORCHVISION_NMS_PATCHED
+    if _TORCHVISION_NMS_PATCHED:
+        return
+
+    try:
+        import torch
+        import torchvision
+        import torchvision.ops as torchvision_ops
+        import torchvision.ops.boxes as torchvision_boxes
+    except ImportError:
+        return
+
+    probe_boxes = torch.tensor([[0.0, 0.0, 4.0, 4.0], [0.5, 0.5, 3.5, 3.5]], dtype=torch.float32)
+    probe_scores = torch.tensor([0.9, 0.8], dtype=torch.float32)
+    try:
+        torchvision_ops.nms(probe_boxes, probe_scores, 0.5)
+        return
+    except Exception as exc:
+        DETECTOR_LOGGER.warning(
+            "检测到 torchvision NMS 不可用，已切换到纯 torch NMS 回退。error=%s",
+            exc,
+        )
+
+    torchvision_ops.nms = _torch_nms_fallback
+    torchvision_boxes.nms = _torch_nms_fallback
+    _TORCHVISION_NMS_PATCHED = True
 
 
 def _clamp_score(value: object) -> float:
@@ -257,6 +349,7 @@ class UltralyticsYoloDetectorBackend(DetectorBackend):
     def _get_model(self):
         if self._model is not None:
             return self._model
+        _ensure_torchvision_nms_fallback()
         try:
             from ultralytics import YOLO
         except ImportError as exc:

@@ -63,11 +63,16 @@ class InstanceAssociationService:
     def __init__(
         self,
         *,
-        text_embedder: TextEmbedder,
+        text_embedder: Optional[TextEmbedder],
         inspection_pose_planner: Optional[InspectionPosePlanner] = None,
     ) -> None:
         self._text_embedder = text_embedder
         self._inspection_pose_planner = inspection_pose_planner or InspectionPosePlanner()
+
+    def set_text_embedder(self, text_embedder: TextEmbedder) -> None:
+        """在运行期注入文本向量器。"""
+
+        self._text_embedder = text_embedder
 
     def associate(
         self,
@@ -298,6 +303,8 @@ class InstanceAssociationService:
         return InstanceMovability.MOVABLE
 
     def _attribute_similarity(self, observation: ProjectedObservation, candidate: SemanticInstance) -> float:
+        if self._text_embedder is None:
+            return 0.0
         left_text = " ".join(
             [
                 observation.label,

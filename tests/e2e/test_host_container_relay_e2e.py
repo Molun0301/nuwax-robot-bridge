@@ -40,6 +40,74 @@ def test_host_container_relay_e2e_path(tmp_path: Path) -> None:
             tool_names = {item["name"] for item in tools.json()["result"]["tools"]}
             assert "capture_image" in tool_names
             assert "list_capabilities" in tool_names
+            assert "list_memory_libraries" in tool_names
+            assert "create_memory_library" in tool_names
+            assert "enable_memory_library" in tool_names
+            assert "disable_memory_library" in tool_names
+            assert "delete_memory_library" in tool_names
+
+            create_memory = client.post(
+                "/mcp",
+                headers=_relay_headers(),
+                json={
+                    "jsonrpc": "2.0",
+                    "id": "create_memory",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "create_memory_library",
+                        "arguments": {
+                            "library_name": "容器预创建记忆库",
+                        },
+                    },
+                },
+            )
+            assert create_memory.status_code == 200
+            create_result = create_memory.json()["result"]["structuredContent"]["result"]
+            assert create_result["create_result"]["created"] is True
+            assert any(item["library_name"] == "容器预创建记忆库" for item in create_result["libraries"])
+
+            enable_memory = client.post(
+                "/mcp",
+                headers=_relay_headers(),
+                json={
+                    "jsonrpc": "2.0",
+                    "id": "enable_memory",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "enable_memory_library",
+                        "arguments": {
+                            "library_name": "容器联调记忆库",
+                            "load_history": False,
+                            "reset_library": False,
+                        },
+                    },
+                },
+            )
+            assert enable_memory.status_code == 200
+            assert (
+                enable_memory.json()["result"]["structuredContent"]["result"]["memory_summary"]["metadata"]["active_library_name"]
+                == "容器联调记忆库"
+            )
+
+            delete_memory = client.post(
+                "/mcp",
+                headers=_relay_headers(),
+                json={
+                    "jsonrpc": "2.0",
+                    "id": "delete_memory",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "delete_memory_library",
+                        "arguments": {
+                            "library_name": "容器联调记忆库",
+                        },
+                    },
+                },
+            )
+            assert delete_memory.status_code == 200
+            delete_result = delete_memory.json()["result"]["structuredContent"]["result"]
+            assert delete_result["delete_result"]["deleted"] is True
+            assert delete_result["memory_summary"]["metadata"]["memory_enabled"] is False
 
             capture = client.post(
                 "/mcp",

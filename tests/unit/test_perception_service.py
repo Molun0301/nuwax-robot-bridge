@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,7 @@ from contracts.perception import TrackState
 from contracts.runtime_views import SceneObjectSummary, SceneSummary
 from core import EventBus, StateNamespace, StateStore
 from gateways.artifacts import LocalArtifactStore
+from gateways.errors import GatewayError
 from providers.image import ImageProvider
 from services import ArtifactService
 from services.perception import (
@@ -20,6 +22,7 @@ from services.perception import (
     DetectorPipeline,
     HybridSceneDescriptionBackend,
     MetadataDrivenDetectorBackend,
+    OpenAICompatibleVisionSceneDescriptionBackend,
     PerceptionService,
     PerceptionVideoRuntime,
     SceneDescriptionBackend,
@@ -254,11 +257,18 @@ class _StaticLocalizationService:
 class _FakeMemoryService:
     """测试用记忆服务。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, should_raise: bool = False, enabled: bool = True) -> None:
         self.calls = []
+        self.should_raise = should_raise
+        self.enabled = enabled
+
+    def is_enabled(self) -> bool:
+        return self.enabled
 
     def remember_current_scene(self, **kwargs):
         self.calls.append(dict(kwargs))
+        if self.should_raise:
+            raise GatewayError("测试记忆写入失败。")
         return {"ok": True}
 
 
@@ -409,6 +419,344 @@ def test_perception_video_runtime_uses_keyframes_and_burst_without_memory_floodi
     status = runtime.get_status()
     assert status.processed_frames >= 4
     assert status.metadata["camera_id"] == "front_camera"
+
+
+def test_perception_video_runtime_ignores_memory_write_failure(tmp_path: Path) -> None:
+    """关键帧记忆写入失败时，不应打断视频感知主流程。"""
+
+    provider_owner = _ProviderOwner(UsbCameraBundle())
+    service, state_store = _build_perception_service(tmp_path, provider_owner)
+    localization_service = _StaticLocalizationService()
+    memory_service = _FakeMemoryService(should_raise=True)
+    runtime = PerceptionVideoRuntime(
+        perception_service=service,
+        state_store=state_store,
+        localization_service=localization_service,
+        mapping_service=None,
+        memory_service=memory_service,
+        enabled=True,
+        auto_start=False,
+        camera_id="front_camera",
+        interval_sec=0.1,
+        store_artifact=False,
+        keyframe_min_interval_sec=0.1,
+        keyframe_max_interval_sec=2.0,
+        keyframe_translation_threshold_m=0.3,
+        keyframe_yaw_threshold_deg=10.0,
+        remember_keyframes=True,
+        remember_min_interval_sec=0.1,
+        burst_frame_count=2,
+        burst_interval_sec=0.01,
+    )
+
+    message = runtime.run_once()
+    status = runtime.get_status()
+
+    assert message is not None
+    assert len(memory_service.calls) == 1
+    assert status.processed_frames == 1
+    assert status.metadata["memory_written"] is False
+
+
+def test_perception_video_runtime_suppresses_repeated_calls_when_pose_is_static(tmp_path: Path) -> None:
+    """静止状态下即使超过最大间隔，也不应重复触发关键帧。"""
+
+    provider_owner = _ProviderOwner(UsbCameraBundle())
+    service, state_store = _build_perception_service(tmp_path, provider_owner)
+    localization_service = _StaticLocalizationService()
+    memory_service = _FakeMemoryService()
+    runtime = PerceptionVideoRuntime(
+        perception_service=service,
+        state_store=state_store,
+        localization_service=localization_service,
+        mapping_service=None,
+        memory_service=memory_service,
+        enabled=True,
+        auto_start=False,
+        camera_id="front_camera",
+        interval_sec=0.1,
+        store_artifact=False,
+        keyframe_min_interval_sec=0.05,
+        keyframe_max_interval_sec=0.2,
+        keyframe_translation_threshold_m=0.3,
+        keyframe_yaw_threshold_deg=10.0,
+        remember_keyframes=True,
+        remember_min_interval_sec=0.05,
+        burst_frame_count=2,
+        burst_interval_sec=0.01,
+    )
+
+    first_message = runtime.run_once()
+    assert first_message is not None
+    assert len(memory_service.calls) == 1
+
+    time.sleep(0.22)
+    second_message = runtime.run_once()
+    status = runtime.get_status()
+
+    assert second_message is None
+    assert len(memory_service.calls) == 1
+    assert status.metadata["last_skip_reason"] == "stationary_pose_hold"
+    assert status.metadata["stationary_suppressed"] is True
+
+
+def test_perception_video_runtime_auto_start_waits_until_memory_enabled(tmp_path: Path) -> None:
+    """自动拉起持续视觉时，应等待记忆库显式启用后再启动。"""
+
+    provider_owner = _ProviderOwner(UsbCameraBundle())
+    service, state_store = _build_perception_service(tmp_path, provider_owner)
+    localization_service = _StaticLocalizationService()
+    memory_service = _FakeMemoryService(enabled=False)
+    runtime = PerceptionVideoRuntime(
+        perception_service=service,
+        state_store=state_store,
+        localization_service=localization_service,
+        mapping_service=None,
+        memory_service=memory_service,
+        enabled=True,
+        auto_start=True,
+        camera_id="front_camera",
+        interval_sec=0.1,
+        store_artifact=False,
+        keyframe_min_interval_sec=0.05,
+        keyframe_max_interval_sec=0.2,
+        keyframe_translation_threshold_m=0.3,
+        keyframe_yaw_threshold_deg=10.0,
+        remember_keyframes=True,
+        remember_min_interval_sec=0.05,
+        burst_frame_count=2,
+        burst_interval_sec=0.01,
+    )
+
+    assert runtime.should_auto_start() is False
+
+    memory_service.enabled = True
+
+    assert runtime.should_auto_start() is True
+
+
+def test_openai_compatible_vision_backend_uses_responses_api_for_ark() -> None:
+    """豆包方舟兼容地址应自动切到 responses 接口。"""
+
+    image_provider = UsbCameraBundle()
+    image_frame = image_provider.capture_image("front_camera")
+    camera_info = image_provider.get_camera_info("front_camera")
+    response_payload = (
+        '{"headline":"看见一名人员和补给架。","details":["人员站在补给架旁边。"],'
+        '"tags":["人员","补给架"],"relations":["beside_dock"],'
+        '"objects":[{"label":"person","count":1,"confidence":0.92,"attributes":{"display_name_zh":"人员"}},'
+        '{"label":"charger","count":1,"confidence":0.81,"attributes":{"display_name_zh":"补给架"}}]}'
+    )
+
+    class _FakeResponsesApi:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(output_text=response_payload)
+
+    class _FailingChatCompletions:
+        def create(self, **kwargs):
+            raise AssertionError("不应走 chat.completions")
+
+    responses_api = _FakeResponsesApi()
+    backend = OpenAICompatibleVisionSceneDescriptionBackend(
+        model="doubao-seed-2-0-pro-260215",
+        base_url="https://ark.cn-beijing.volces.com/api/v3",
+        api_style="auto",
+    )
+    backend._client = SimpleNamespace(
+        responses=responses_api,
+        chat=SimpleNamespace(completions=_FailingChatCompletions()),
+    )
+
+    summary = backend.describe(
+        camera_id="front_camera",
+        detections_2d=(),
+        detections_3d=(),
+        tracks=(),
+        image_frame=image_frame,
+        camera_info=camera_info,
+    )
+
+    assert responses_api.calls
+    request_payload = responses_api.calls[0]
+    assert request_payload["input"][0]["content"][0]["type"] == "input_image"
+    assert request_payload["input"][0]["content"][1]["type"] == "input_text"
+    assert summary.headline == "看见一名人员和补给架。"
+    assert summary.metadata["cloud_vision_api_style"] == "responses"
+    assert "person" in summary.metadata["visual_labels"]
+
+
+def test_openai_compatible_vision_backend_falls_back_to_raw_http_responses_for_old_sdk(monkeypatch) -> None:
+    """旧版 openai SDK 缺少 responses 接口时，应回退到原生 HTTP 请求。"""
+
+    image_provider = UsbCameraBundle()
+    image_frame = image_provider.capture_image("front_camera")
+    camera_info = image_provider.get_camera_info("front_camera")
+    backend = OpenAICompatibleVisionSceneDescriptionBackend(
+        model="doubao-seed-2-0-pro-260215",
+        base_url="https://ark.cn-beijing.volces.com/api/v3",
+        api_style="auto",
+    )
+    backend._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: (_ for _ in ()).throw(AssertionError("不应走 chat"))))
+    )
+
+    recorded_payloads = []
+
+    def _fake_post_responses_request(request_payload):
+        recorded_payloads.append(request_payload)
+        return {
+            "output": [
+                {
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": (
+                                '{"headline":"看见前方有办公桌。","details":["办公桌位于画面中央。"],'
+                                '"tags":["办公桌"],"relations":["center"],'
+                                '"objects":[{"label":"desk","count":1,"confidence":0.88,'
+                                '"attributes":{"display_name_zh":"办公桌"}}]}'
+                            ),
+                        }
+                    ]
+                }
+            ]
+        }
+
+    monkeypatch.setattr(backend, "_post_responses_request", _fake_post_responses_request)
+
+    summary = backend.describe(
+        camera_id="front_camera",
+        detections_2d=(),
+        detections_3d=(),
+        tracks=(),
+        image_frame=image_frame,
+        camera_info=camera_info,
+    )
+
+    assert recorded_payloads
+    assert recorded_payloads[0]["input"][0]["content"][0]["type"] == "input_image"
+    assert summary.headline == "看见前方有办公桌。"
+    assert summary.metadata["cloud_vision_api_style"] == "responses"
+    assert "desk" in summary.metadata["visual_labels"]
+
+
+def test_openai_compatible_vision_backend_keeps_chat_completions_for_openai() -> None:
+    """标准 OpenAI 兼容地址仍应走 chat.completions 接口。"""
+
+    image_provider = UsbCameraBundle()
+    image_frame = image_provider.capture_image("front_camera")
+    camera_info = image_provider.get_camera_info("front_camera")
+    response_payload = (
+        '{"headline":"看见一名人员。","details":["人员位于画面中央。"],'
+        '"tags":["人员"],"relations":["center"],'
+        '"objects":[{"label":"person","count":1,"confidence":0.95,"attributes":{"display_name_zh":"人员"}}]}'
+    )
+
+    class _FakeChatCompletions:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=response_payload),
+                    )
+                ]
+            )
+
+    class _FailingResponsesApi:
+        def create(self, **kwargs):
+            raise AssertionError("不应走 responses")
+
+    chat_completions = _FakeChatCompletions()
+    backend = OpenAICompatibleVisionSceneDescriptionBackend(
+        model="gpt-4o-mini",
+        base_url="https://api.openai.com/v1",
+        api_style="auto",
+    )
+    backend._client = SimpleNamespace(
+        responses=_FailingResponsesApi(),
+        chat=SimpleNamespace(completions=chat_completions),
+    )
+
+    summary = backend.describe(
+        camera_id="front_camera",
+        detections_2d=(),
+        detections_3d=(),
+        tracks=(),
+        image_frame=image_frame,
+        camera_info=camera_info,
+    )
+
+    assert chat_completions.calls
+    assert summary.headline == "看见一名人员。"
+    assert summary.metadata["cloud_vision_api_style"] == "chat_completions"
+
+
+def test_openai_compatible_vision_backend_retries_when_json_is_truncated() -> None:
+    """云端响应因 max_tokens 截断时，应自动放大配额后重试一次。"""
+
+    image_provider = UsbCameraBundle()
+    image_frame = image_provider.capture_image("front_camera")
+    camera_info = image_provider.get_camera_info("front_camera")
+    truncated_payload = (
+        '{"headline":"办公室内有人坐在工位前。","details":["右侧有人正在使用电脑。"],'
+        '"tags":["人员","办公桌"],"relations":["person_near_desk"],'
+        '"objects":[{"label":"person","count":1,"confidence":0.95,"attributes":{"display_name_zh":"人员"}},'
+    )
+    complete_payload = (
+        '{"headline":"办公室内有人坐在工位前。","details":["右侧有人正在使用电脑。"],'
+        '"tags":["人员","办公桌"],"relations":["person_near_desk"],'
+        '"objects":[{"label":"person","count":1,"confidence":0.95,"attributes":{"display_name_zh":"人员"}},'
+        '{"label":"desk","count":1,"confidence":0.9,"attributes":{"display_name_zh":"办公桌"}}]}'
+    )
+
+    class _FakeChatCompletions:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            payload = truncated_payload if len(self.calls) == 1 else complete_payload
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=payload),
+                    )
+                ]
+            )
+
+    chat_completions = _FakeChatCompletions()
+    backend = OpenAICompatibleVisionSceneDescriptionBackend(
+        model="qwen3-vl-flash",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        api_style="chat_completions",
+        max_tokens=700,
+    )
+    backend._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=chat_completions),
+    )
+
+    summary = backend.describe(
+        camera_id="front_camera",
+        detections_2d=(),
+        detections_3d=(),
+        tracks=(),
+        image_frame=image_frame,
+        camera_info=camera_info,
+    )
+
+    assert len(chat_completions.calls) == 2
+    assert chat_completions.calls[0]["max_tokens"] == 700
+    assert chat_completions.calls[1]["max_tokens"] == 1400
+    assert summary.headline == "办公室内有人坐在工位前。"
+    assert "person" in summary.metadata["visual_labels"]
 
 
 def test_tracker_lifecycle_flows_from_tentative_to_removed(tmp_path: Path) -> None:

@@ -42,12 +42,24 @@ class NavigationService:
     def is_navigation_available(self) -> bool:
         """判断导航后端是否可用。"""
 
-        return self._find_navigation_provider() is not None
+        provider = self._find_navigation_provider()
+        if provider is None or not provider.is_available():
+            return False
+        availability_checker = getattr(provider, "is_navigation_available", None)
+        if callable(availability_checker):
+            return bool(availability_checker())
+        return True
 
     def is_exploration_available(self) -> bool:
         """判断探索后端是否可用。"""
 
-        return self._find_exploration_provider() is not None
+        provider = self._find_exploration_provider()
+        if provider is None or not provider.is_available():
+            return False
+        availability_checker = getattr(provider, "is_exploration_available", None)
+        if callable(availability_checker):
+            return bool(availability_checker())
+        return True
 
     def refresh_navigation(self) -> NavigationContext:
         """刷新导航上下文。"""
@@ -221,7 +233,14 @@ class NavigationService:
         provider = self._get_exploration_provider()
         accepted = provider.start_exploration(request)
         if not accepted:
-            raise GatewayError(f"探索后端拒绝请求 {request.request_id}。")
+            message = f"探索后端拒绝请求 {request.request_id}。"
+            try:
+                exploration_state = provider.get_exploration_state()
+            except Exception:
+                exploration_state = None
+            if exploration_state is not None and exploration_state.message:
+                message = exploration_state.message
+            raise GatewayError(message)
         self._current_explore_request = request
         context = self.refresh_exploration()
         if context.exploration_state.status == ExplorationStatus.IDLE:

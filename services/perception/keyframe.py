@@ -23,9 +23,10 @@ class PerceptionKeyframeSelector:
 
     默认规则采用“时间 + 位姿 + 区域/拓扑变化”的组合触发：
     1. 首帧直接进入关键帧；
-    2. 超过最大间隔时兜底触发；
-    3. 位姿平移或朝向变化达到阈值时触发；
-    4. 进入新的语义区域或拓扑节点时触发。
+    2. 位姿平移或朝向变化达到阈值时触发；
+    3. 进入新的语义区域或拓扑节点时触发；
+    4. 如果位姿几乎不变，则即使超过最大间隔也持续抑制，避免静止时重复调用视觉 API；
+    5. 只有在缺少位姿上下文时，才回退使用最大间隔兜底触发。
     """
 
     def __init__(
@@ -61,12 +62,10 @@ class PerceptionKeyframeSelector:
             **anchor_metadata,
             "elapsed_sec": round(elapsed_sec, 6),
         }
-        if elapsed_sec >= self._max_interval_sec:
-            return KeyframeDecision(True, "max_interval", metadata)
-
         if elapsed_sec < self._min_interval_sec:
             return KeyframeDecision(False, "below_min_interval", metadata)
 
+        has_pose_context = current_pose is not None and self._last_keyframe_pose is not None
         if current_pose is not None and self._last_keyframe_pose is not None:
             translation_m = self._distance(current_pose, self._last_keyframe_pose)
             yaw_delta_rad = self._yaw_delta(current_pose, self._last_keyframe_pose)
@@ -87,6 +86,17 @@ class PerceptionKeyframeSelector:
             return KeyframeDecision(True, "semantic_region_changed", metadata)
         if topo_node_id and topo_node_id != self._last_topo_node_id:
             return KeyframeDecision(True, "topology_node_changed", metadata)
+
+        if elapsed_sec >= self._max_interval_sec:
+            metadata.update(
+                {
+                    "max_interval_elapsed": True,
+                    "stationary_suppressed": has_pose_context,
+                }
+            )
+            if has_pose_context:
+                return KeyframeDecision(False, "stationary_pose_hold", metadata)
+            return KeyframeDecision(True, "max_interval", metadata)
         return KeyframeDecision(False, "no_significant_change", metadata)
 
     def mark_processed(
@@ -170,4 +180,3 @@ class PerceptionKeyframeSelector:
         siny_cosp = 2.0 * ((orientation.w * orientation.z) + (orientation.x * orientation.y))
         cosy_cosp = 1.0 - (2.0 * ((orientation.y * orientation.y) + (orientation.z * orientation.z)))
         return math.atan2(siny_cosp, cosy_cosp)
-

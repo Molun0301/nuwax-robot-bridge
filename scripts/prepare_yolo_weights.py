@@ -3,17 +3,24 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import shutil
-from typing import Iterable, Optional
+import subprocess
+import tempfile
+from typing import Iterable, List, Optional
+import urllib.request
+
+
+DEFAULT_RELEASE = "v8.4.0"
+DEFAULT_REPO = "ultralytics/assets"
 
 
 def build_parser() -> argparse.ArgumentParser:
     """构建命令行参数。"""
 
-    parser = argparse.ArgumentParser(description="预下载并固化 YOLO 权重文件。")
+    parser = argparse.ArgumentParser(description="准备 YOLO 权重文件。")
     parser.add_argument(
         "--model",
         default="yolo26n.pt",
-        help="Ultralytics 模型名或本地权重路径，例如 yolo26n.pt。",
+        help="模型名或本地权重路径，例如 yolo26n.pt。",
     )
     parser.add_argument(
         "--output",
@@ -21,66 +28,128 @@ def build_parser() -> argparse.ArgumentParser:
         help="输出权重路径。默认写入项目 runtime_data/models/。",
     )
     parser.add_argument(
+        "--release",
+        default=DEFAULT_RELEASE,
+        help="Ultralytics 官方 release 版本，默认使用 v8.4.0。",
+    )
+    parser.add_argument(
+        "--download-url",
+        default="",
+        help="显式指定下载地址。设置后优先使用该地址。",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="如果输出文件已存在，则覆盖。",
     )
+    parser.add_argument(
+        "--timeout-sec",
+        type=float,
+        default=30.0,
+        help="单次下载请求超时时间，单位秒。",
+    )
     return parser
 
 
-def _iter_candidate_paths(model: object, model_name: str) -> Iterable[Path]:
-    """尽量从 Ultralytics 实例和常见缓存目录中定位已下载的权重文件。"""
+def _normalize_output_path(output: str) -> Path:
+    output_path = Path(output).expanduser()
+    if not output_path.is_absolute():
+        output_path = (Path.cwd() / output_path).resolve()
+    return output_path
 
-    requested = Path(model_name).expanduser()
-    if requested.exists():
-        yield requested.resolve()
 
-    for attr_name in ("ckpt_path", "pt_path", "checkpoint_path"):
-        value = getattr(model, attr_name, None)
-        if isinstance(value, str) and value.strip():
-            path = Path(value).expanduser()
-            if path.exists():
-                yield path.resolve()
+def _iter_candidate_urls(model_name: str, release: str, explicit_url: str) -> Iterable[str]:
+    name = Path(model_name).name
+    if explicit_url.strip():
+        yield explicit_url.strip()
+    yield f"https://github.com/{DEFAULT_REPO}/releases/download/{release}/{name}"
 
-    ckpt_value = getattr(model, "ckpt", None)
-    if isinstance(ckpt_value, str) and ckpt_value.strip():
-        path = Path(ckpt_value).expanduser()
-        if path.exists():
-            yield path.resolve()
 
-    filename = requested.name
-    search_roots = (
-        Path.cwd(),
-        Path.home() / ".cache" / "ultralytics",
-        Path.home() / ".config" / "Ultralytics",
-        Path.home() / ".cache" / "torch" / "hub" / "checkpoints",
+def _run_external_downloader(command: List[str]) -> bool:
+    try:
+        completed = subprocess.run(command, check=False)
+    except FileNotFoundError:
+        return False
+    return completed.returncode == 0
+
+
+def _download_with_wget(url: str, target: Path, timeout_sec: float) -> bool:
+    return _run_external_downloader(
+        [
+            "wget",
+            "-4",
+            "-O",
+            str(target),
+            "--timeout=%d" % max(1, int(timeout_sec)),
+            "--tries=2",
+            url,
+        ]
     )
-    for root in search_roots:
-        if not root.exists():
-            continue
-        try:
-            for path in root.rglob(filename):
-                if path.is_file():
-                    yield path.resolve()
-        except OSError:
-            continue
 
 
-def _resolve_downloaded_weights(model: object, model_name: str) -> Optional[Path]:
-    """返回最可能的权重文件路径。"""
+def _download_with_curl(url: str, target: Path, timeout_sec: float) -> bool:
+    return _run_external_downloader(
+        [
+            "curl",
+            "-L",
+            "-4",
+            "--fail",
+            "--connect-timeout",
+            str(max(1, int(timeout_sec))),
+            "-o",
+            str(target),
+            url,
+        ]
+    )
 
-    seen = set()
-    candidates = []
-    for path in _iter_candidate_paths(model, model_name):
-        key = str(path)
-        if key in seen:
-            continue
-        seen.add(key)
-        candidates.append(path)
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
-    return candidates[0]
+
+def _download_with_urllib(url: str, target: Path, timeout_sec: float) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_sec) as response:
+            with target.open("wb") as file:
+                shutil.copyfileobj(response, file)
+    except Exception:
+        return False
+    return True
+
+
+def _download_to_temp(urls: Iterable[str], timeout_sec: float) -> Optional[Path]:
+    with tempfile.TemporaryDirectory(prefix="nuwax_yolo_download_") as temp_dir:
+        temp_path = Path(temp_dir) / "weights.pt"
+        for url in urls:
+            if _download_with_wget(url, temp_path, timeout_sec):
+                if temp_path.exists() and temp_path.stat().st_size > 0:
+                    return _materialize_temp_file(temp_path)
+            if _download_with_curl(url, temp_path, timeout_sec):
+                if temp_path.exists() and temp_path.stat().st_size > 0:
+                    return _materialize_temp_file(temp_path)
+            if _download_with_urllib(url, temp_path, timeout_sec):
+                if temp_path.exists() and temp_path.stat().st_size > 0:
+                    return _materialize_temp_file(temp_path)
+    return None
+
+
+def _materialize_temp_file(source: Path) -> Path:
+    temp_file = tempfile.NamedTemporaryFile(prefix="nuwax_yolo_weights_", suffix=".pt", delete=False)
+    temp_file.close()
+    target = Path(temp_file.name)
+    shutil.copy2(str(source), str(target))
+    return target
+
+
+def _resolve_local_source(model_name: str) -> Optional[Path]:
+    candidate = Path(model_name).expanduser()
+    if candidate.exists():
+        return candidate.resolve()
+    return None
+
+
+def _ensure_min_bytes(path: Path, min_bytes: int = 100_000) -> None:
+    if not path.exists():
+        raise SystemExit("权重文件不存在：%s" % path)
+    size = path.stat().st_size
+    if size < min_bytes:
+        raise SystemExit("权重文件大小异常，可能下载未完成：%s (%d bytes)" % (path, size))
 
 
 def main() -> int:
@@ -88,31 +157,35 @@ def main() -> int:
 
     parser = build_parser()
     args = parser.parse_args()
-    output_path = Path(args.output).expanduser()
-    if not output_path.is_absolute():
-        output_path = (Path.cwd() / output_path).resolve()
+    output_path = _normalize_output_path(args.output)
 
     if output_path.exists() and not args.overwrite:
+        _ensure_min_bytes(output_path)
         print("目标权重已存在：%s" % output_path)
         return 0
 
-    try:
-        from ultralytics import YOLO
-    except ImportError as exc:
-        raise SystemExit("当前环境未安装 ultralytics，无法准备 YOLO 权重。") from exc
+    source_path = _resolve_local_source(args.model)
+    temp_download: Optional[Path] = None
 
-    # 触发 Ultralytics 的本地加载或官方权重下载逻辑。
-    model = YOLO(args.model)
-    source_path = _resolve_downloaded_weights(model, args.model)
     if source_path is None:
-        raise SystemExit(
-            "未能定位已下载的权重文件。请确认当前机器能联网访问 Ultralytics 官方模型资源，"
-            "或手工把权重放到目标路径。"
+        temp_download = _download_to_temp(
+            _iter_candidate_urls(args.model, args.release, args.download_url),
+            timeout_sec=max(1.0, float(args.timeout_sec)),
         )
+        if temp_download is None:
+            raise SystemExit(
+                "未能自动下载 YOLO 权重。请手工下载后放到目标路径，"
+                "或使用 --download-url 指向一个当前网络可访问的地址。"
+            )
+        source_path = temp_download
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(str(source_path), str(output_path))
+    _ensure_min_bytes(output_path)
     print("YOLO 权重已准备完成：%s" % output_path)
+
+    if temp_download is not None and temp_download.exists():
+        temp_download.unlink()
     return 0
 
 

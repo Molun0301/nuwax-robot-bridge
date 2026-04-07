@@ -92,6 +92,7 @@ class Go2ProviderBundle(
             robot_id=self.assembly.defaults.parameters["robot_id"],
             frame_id=self.assembly.defaults.frame_ids["base"],
             mode=_to_control_mode(self.assembly.current_mode),
+            pose=self.get_current_pose(),
             joints=self.get_joint_states(),
             imu=self.get_imu_state(),
             safety=self.get_safety_state(),
@@ -115,6 +116,11 @@ class Go2ProviderBundle(
         ]
 
     def get_imu_state(self) -> Optional[IMUState]:
+        if self.assembly.data_plane is not None:
+            imu_state = self.assembly.data_plane.get_imu_state()
+            if imu_state is not None:
+                return imu_state
+
         if self.assembly.low_level_controller is None:
             return None
 

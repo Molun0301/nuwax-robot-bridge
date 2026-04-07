@@ -92,7 +92,15 @@ class LocalizationService:
     def is_available(self) -> bool:
         """判断定位服务当前是否可用。"""
 
-        return self._latest_snapshot is not None or self._find_localization_provider() is not None
+        if self._latest_snapshot is not None:
+            return True
+        provider = self._find_localization_provider()
+        if provider is None or not provider.is_available():
+            return False
+        availability_checker = getattr(provider, "is_localization_available", None)
+        if callable(availability_checker):
+            return bool(availability_checker())
+        return True
 
     def _get_localization_provider(self) -> LocalizationProvider:
         provider = self._find_localization_provider()

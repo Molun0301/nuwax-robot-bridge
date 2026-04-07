@@ -4,8 +4,9 @@ from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
 import threading
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence
 
+from contracts.base import utc_now
 from contracts.memory import SemanticMemoryEntry, TaggedLocation
 from contracts.spatial_memory import ObservationEvent, SemanticInstance
 
@@ -24,6 +25,15 @@ class VectorRecord:
     embedding_dim: int
     source_text: str
     vector_payload: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class MemoryLibraryRecord:
+    """命名记忆库目录记录。"""
+
+    library_name: str
+    created_at: str
     updated_at: str
 
 
@@ -124,6 +134,61 @@ class MemoryRepository:
             )
             for row in rows
         }
+
+    def load_memory_libraries(self) -> List[MemoryLibraryRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT library_name, created_at, updated_at
+                FROM memory_libraries
+                ORDER BY updated_at DESC, library_name ASC
+                """
+            ).fetchall()
+        return [
+            MemoryLibraryRecord(
+                library_name=str(row["library_name"]),
+                created_at=str(row["created_at"]),
+                updated_at=str(row["updated_at"]),
+            )
+            for row in rows
+        ]
+
+    def upsert_memory_library(self, library_name: str) -> None:
+        resolved_name = str(library_name or "").strip()
+        if not resolved_name:
+            return
+        timestamp = utc_now().isoformat()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO memory_libraries (
+                    library_name,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT(library_name) DO UPDATE SET
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    resolved_name,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self._conn.commit()
+
+    def delete_memory_library(self, library_name: str) -> bool:
+        resolved_name = str(library_name or "").strip()
+        if not resolved_name:
+            return False
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM memory_libraries WHERE library_name = ?",
+                (resolved_name,),
+            )
+            self._conn.commit()
+        return int(cursor.rowcount or 0) > 0
 
     def upsert_tagged_location(self, location: TaggedLocation) -> None:
         payload_json = location.model_dump_json()
@@ -251,6 +316,79 @@ class MemoryRepository:
             )
             self._conn.commit()
 
+    def delete_tagged_locations(self, location_ids: Sequence[str]) -> int:
+        normalized_ids = [str(item).strip() for item in location_ids if str(item).strip()]
+        if not normalized_ids:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "DELETE FROM tagged_locations WHERE location_id = ?",
+                [(location_id,) for location_id in normalized_ids],
+            )
+            self._conn.executemany(
+                "DELETE FROM memory_vectors WHERE record_id = ?",
+                [(location_id,) for location_id in normalized_ids],
+            )
+            self._conn.commit()
+        return len(normalized_ids)
+
+    def delete_semantic_memories(self, memory_ids: Sequence[str]) -> int:
+        normalized_ids = [str(item).strip() for item in memory_ids if str(item).strip()]
+        if not normalized_ids:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "DELETE FROM semantic_memories WHERE memory_id = ?",
+                [(memory_id,) for memory_id in normalized_ids],
+            )
+            self._conn.executemany(
+                "DELETE FROM memory_vectors WHERE record_id = ?",
+                [(memory_id,) for memory_id in normalized_ids],
+            )
+            self._conn.commit()
+        return len(normalized_ids)
+
+    def delete_semantic_instances(self, instance_ids: Sequence[str]) -> int:
+        normalized_ids = [str(item).strip() for item in instance_ids if str(item).strip()]
+        if not normalized_ids:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "DELETE FROM semantic_instances WHERE instance_id = ?",
+                [(instance_id,) for instance_id in normalized_ids],
+            )
+            self._conn.executemany(
+                "DELETE FROM memory_vectors WHERE record_id = ?",
+                [(instance_id,) for instance_id in normalized_ids],
+            )
+            self._conn.commit()
+        return len(normalized_ids)
+
+    def delete_observation_events(self, event_ids: Sequence[str]) -> int:
+        normalized_ids = [str(item).strip() for item in event_ids if str(item).strip()]
+        if not normalized_ids:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "DELETE FROM observation_events WHERE event_id = ?",
+                [(event_id,) for event_id in normalized_ids],
+            )
+            self._conn.executemany(
+                "DELETE FROM memory_vectors WHERE record_id = ?",
+                [(event_id,) for event_id in normalized_ids],
+            )
+            self._conn.commit()
+        return len(normalized_ids)
+
+    def clear_all(self) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM tagged_locations")
+            self._conn.execute("DELETE FROM semantic_memories")
+            self._conn.execute("DELETE FROM semantic_instances")
+            self._conn.execute("DELETE FROM observation_events")
+            self._conn.execute("DELETE FROM memory_vectors")
+            self._conn.commit()
+
     def upsert_vector_record(
         self,
         *,
@@ -325,6 +463,18 @@ class MemoryRepository:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_memories_kind ON semantic_memories(kind)"
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_libraries (
+                    library_name TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_libraries_updated_at ON memory_libraries(updated_at)"
             )
             self._conn.execute(
                 """

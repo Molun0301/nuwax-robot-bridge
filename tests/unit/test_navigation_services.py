@@ -33,9 +33,25 @@ class FakeNavigationBundle(LocalizationProvider, MapProvider, NavigationProvider
         self.last_request_id: Optional[str] = None
         self.explore_poll_count = 0
         self.explore_cancelled = False
+        self.localization_available = True
+        self.map_available = True
+        self.navigation_available = True
+        self.exploration_available = True
 
     def is_available(self) -> bool:
         return True
+
+    def is_localization_available(self) -> bool:
+        return self.localization_available
+
+    def is_map_available(self) -> bool:
+        return self.map_available
+
+    def is_navigation_available(self) -> bool:
+        return self.navigation_available
+
+    def is_exploration_available(self) -> bool:
+        return self.exploration_available
 
     def get_current_pose(self) -> Optional[Pose]:
         return self.current_pose
@@ -314,3 +330,18 @@ def test_navigation_service_exploration_flow_reuses_same_runtime_boundary() -> N
     assert latest_navigation_state is not None
     assert latest_navigation_state.value.exploration_state.covered_ratio == 1.0
     assert len(navigation_service.list_exploration_history()) >= 1
+
+
+def test_services_consult_provider_specific_availability_flags() -> None:
+    """服务可用性应优先反映提供器的真实运行状态。"""
+
+    providers, _, localization_service, mapping_service, navigation_service = _build_navigation_services()
+    providers.localization_available = False
+    providers.map_available = False
+    providers.navigation_available = False
+    providers.exploration_available = False
+
+    assert localization_service.is_available() is False
+    assert mapping_service.is_available() is False
+    assert navigation_service.is_navigation_available() is False
+    assert navigation_service.is_exploration_available() is False

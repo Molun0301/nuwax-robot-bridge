@@ -67,6 +67,10 @@ from services.perception import PerceptionService
 
 LOGGER = logging.getLogger(__name__)
 
+MEMORY_LIBRARY_METADATA_KEY = "memory_library_name"
+LEGACY_MEMORY_LIBRARY_NAME = "legacy_default"
+MEMORY_DISABLED_MESSAGE = "记忆库功能尚未启用，请先调用 `enable_memory_library`。"
+
 
 @dataclass
 class _ScoredCandidate:
@@ -86,6 +90,18 @@ class _ScoredCandidate:
     recency_score: float
     distance_m: Optional[float]
     final_score: float
+
+
+@dataclass(frozen=True)
+class _MemoryLibraryStats:
+    """单个命名记忆库的聚合摘要。"""
+
+    library_name: str
+    tagged_location_count: int = 0
+    semantic_memory_count: int = 0
+    semantic_instance_count: int = 0
+    observation_event_count: int = 0
+    last_updated_at: Optional[datetime] = None
 
 
 class MemoryService:
@@ -109,6 +125,9 @@ class MemoryService:
         text_embedding_dimension: Optional[int] = None,
         image_embedding_model: str = "disabled",
         image_embedding_dimension: int = 512,
+        embedding_api_key: str = "",
+        embedding_base_url: str = "https://dashscope.aliyuncs.com/api/v1",
+        embedding_timeout_sec: float = 20.0,
         text_embedder: Optional[TextEmbedder] = None,
         vision_language_embedder: Optional[VisionLanguageEmbedder] = None,
         vector_store: Optional[SQLiteNamedVectorStore] = None,
@@ -122,24 +141,26 @@ class MemoryService:
         self._artifact_store = artifact_store
         self._repository = MemoryRepository(memory_db_path)
         self._vector_store = vector_store or SQLiteNamedVectorStore(memory_db_path)
+        self._embedding_api_key = str(embedding_api_key or "").strip()
+        self._embedding_base_url = str(embedding_base_url or "").strip() or "https://dashscope.aliyuncs.com/api/v1"
+        self._embedding_timeout_sec = max(1.0, float(embedding_timeout_sec))
 
-        resolved_text_model = (
+        self._configured_text_model = (
             text_embedding_model
             or embedding_model
             or "sentence-transformers:BAAI/bge-m3"
         )
-        resolved_text_dimension = int(text_embedding_dimension or embedding_dimension or 1024)
-        self._text_embedder = text_embedder or self._build_text_embedder_with_fallback(
-            resolved_text_model,
-            resolved_text_dimension,
+        self._configured_text_dimension = int(text_embedding_dimension or embedding_dimension or 1024)
+        self._configured_image_model = str(image_embedding_model or "disabled").strip() or "disabled"
+        self._configured_image_dimension = int(image_embedding_dimension or 512)
+        self._text_embedder = text_embedder
+        self._image_embedder = vision_language_embedder
+        self._text_embedder_ready = text_embedder is not None
+        self._image_embedder_ready = (
+            vision_language_embedder is not None or self._configured_image_model.lower() == "disabled"
         )
-        self._image_embedder = (
-            vision_language_embedder
-            or self._build_image_embedder_with_fallback(
-                image_embedding_model,
-                image_embedding_dimension,
-            )
-        )
+        self._memory_enabled = False
+        self._active_library_name: Optional[str] = None
         self._inspection_pose_planner = InspectionPosePlanner()
         self._semantic_map_builder = SemanticMapBuilder(
             inspection_pose_planner=self._inspection_pose_planner,
@@ -166,7 +187,304 @@ class MemoryService:
         self._semantic_history: Deque[SemanticMemoryEntry] = deque(maxlen=max(1, history_limit))
         self._semantic_instance_history: Deque[SemanticInstance] = deque(maxlen=max(1, history_limit))
         self._observation_event_history: Deque[ObservationEvent] = deque(maxlen=max(1, history_limit))
-        self._load_persisted_memory()
+
+    def is_enabled(self) -> bool:
+        """返回记忆库当前是否已启用。"""
+
+        return self._memory_enabled and bool(self._active_library_name)
+
+    def activate_memory_library(
+        self,
+        *,
+        library_name: str,
+        load_history: bool = True,
+        reset_library: bool = False,
+    ) -> Dict[str, object]:
+        """启用指定命名记忆库，并按需加载历史。"""
+
+        resolved_name = str(library_name or "").strip()
+        if not resolved_name:
+            raise GatewayError(
+                "记忆库名称不能为空。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+
+        self._repository.upsert_memory_library(resolved_name)
+        if reset_library:
+            self._delete_memory_library_records(resolved_name)
+        self._ensure_embedders_initialized()
+        self._clear_active_memory_state()
+        self._memory_enabled = True
+        self._active_library_name = resolved_name
+        if load_history:
+            self._load_persisted_memory(library_name=resolved_name)
+        summary = self.get_summary()
+        self._publish_memory_event(
+            "memory.library_enabled",
+            "记忆库 %s 已启用。" % resolved_name,
+            payload={
+                "library_name": resolved_name,
+                "load_history": bool(load_history),
+                "reset_library": bool(reset_library),
+                "summary": summary.model_dump(mode="json"),
+            },
+        )
+        return summary.model_dump(mode="json")
+
+    def create_memory_library(self, *, library_name: str) -> Dict[str, object]:
+        """创建命名记忆库目录，但不进入激活态。"""
+
+        resolved_name = str(library_name or "").strip()
+        if not resolved_name:
+            raise GatewayError(
+                "记忆库名称不能为空。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+
+        existed_before = any(item["library_name"] == resolved_name for item in self.list_memory_libraries())
+        self._repository.upsert_memory_library(resolved_name)
+        summary = self.get_summary()
+        created = not existed_before
+        self._publish_memory_event(
+            "memory.library_created",
+            "记忆库 %s 已创建。" % resolved_name if created else "记忆库 %s 已存在。" % resolved_name,
+            payload={
+                "library_name": resolved_name,
+                "created": created,
+                "active": resolved_name == self._active_library_name,
+                "summary": summary.model_dump(mode="json"),
+            },
+        )
+        return {
+            "library_name": resolved_name,
+            "created": created,
+            "active": resolved_name == self._active_library_name,
+        }
+
+    def disable_memory_library(self) -> Dict[str, object]:
+        """停用当前记忆库，并清空激活态缓存。"""
+
+        previous_name = self._active_library_name
+        self._clear_active_memory_state()
+        self._memory_enabled = False
+        self._active_library_name = None
+        summary = self.get_summary()
+        if previous_name:
+            self._publish_memory_event(
+                "memory.library_disabled",
+                "记忆库 %s 已停用。" % previous_name,
+                payload={"library_name": previous_name},
+            )
+        return summary.model_dump(mode="json")
+
+    def delete_memory_library(self, *, library_name: str) -> Dict[str, object]:
+        """删除指定命名记忆库及其关联记录。"""
+
+        resolved_name = str(library_name or "").strip()
+        if not resolved_name:
+            raise GatewayError(
+                "记忆库名称不能为空。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+
+        was_active = resolved_name == self._active_library_name
+        if was_active:
+            self._clear_active_memory_state()
+            self._memory_enabled = False
+            self._active_library_name = None
+
+        deleted_counts = self._delete_memory_library_records(resolved_name)
+        deleted_directory = self._repository.delete_memory_library(resolved_name)
+        deleted = deleted_directory or any(count > 0 for count in deleted_counts.values())
+        summary = self.get_summary()
+        self._publish_memory_event(
+            "memory.library_deleted",
+            "记忆库 %s 已删除。" % resolved_name if deleted else "记忆库 %s 不存在，无需删除。" % resolved_name,
+            payload={
+                "library_name": resolved_name,
+                "deleted": deleted,
+                "was_active": was_active,
+                "deleted_counts": deleted_counts,
+                "summary": summary.model_dump(mode="json"),
+            },
+        )
+        return {
+            "library_name": resolved_name,
+            "deleted": deleted,
+            "was_active": was_active,
+            "deleted_counts": deleted_counts,
+        }
+
+    def list_memory_libraries(self) -> Tuple[Dict[str, object], ...]:
+        """列出当前仓库内可见的命名记忆库。"""
+
+        stats_by_name: Dict[str, _MemoryLibraryStats] = {
+            item.library_name: _MemoryLibraryStats(
+                library_name=item.library_name,
+                last_updated_at=datetime.fromisoformat(item.updated_at),
+            )
+            for item in self._repository.load_memory_libraries()
+        }
+
+        def _touch(name: str, *, record_kind: str, timestamp: datetime) -> None:
+            current = stats_by_name.get(name)
+            if current is None:
+                current = _MemoryLibraryStats(library_name=name)
+            updated_at = current.last_updated_at
+            if updated_at is None or timestamp > updated_at:
+                updated_at = timestamp
+            stats_by_name[name] = _MemoryLibraryStats(
+                library_name=name,
+                tagged_location_count=current.tagged_location_count + (1 if record_kind == "tagged_location" else 0),
+                semantic_memory_count=current.semantic_memory_count + (1 if record_kind == "semantic_memory" else 0),
+                semantic_instance_count=current.semantic_instance_count + (1 if record_kind == "semantic_instance" else 0),
+                observation_event_count=current.observation_event_count + (1 if record_kind == "observation_event" else 0),
+                last_updated_at=updated_at,
+            )
+
+        for location in self._repository.load_tagged_locations():
+            _touch(
+                self._record_library_name(location),
+                record_kind="tagged_location",
+                timestamp=location.timestamp,
+            )
+        for entry in self._repository.load_semantic_memories():
+            _touch(
+                self._record_library_name(entry),
+                record_kind="semantic_memory",
+                timestamp=entry.timestamp,
+            )
+        for instance in self._repository.load_semantic_instances():
+            _touch(
+                self._record_library_name(instance),
+                record_kind="semantic_instance",
+                timestamp=instance.last_seen_ts,
+            )
+        for event in self._repository.load_observation_events():
+            _touch(
+                self._record_library_name(event),
+                record_kind="observation_event",
+                timestamp=event.timestamp,
+            )
+
+        libraries: List[Dict[str, object]] = []
+        for stats in sorted(stats_by_name.values(), key=lambda item: (item.library_name.lower(), item.library_name)):
+            libraries.append(
+                {
+                    "library_name": stats.library_name,
+                    "active": stats.library_name == self._active_library_name,
+                    "tagged_location_count": stats.tagged_location_count,
+                    "semantic_memory_count": stats.semantic_memory_count,
+                    "semantic_instance_count": stats.semantic_instance_count,
+                    "observation_event_count": stats.observation_event_count,
+                    "last_updated_at": stats.last_updated_at.isoformat() if stats.last_updated_at is not None else None,
+                }
+            )
+        return tuple(libraries)
+
+    def _ensure_embedders_initialized(self) -> None:
+        if not self._text_embedder_ready:
+            self._text_embedder = self._build_text_embedder_with_fallback(
+                self._configured_text_model,
+                self._configured_text_dimension,
+            )
+            self._text_embedder_ready = True
+        if self._text_embedder is not None:
+            self._instance_association_service.set_text_embedder(self._text_embedder)
+        if not self._image_embedder_ready:
+            self._image_embedder = self._build_image_embedder_with_fallback(
+                self._configured_image_model,
+                self._configured_image_dimension,
+            )
+            self._image_embedder_ready = True
+
+    def _require_memory_enabled(self) -> str:
+        if not self.is_enabled():
+            raise GatewayError(
+                MEMORY_DISABLED_MESSAGE,
+                error_code="memory_disabled",
+                http_status=409,
+                jsonrpc_code=-32000,
+            )
+        self._ensure_embedders_initialized()
+        assert self._active_library_name is not None
+        return self._active_library_name
+
+    def _clear_active_memory_state(self) -> None:
+        self._tagged_locations_by_id.clear()
+        self._semantic_entries_by_id.clear()
+        self._semantic_instances_by_id.clear()
+        self._observation_events_by_id.clear()
+        self._tagged_location_history.clear()
+        self._semantic_history.clear()
+        self._semantic_instance_history.clear()
+        self._observation_event_history.clear()
+        self._latest_semantic_map_context = SemanticMapBuildResult(
+            map_version_id=None,
+            frame_id="map",
+            semantic_regions=(),
+            anchors_by_id={},
+            topology_nodes_by_id={},
+        )
+        self._vector_store.clear_all()
+
+    def _attach_library_metadata(self, metadata: Optional[Dict[str, object]]) -> Dict[str, object]:
+        merged = dict(metadata or {})
+        if self._active_library_name:
+            merged[MEMORY_LIBRARY_METADATA_KEY] = self._active_library_name
+        return merged
+
+    def _record_library_name(self, record: object) -> str:
+        metadata = getattr(record, "metadata", {}) or {}
+        if isinstance(metadata, dict):
+            value = str(metadata.get(MEMORY_LIBRARY_METADATA_KEY, "") or "").strip()
+            if value:
+                return value
+        return LEGACY_MEMORY_LIBRARY_NAME
+
+    def _delete_memory_library_records(self, library_name: str) -> Dict[str, int]:
+        tagged_locations = [item for item in self._repository.load_tagged_locations() if self._record_library_name(item) == library_name]
+        semantic_memories = [item for item in self._repository.load_semantic_memories() if self._record_library_name(item) == library_name]
+        semantic_instances = [item for item in self._repository.load_semantic_instances() if self._record_library_name(item) == library_name]
+        observation_events = [item for item in self._repository.load_observation_events() if self._record_library_name(item) == library_name]
+
+        artifact_ids = set()
+        for item in semantic_memories:
+            artifact_ids.update(item.artifact_ids)
+        for item in semantic_instances:
+            artifact_ids.update(item.artifact_ids)
+        for item in observation_events:
+            artifact_ids.update(item.artifact_ids)
+
+        self._repository.delete_tagged_locations([item.location_id for item in tagged_locations])
+        self._repository.delete_semantic_memories([item.memory_id for item in semantic_memories])
+        self._repository.delete_semantic_instances([item.instance_id for item in semantic_instances])
+        self._repository.delete_observation_events([item.event_id for item in observation_events])
+        self._vector_store.delete_points(
+            [item.location_id for item in tagged_locations]
+            + [item.memory_id for item in semantic_memories]
+            + [item.instance_id for item in semantic_instances]
+            + [item.event_id for item in observation_events]
+        )
+        if self._artifact_store is not None:
+            for artifact_id in sorted(artifact_ids):
+                try:
+                    self._artifact_store.delete_artifact(artifact_id)
+                except Exception:
+                    continue
+        return {
+            "tagged_location_count": len(tagged_locations),
+            "semantic_memory_count": len(semantic_memories),
+            "semantic_instance_count": len(semantic_instances),
+            "observation_event_count": len(observation_events),
+            "artifact_count": len(artifact_ids),
+        }
 
     def _build_text_embedder_with_fallback(
         self,
@@ -176,7 +494,13 @@ class MemoryService:
         """优先构造配置指定的文本向量器，失败时回退到 hashing。"""
 
         try:
-            return build_text_embedder(model_name, dimension)
+            return build_text_embedder(
+                model_name,
+                dimension,
+                api_key=self._embedding_api_key,
+                base_url=self._embedding_base_url,
+                timeout_sec=self._embedding_timeout_sec,
+            )
         except Exception as exc:
             LOGGER.warning(
                 "文本向量模型初始化失败，已回退到 hashing-v1。requested=%s error=%s",
@@ -197,7 +521,13 @@ class MemoryService:
         """优先构造图文共享向量器，失败时关闭图像向量链路。"""
 
         try:
-            return build_vision_language_embedder(model_name, dimension)
+            return build_vision_language_embedder(
+                model_name,
+                dimension,
+                api_key=self._embedding_api_key,
+                base_url=self._embedding_base_url,
+                timeout_sec=self._embedding_timeout_sec,
+            )
         except Exception as exc:
             LOGGER.warning(
                 "图像向量模型初始化失败，已关闭图像向量链路。requested=%s error=%s",
@@ -220,6 +550,7 @@ class MemoryService:
     ) -> Tuple[TaggedLocation, Optional[SemanticMemoryEntry]]:
         """把当前位置写成带空间锚点的命名地点。"""
 
+        self._require_memory_enabled()
         normalized_name = self._normalize_text(name)
         if not normalized_name:
             raise GatewayError(
@@ -256,12 +587,14 @@ class MemoryService:
             semantic_region_id=semantic_region_id,
             topo_node_id=topo_node_id,
         )
-        merged_metadata = {
+        merged_metadata = self._attach_library_metadata(
+            {
             "description": description or "",
             "camera_id": camera_id or "",
             "anchor_id": anchor_id or "",
             **dict(metadata or {}),
-        }
+            }
+        )
         if perception_context is not None:
             merged_metadata.update(self._build_scene_memory_metadata(perception_context))
         tagged_location = TaggedLocation(
@@ -348,6 +681,7 @@ class MemoryService:
     ) -> SemanticMemoryEntry:
         """把当前观察或感知结果写入语义记忆。"""
 
+        self._require_memory_enabled()
         linked_location = None
         if linked_location_id:
             linked_location = self._tagged_locations_by_id.get(linked_location_id)
@@ -379,7 +713,7 @@ class MemoryService:
             collected_tags.extend(linked_location.aliases)
             collected_tags.extend(linked_location.semantic_labels)
 
-        merged_metadata = dict(metadata or {})
+        merged_metadata = self._attach_library_metadata(metadata)
         if perception_context is not None:
             merged_metadata.update(self._build_scene_memory_metadata(perception_context))
 
@@ -405,6 +739,7 @@ class MemoryService:
     ) -> MemoryQueryResult:
         """查询命名地点。"""
 
+        self._require_memory_enabled()
         resolved_filter = self._merge_payload_filter(
             payload_filter,
             record_kinds=[MemoryRecordKind.TAGGED_LOCATION],
@@ -441,6 +776,7 @@ class MemoryService:
     ) -> MemoryQueryResult:
         """查询语义记忆。"""
 
+        self._require_memory_enabled()
         resolved_filter = self._merge_payload_filter(
             payload_filter,
             record_kinds=[
@@ -482,6 +818,8 @@ class MemoryService:
     ) -> Optional[TaggedLocation]:
         """返回最优地点命中。"""
 
+        if not self.is_enabled():
+            return None
         result = self.query_location(query, similarity_threshold=similarity_threshold, limit=1)
         if not result.matches:
             return None
@@ -497,6 +835,8 @@ class MemoryService:
     ) -> Optional[MemoryNavigationCandidate]:
         """把自由文本查询解析成可导航的记忆候选。"""
 
+        if not self.is_enabled():
+            return None
         current_pose = self._get_current_pose()
         map_snapshot = self._get_map_snapshot()
         self._refresh_semantic_map_context(map_snapshot)
@@ -558,6 +898,16 @@ class MemoryService:
     ) -> MemoryArrivalVerification:
         """到点后用当前场景与目标记忆做一次复核。"""
 
+        if not self.is_enabled():
+            return MemoryArrivalVerification(
+                query=query,
+                verified=False,
+                score=0.0,
+                matched_labels=[],
+                matched_memory_id=None,
+                reason="当前记忆库未启用，已跳过记忆复核。",
+                metadata={"memory_enabled": False},
+            )
         legacy_candidate = self._coerce_legacy_navigation_candidate(navigation_candidate)
         effective_query = (
             legacy_candidate.verification_query
@@ -651,6 +1001,8 @@ class MemoryService:
         last_location = self._tagged_location_history[-1] if self._tagged_location_history else None
         last_memory = self._semantic_history[-1] if self._semantic_history else None
         vector_counts = self._vector_store.count_vectors_by_name()
+        text_model = self._text_embedder.model_name if self._text_embedder is not None else "disabled"
+        text_dimension = self._text_embedder.dimension if self._text_embedder is not None else 0
         return MemoryStoreSummary(
             tagged_location_count=len(self._tagged_locations_by_id),
             semantic_memory_count=len(self._semantic_entries_by_id),
@@ -658,10 +1010,13 @@ class MemoryService:
             last_memory_id=last_memory.memory_id if last_memory is not None else None,
             metadata={
                 "store_mode": "multimodal_named_vector",
+                "memory_enabled": self.is_enabled(),
+                "active_library_name": self._active_library_name,
+                "known_libraries": list(self.list_memory_libraries()),
                 "db_path": self._repository.db_path,
                 "vector_store_backend": self._vector_store.backend_name,
-                "text_embedding_model": self._text_embedder.model_name,
-                "text_embedding_dimension": self._text_embedder.dimension,
+                "text_embedding_model": text_model,
+                "text_embedding_dimension": text_dimension,
                 "image_embedding_model": self._image_embedder.model_name if self._image_embedder is not None else "disabled",
                 "image_embedding_dimension": self._image_embedder.dimension if self._image_embedder is not None else 0,
                 "vector_point_count": self._vector_store.count_points(),
@@ -732,7 +1087,7 @@ class MemoryService:
                 metadata,
             )
 
-        merged_metadata = {"camera_id": camera_id or "", **dict(metadata or {})}
+        merged_metadata = self._attach_library_metadata({"camera_id": camera_id or "", **dict(metadata or {})})
         if perception_context is not None:
             merged_metadata.update(self._build_scene_memory_metadata(perception_context))
 
@@ -800,7 +1155,15 @@ class MemoryService:
             )
         current_pose = self._get_current_pose()
         query_text_vector = self._text_embedder.embed_text(query)
-        query_image_vector = self._image_embedder.embed_text(query) if self._image_embedder is not None else None
+        query_image_vector = None
+        if self._image_embedder is not None:
+            if (
+                self._image_embedder.model_name == self._text_embedder.model_name
+                and self._image_embedder.dimension == self._text_embedder.dimension
+            ):
+                query_image_vector = query_text_vector
+            else:
+                query_image_vector = self._image_embedder.embed_text(query)
         recall_limit = max(limit * 12, 20)
         vector_hits = self._vector_store.query(
             vector_name=TEXT_VECTOR_NAME,
@@ -1115,62 +1478,82 @@ class MemoryService:
             },
         )
 
-    def _load_persisted_memory(self) -> None:
-        persisted_locations = self._repository.load_tagged_locations()
-        persisted_memories = self._repository.load_semantic_memories()
-        persisted_instances = self._repository.load_semantic_instances()
-        persisted_events = self._repository.load_observation_events()
+    def _load_persisted_memory(self, *, library_name: Optional[str] = None) -> None:
+        target_library = str(library_name or self._active_library_name or "").strip()
+        if not target_library:
+            return
+
+        persisted_locations = [
+            item for item in self._repository.load_tagged_locations() if self._record_library_name(item) == target_library
+        ]
+        persisted_memories = [
+            item for item in self._repository.load_semantic_memories() if self._record_library_name(item) == target_library
+        ]
+        persisted_instances = [
+            item for item in self._repository.load_semantic_instances() if self._record_library_name(item) == target_library
+        ]
+        persisted_events = [
+            item for item in self._repository.load_observation_events() if self._record_library_name(item) == target_library
+        ]
 
         for location in persisted_locations:
             self._tagged_locations_by_id[location.location_id] = location
             self._tagged_location_history.append(location)
             self._write_tagged_location_state(location)
-            self._upsert_vector_point_for_location(location)
 
         for entry in persisted_memories:
             self._semantic_entries_by_id[entry.memory_id] = entry
             self._semantic_history.append(entry)
             self._write_semantic_memory_state(entry)
-            self._upsert_vector_point_for_memory(entry)
 
         for instance in persisted_instances:
             self._semantic_instances_by_id[instance.instance_id] = instance
             self._semantic_instance_history.append(instance)
             self._write_semantic_instance_state(instance)
-            self._upsert_vector_point_for_instance(instance)
 
         for event in persisted_events:
             self._observation_events_by_id[event.event_id] = event
             self._observation_event_history.append(event)
             self._write_observation_event_state(event)
-            self._upsert_vector_point_for_observation_event(event)
 
         for location in persisted_locations:
-            if location.memory_id:
-                self._upsert_vector_point_for_location(location)
+            self._safe_upsert_persisted_vector(
+                record_id=location.location_id,
+                action=lambda current=location: self._upsert_vector_point_for_location(current),
+            )
+        for entry in persisted_memories:
+            self._safe_upsert_persisted_vector(
+                record_id=entry.memory_id,
+                action=lambda current=entry: self._upsert_vector_point_for_memory(current),
+            )
+        for instance in persisted_instances:
+            self._safe_upsert_persisted_vector(
+                record_id=instance.instance_id,
+                action=lambda current=instance: self._upsert_vector_point_for_instance(current),
+            )
+        for event in persisted_events:
+            self._safe_upsert_persisted_vector(
+                record_id=event.event_id,
+                action=lambda current=event: self._upsert_vector_point_for_observation_event(current),
+            )
+
+    def _safe_upsert_persisted_vector(self, *, record_id: str, action) -> None:
+        try:
+            action()
+        except Exception as exc:
+            LOGGER.warning("历史记忆向量重建失败，已跳过。record_id=%s error=%s", record_id, exc)
 
     def _upsert_vector_point_for_location(self, location: TaggedLocation) -> None:
         payload = self._build_location_payload(location)
-        vectors = {
-            TEXT_VECTOR_NAME: NamedVector(
-                vector_name=TEXT_VECTOR_NAME,
-                model_name=self._text_embedder.model_name,
-                dimension=self._text_embedder.dimension,
-                vector=self._text_embedder.embed_text(payload["retrieval_text"]),
-            )
-        }
         image_bytes = self._load_primary_image_bytes([])
         if location.memory_id is not None:
             linked_memory = self._semantic_entries_by_id.get(location.memory_id)
             if linked_memory is not None:
                 image_bytes = self._load_primary_image_bytes(linked_memory.artifact_ids) or image_bytes
-        if image_bytes is not None and self._image_embedder is not None:
-            vectors[IMAGE_VECTOR_NAME] = NamedVector(
-                vector_name=IMAGE_VECTOR_NAME,
-                model_name=self._image_embedder.model_name,
-                dimension=self._image_embedder.dimension,
-                vector=self._image_embedder.embed_image_bytes(image_bytes),
-            )
+        vectors = self._build_named_vectors(
+            retrieval_text=str(payload["retrieval_text"]),
+            image_bytes=image_bytes,
+        )
         self._vector_store.upsert_point(
             point_id=location.location_id,
             collection_name=PLACE_NODES_COLLECTION,
@@ -1182,22 +1565,11 @@ class MemoryService:
 
     def _upsert_vector_point_for_memory(self, entry: SemanticMemoryEntry) -> None:
         payload = self._build_memory_payload(entry)
-        vectors = {
-            TEXT_VECTOR_NAME: NamedVector(
-                vector_name=TEXT_VECTOR_NAME,
-                model_name=self._text_embedder.model_name,
-                dimension=self._text_embedder.dimension,
-                vector=self._text_embedder.embed_text(payload["retrieval_text"]),
-            )
-        }
         image_bytes = self._load_primary_image_bytes(entry.artifact_ids)
-        if image_bytes is not None and self._image_embedder is not None:
-            vectors[IMAGE_VECTOR_NAME] = NamedVector(
-                vector_name=IMAGE_VECTOR_NAME,
-                model_name=self._image_embedder.model_name,
-                dimension=self._image_embedder.dimension,
-                vector=self._image_embedder.embed_image_bytes(image_bytes),
-            )
+        vectors = self._build_named_vectors(
+            retrieval_text=str(payload["retrieval_text"]),
+            image_bytes=image_bytes,
+        )
         self._vector_store.upsert_point(
             point_id=entry.memory_id,
             collection_name=EPISODIC_OBSERVATIONS_COLLECTION,
@@ -1209,22 +1581,11 @@ class MemoryService:
 
     def _upsert_vector_point_for_instance(self, instance: SemanticInstance) -> None:
         payload = self._build_instance_payload(instance)
-        vectors = {
-            TEXT_VECTOR_NAME: NamedVector(
-                vector_name=TEXT_VECTOR_NAME,
-                model_name=self._text_embedder.model_name,
-                dimension=self._text_embedder.dimension,
-                vector=self._text_embedder.embed_text(payload["retrieval_text"]),
-            )
-        }
         image_bytes = self._load_primary_image_bytes(instance.artifact_ids)
-        if image_bytes is not None and self._image_embedder is not None:
-            vectors[IMAGE_VECTOR_NAME] = NamedVector(
-                vector_name=IMAGE_VECTOR_NAME,
-                model_name=self._image_embedder.model_name,
-                dimension=self._image_embedder.dimension,
-                vector=self._image_embedder.embed_image_bytes(image_bytes),
-            )
+        vectors = self._build_named_vectors(
+            retrieval_text=str(payload["retrieval_text"]),
+            image_bytes=image_bytes,
+        )
         self._vector_store.upsert_point(
             point_id=instance.instance_id,
             collection_name=OBJECT_INSTANCES_COLLECTION,
@@ -1236,22 +1597,11 @@ class MemoryService:
 
     def _upsert_vector_point_for_observation_event(self, event: ObservationEvent) -> None:
         payload = self._build_observation_event_payload(event)
-        vectors = {
-            TEXT_VECTOR_NAME: NamedVector(
-                vector_name=TEXT_VECTOR_NAME,
-                model_name=self._text_embedder.model_name,
-                dimension=self._text_embedder.dimension,
-                vector=self._text_embedder.embed_text(payload["retrieval_text"]),
-            )
-        }
         image_bytes = self._load_primary_image_bytes(event.artifact_ids)
-        if image_bytes is not None and self._image_embedder is not None:
-            vectors[IMAGE_VECTOR_NAME] = NamedVector(
-                vector_name=IMAGE_VECTOR_NAME,
-                model_name=self._image_embedder.model_name,
-                dimension=self._image_embedder.dimension,
-                vector=self._image_embedder.embed_image_bytes(image_bytes),
-            )
+        vectors = self._build_named_vectors(
+            retrieval_text=str(payload["retrieval_text"]),
+            image_bytes=image_bytes,
+        )
         self._vector_store.upsert_point(
             point_id=event.event_id,
             collection_name=EPISODIC_OBSERVATIONS_COLLECTION,
@@ -1260,6 +1610,51 @@ class MemoryService:
             vectors=vectors,
             updated_at=event.timestamp.isoformat(),
         )
+
+    def _build_named_vectors(
+        self,
+        *,
+        retrieval_text: str,
+        image_bytes: Optional[bytes],
+    ) -> Dict[str, NamedVector]:
+        vectors = {
+            TEXT_VECTOR_NAME: NamedVector(
+                vector_name=TEXT_VECTOR_NAME,
+                model_name=self._text_embedder.model_name,
+                dimension=self._text_embedder.dimension,
+                vector=self._embed_retrieval_text(retrieval_text, image_bytes=image_bytes),
+            )
+        }
+        if image_bytes is not None and self._image_embedder is not None:
+            vectors[IMAGE_VECTOR_NAME] = NamedVector(
+                vector_name=IMAGE_VECTOR_NAME,
+                model_name=self._image_embedder.model_name,
+                dimension=self._image_embedder.dimension,
+                vector=self._image_embedder.embed_image_bytes(image_bytes),
+            )
+        return vectors
+
+    def _embed_retrieval_text(
+        self,
+        retrieval_text: str,
+        *,
+        image_bytes: Optional[bytes],
+    ) -> np.ndarray:
+        if image_bytes is not None:
+            try:
+                return self._text_embedder.embed_fused_text_image(
+                    text=retrieval_text,
+                    image_bytes=image_bytes,
+                )
+            except NotImplementedError:
+                pass
+            except Exception as exc:
+                LOGGER.warning(
+                    "图文融合向量生成失败，已回退到纯文本向量。model=%s error=%s",
+                    self._text_embedder.model_name,
+                    exc,
+                )
+        return self._text_embedder.embed_text(retrieval_text)
 
     def _build_location_payload(self, location: TaggedLocation) -> Dict[str, object]:
         description = str(location.metadata.get("description", "")).strip()
@@ -1781,7 +2176,11 @@ class MemoryService:
         self._semantic_instances_by_id = dict(updated_instances)
         linked_instance_ids: List[str] = []
         for outcome in outcomes:
-            instance = outcome.instance
+            instance = outcome.instance.model_copy(
+                update={"metadata": self._attach_library_metadata(outcome.instance.metadata)},
+                deep=True,
+            )
+            self._semantic_instances_by_id[instance.instance_id] = instance
             linked_instance_ids.append(instance.instance_id)
             self._semantic_instance_history.append(instance)
             self._write_semantic_instance_state(instance)
@@ -1812,11 +2211,13 @@ class MemoryService:
             ),
             visual_labels=self._normalize_tags([item.label for item in perception_context.scene_summary.objects]),
             vision_tags=self._normalize_tags(self._collect_scene_vision_tags(perception_context.scene_summary)),
-            metadata={
-                "camera_id": camera_id or "",
-                "projection_count": len(projected),
-                "linked_memory_id": memory_entry.memory_id,
-            },
+            metadata=self._attach_library_metadata(
+                {
+                    "camera_id": camera_id or "",
+                    "projection_count": len(projected),
+                    "linked_memory_id": memory_entry.memory_id,
+                }
+            ),
         )
         self._observation_events_by_id[observation_event.event_id] = observation_event
         self._observation_event_history.append(observation_event)
@@ -2103,7 +2504,13 @@ class MemoryService:
             self._refresh_semantic_map_context(snapshot)
             return snapshot
         if self._mapping_service.is_available():
-            snapshot = self._mapping_service.refresh()
+            try:
+                snapshot = self._mapping_service.refresh()
+            except GatewayError as exc:
+                if "地图快照至少需要包含 occupancy_grid、cost_map、semantic_map 之一。" not in str(exc):
+                    raise
+                self._refresh_semantic_map_context(None)
+                return None
             self._refresh_semantic_map_context(snapshot)
             return snapshot
         return None

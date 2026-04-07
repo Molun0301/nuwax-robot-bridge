@@ -95,7 +95,16 @@ class PerceptionVideoRuntime:
     def should_auto_start(self) -> bool:
         """返回是否应在宿主机运行时启动时自动拉起。"""
 
-        return self._enabled and self._auto_start
+        if not (self._enabled and self._auto_start):
+            return False
+        if self._memory_service is None:
+            return True
+        if hasattr(self._memory_service, "is_enabled"):
+            try:
+                return bool(self._memory_service.is_enabled())
+            except Exception:
+                return False
+        return True
 
     def is_running(self) -> bool:
         """返回后台线程是否处于运行状态。"""
@@ -343,22 +352,33 @@ class PerceptionVideoRuntime:
             return False
         if self._memory_service is None or not self._remember_keyframes:
             return False
+        if hasattr(self._memory_service, "is_enabled") and not self._memory_service.is_enabled():
+            return False
         if not force and self._last_memory_write_at is not None:
             elapsed_sec = max(0.0, (now - self._last_memory_write_at).total_seconds())
             if elapsed_sec < self._remember_min_interval_sec:
                 return False
-        self._memory_service.remember_current_scene(
-            title="自动场景记忆：%s" % context.scene_summary.headline[:48],
-            camera_id=context.camera_id,
-            summary_override=context.scene_summary.headline,
-            tags=self._build_memory_tags(context),
-            metadata={
-                "requested_by": "perception_video_runtime",
-                "source": "perception_video_runtime",
-                "capture_mode": "burst" if force else "keyframe",
-                "keyframe_reason": reason,
-            },
-        )
+        try:
+            self._memory_service.remember_current_scene(
+                title="自动场景记忆：%s" % context.scene_summary.headline[:48],
+                camera_id=context.camera_id,
+                summary_override=context.scene_summary.headline,
+                tags=self._build_memory_tags(context),
+                metadata={
+                    "requested_by": "perception_video_runtime",
+                    "source": "perception_video_runtime",
+                    "capture_mode": "burst" if force else "keyframe",
+                    "keyframe_reason": reason,
+                },
+            )
+        except Exception as exc:
+            PERCEPTION_RUNTIME_LOGGER.warning(
+                "关键帧记忆写入失败，已跳过本次记忆 camera=%s reason=%s error=%s",
+                context.camera_id,
+                reason,
+                exc,
+            )
+            return False
         self._last_memory_write_at = now
         return True
 
