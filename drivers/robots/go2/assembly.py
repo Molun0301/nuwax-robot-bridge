@@ -378,7 +378,6 @@ class Go2RobotAssembly(RobotAssemblyBase):
             "hand_stand": ("HandStand", "flag"),
             "free_jump": ("FreeJump", "flag"),
             "free_bound": ("FreeBound", "flag"),
-            "free_avoid": ("FreeAvoid", "flag"),
             "walk_upright": ("WalkUpright", "flag"),
             "cross_step": ("CrossStep", "flag"),
             "switch_joystick": ("SwitchJoystick", "on"),

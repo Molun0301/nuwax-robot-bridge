@@ -232,6 +232,16 @@ class Go2ProviderBundle(
         return self.assembly.data_plane.get_exploration_state()
 
     def send_twist(self, twist: Twist) -> None:
+        data_plane = self.assembly.data_plane
+        if data_plane is not None and hasattr(data_plane, "can_accept_motion_command") and data_plane.can_accept_motion_command():
+            code = data_plane.send_motion_command(
+                twist.linear.x,
+                twist.linear.y,
+                twist.angular.z,
+            )
+            if code != 0:
+                raise RuntimeError(f"Go2 数据面运动命令执行失败: code={code}")
+            return
         self.assembly.move(
             twist.linear.x,
             twist.linear.y,
@@ -239,6 +249,10 @@ class Go2ProviderBundle(
         )
 
     def stop_motion(self) -> None:
+        data_plane = self.assembly.data_plane
+        if data_plane is not None and hasattr(data_plane, "can_accept_motion_command") and data_plane.can_accept_motion_command():
+            data_plane.stop_motion_command()
+            return
         self.assembly.stop_move()
 
     def get_safety_state(self) -> SafetyState:

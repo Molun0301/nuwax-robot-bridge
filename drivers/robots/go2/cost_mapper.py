@@ -23,7 +23,7 @@ except ImportError:
 @dataclass
 class Go2CostMapperConfig:
     enabled: bool = True
-    resolution_m: float = 0.10
+    resolution_m: float = 0.05
     width: int = 200
     height: int = 200
     frame_id: str = "odom"
@@ -31,7 +31,7 @@ class Go2CostMapperConfig:
     max_obstacle_height_m: float = 1.20
     traversability_threshold: float = 0.65
     lethal_threshold: float = 0.20
-    inflation_radius_m: float = 0.18
+    inflation_radius_m: float = 0.05
     height_variance_weight: float = 50.0
     height_gradient_weight: float = 30.0
 

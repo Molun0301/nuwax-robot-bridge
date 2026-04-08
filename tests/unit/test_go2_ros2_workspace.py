@@ -8,8 +8,9 @@ import sys
 from types import SimpleNamespace
 
 from contracts.geometry import Pose, Quaternion, Vector3
-from contracts.maps import CostMap
+from contracts.maps import CostMap, OccupancyGrid
 from contracts.navigation import ExplorationStatus, ExploreAreaRequest
+from drivers.robots.go2 import data_plane as go2_data_plane
 from drivers.robots.go2.data_plane import Go2DataPlaneRuntime, RclpyGo2RosBridge
 from drivers.robots.go2 import settings as go2_settings
 from drivers.robots.go2.settings import (
@@ -17,6 +18,7 @@ from drivers.robots.go2.settings import (
     Go2DirectDdsConfig,
     Go2ExplorationConfig,
     Go2MapSynthesisConfig,
+    Go2OfficialBackendConfig,
 )
 
 
@@ -28,6 +30,8 @@ class _FakeBridge:
         self.map_available = map_available
         self.navigation_available = navigation_available
         self.started = False
+        self.mapping_runtime_enable_reasons: list[str] = []
+        self.mapping_runtime_disable_reasons: list[str] = []
 
     def start(self) -> None:
         self.started = True
@@ -62,6 +66,18 @@ class _FakeBridge:
     def get_semantic_map(self):
         return None
 
+    def enable_mapping_runtime(self, *, reason: str = ""):
+        self.mapping_runtime_enable_reasons.append(str(reason or ""))
+        return {"point_cloud_mapping_runtime_enabled": True}
+
+    def disable_mapping_runtime(self, *, reason: str = ""):
+        self.mapping_runtime_disable_reasons.append(str(reason or ""))
+        self.map_available = False
+        return {
+            "point_cloud_mapping_runtime_enabled": False,
+            "map_available": False,
+        }
+
     def set_goal(self, goal):
         del goal
         return False
@@ -74,6 +90,91 @@ class _FakeBridge:
 
     def is_goal_reached(self):
         return False
+
+
+class _FakeSportClient:
+    """测试用官方运动客户端。"""
+
+    def __init__(self) -> None:
+        self.timeout: float | None = None
+        self.initialized = False
+        self.move_calls: list[tuple[float, float, float]] = []
+        self.stop_calls = 0
+
+    def SetTimeout(self, timeout: float) -> None:
+        self.timeout = float(timeout)
+
+    def Init(self) -> None:
+        self.initialized = True
+
+    def Move(self, vx: float, vy: float, vyaw: float) -> int:
+        self.move_calls.append((vx, vy, vyaw))
+        return 0
+
+    def StopMove(self) -> int:
+        self.stop_calls += 1
+        return 0
+
+
+class _FakeObstaclesAvoidClient:
+    """测试用官方避障客户端。"""
+
+    def __init__(self) -> None:
+        self.timeout: float | None = None
+        self.initialized = False
+        self.switch_enabled = False
+        self.remote_enabled = False
+        self.switch_calls: list[bool] = []
+        self.remote_calls: list[bool] = []
+        self.move_calls: list[tuple[float, float, float]] = []
+
+    def SetTimeout(self, timeout: float) -> None:
+        self.timeout = float(timeout)
+
+    def Init(self) -> None:
+        self.initialized = True
+
+    def GetServerApiVersion(self):
+        return 0, "test-server"
+
+    def SwitchSet(self, enabled: bool) -> int:
+        self.switch_enabled = bool(enabled)
+        self.switch_calls.append(self.switch_enabled)
+        return 0
+
+    def SwitchGet(self):
+        return 0, self.switch_enabled
+
+    def UseRemoteCommandFromApi(self, enabled: bool) -> int:
+        self.remote_enabled = bool(enabled)
+        self.remote_calls.append(self.remote_enabled)
+        return 0
+
+    def Move(self, vx: float, vy: float, vyaw: float) -> int:
+        self.move_calls.append((vx, vy, vyaw))
+        return 0
+
+
+class _FakeRobotStateClient:
+    """测试用官方 robot_state 客户端。"""
+
+    def __init__(self) -> None:
+        self.timeout: float | None = None
+        self.initialized = False
+        self.service_switch_calls: list[tuple[str, bool]] = []
+
+    def SetTimeout(self, timeout: float) -> None:
+        self.timeout = float(timeout)
+
+    def Init(self) -> None:
+        self.initialized = True
+
+    def ServiceList(self):
+        return 0, []
+
+    def ServiceSwitch(self, service_name: str, enabled: bool) -> int:
+        self.service_switch_calls.append((str(service_name), bool(enabled)))
+        return 0
 
 
 def _build_pose_odom_message(*, x: float, y: float, z: float = 0.0, frame_id: str = "odom") -> SimpleNamespace:
@@ -213,6 +314,7 @@ def test_go2_bridge_can_synthesize_local_maps_from_direct_dds_point_cloud() -> N
         Go2DataPlaneConfig(
             enabled=True,
             map_synthesis=Go2MapSynthesisConfig(
+                global_map_enabled=False,
                 local_map_enabled=True,
                 local_map_resolution_m=0.5,
                 local_map_width=20,
@@ -227,6 +329,7 @@ def test_go2_bridge_can_synthesize_local_maps_from_direct_dds_point_cloud() -> N
         _build_sport_mode_state_message(x=0.0, y=0.0),
         source_topic="dds:rt/sportmodestate",
     )
+    bridge.enable_mapping_runtime(reason="test")
     bridge._on_direct_point_cloud(
         _build_point_cloud_message([(1.0, 0.0, 0.10), (1.5, 0.0, 0.10)]),
         source_topic="dds:rt/utlidar/cloud",
@@ -258,12 +361,104 @@ def test_go2_bridge_can_synthesize_local_maps_from_direct_dds_point_cloud() -> N
     assert any(region.label == "hazard" for region in semantic_map.regions)
 
 
+def test_go2_bridge_defers_direct_dds_point_cloud_mapping_until_runtime_enabled() -> None:
+    bridge = RclpyGo2RosBridge(
+        Go2DataPlaneConfig(
+            enabled=True,
+            map_synthesis=Go2MapSynthesisConfig(
+                global_map_enabled=False,
+                local_map_enabled=True,
+                local_map_resolution_m=0.5,
+                local_map_width=20,
+                local_map_height=20,
+                local_map_update_interval_sec=0.0,
+                local_map_inflation_radius_m=0.5,
+                semantic_min_cells=1,
+            ),
+        )
+    )
+    point_cloud_message = _build_point_cloud_message([(1.0, 0.0, 0.10), (1.5, 0.0, 0.10)])
+
+    bridge._on_sport_mode_state(
+        _build_sport_mode_state_message(x=0.0, y=0.0),
+        source_topic="dds:rt/sportmodestate",
+    )
+    bridge._on_direct_point_cloud(
+        point_cloud_message,
+        source_topic="dds:rt/utlidar/cloud",
+    )
+
+    initial_status = bridge.get_status()
+
+    assert bridge.get_occupancy_grid() is None
+    assert bridge.get_cost_map() is None
+    assert bridge.get_semantic_map() is None
+    assert bridge.is_map_available() is False
+    assert initial_status["dds_cloud_ready"] is True
+    assert initial_status["point_cloud_source_topic"] == "dds:rt/utlidar/cloud"
+    assert initial_status["point_cloud_mapping_runtime_enabled"] is False
+    assert initial_status["point_cloud_mapping_deferred_until_runtime_enable"] is True
+
+    enable_result = bridge.enable_mapping_runtime(reason="test")
+    bridge._on_direct_point_cloud(
+        point_cloud_message,
+        source_topic="dds:rt/utlidar/cloud",
+    )
+
+    occupancy = bridge.get_occupancy_grid()
+    status = bridge.get_status()
+
+    assert enable_result["point_cloud_mapping_runtime_enabled"] is True
+    assert occupancy is not None
+    assert bridge.is_map_available() is True
+    assert status["local_map_ready"] is True
+    assert status["point_cloud_mapping_runtime_enabled"] is True
+
+    disable_result = bridge.disable_mapping_runtime(reason="test_disable")
+    disabled_status = bridge.get_status()
+
+    assert disable_result["point_cloud_mapping_runtime_enabled"] is False
+    assert disable_result["map_available"] is False
+    assert bridge.get_occupancy_grid() is None
+    assert bridge.get_cost_map() is None
+    assert bridge.get_semantic_map() is None
+    assert bridge.is_map_available() is False
+    assert disabled_status["global_map_ready"] is False
+    assert disabled_status["local_map_ready"] is False
+    assert disabled_status["point_cloud_mapping_runtime_enabled"] is False
+
+
+def test_go2_data_plane_runtime_enables_bridge_mapping_runtime_on_demand() -> None:
+    bridge = _FakeBridge(localization_available=True, map_available=False, navigation_available=False)
+    runtime = Go2DataPlaneRuntime(Go2DataPlaneConfig(enabled=True), bridge=bridge)
+
+    result = runtime.ensure_mapping_runtime_enabled(reason="explore_area")
+
+    assert bridge.mapping_runtime_enable_reasons == ["explore_area"]
+    assert result["bridge_mapping_runtime"] == {"point_cloud_mapping_runtime_enabled": True}
+
+
+def test_go2_data_plane_runtime_disables_bridge_mapping_runtime_on_demand() -> None:
+    bridge = _FakeBridge(localization_available=True, map_available=True, navigation_available=False)
+    runtime = Go2DataPlaneRuntime(Go2DataPlaneConfig(enabled=True), bridge=bridge)
+
+    result = runtime.disable_mapping_runtime(reason="disable_memory_library")
+
+    assert bridge.mapping_runtime_disable_reasons == ["disable_memory_library"]
+    assert result["bridge_mapping_runtime"] == {
+        "point_cloud_mapping_runtime_enabled": False,
+        "map_available": False,
+    }
+
+
 def test_go2_bridge_can_use_ros_point_cloud_as_local_map_fallback() -> None:
     bridge = RclpyGo2RosBridge(
         Go2DataPlaneConfig(
             enabled=True,
             direct_dds=Go2DirectDdsConfig(enabled=False),
+            official=Go2OfficialBackendConfig(enabled=False),
             map_synthesis=Go2MapSynthesisConfig(
+                global_map_enabled=False,
                 local_map_enabled=True,
                 local_map_resolution_m=0.5,
                 local_map_width=20,
@@ -441,3 +636,208 @@ def test_go2_data_plane_exploration_falls_back_to_inner_radius_when_outer_ring_b
     ]
     assert max(candidate_radii) < 5.0
     assert min(candidate_radii) <= 1.582
+
+
+def test_go2_data_plane_exploration_keeps_ring_candidates_when_preview_map_is_temporarily_unusable() -> None:
+    config = Go2DataPlaneConfig(
+        enabled=True,
+        exploration=Go2ExplorationConfig(
+            enabled=True,
+            sample_radius_m=1.5,
+            sample_count=8,
+            max_goal_cost=75.0,
+        ),
+    )
+    runtime = Go2DataPlaneRuntime(
+        config,
+        bridge=_FakeBridge(localization_available=True, map_available=True, navigation_available=False),
+    )
+    runtime._official_sport_ready = True
+
+    current_pose = Pose(
+        frame_id="odom",
+        position=Vector3(x=0.0, y=0.0, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+    occupancy_grid = OccupancyGrid(
+        map_id="mismatched_frontier_grid",
+        frame_id="map",
+        width=40,
+        height=40,
+        resolution_m=0.1,
+        origin=Pose(
+            frame_id="map",
+            position=Vector3(x=-2.0, y=-2.0, z=0.0),
+            orientation=Quaternion(w=1.0),
+        ),
+        data=[0] * (40 * 40),
+    )
+
+    runtime.get_current_pose = lambda: current_pose
+    runtime.get_occupancy_grid = lambda: occupancy_grid
+    runtime.get_cost_map = lambda: None
+
+    candidates = runtime._build_exploration_candidates(
+        ExploreAreaRequest(
+            request_id="explore_unknown_area",
+            strategy="frontier",
+            radius_m=2.0,
+        )
+    )
+
+    assert candidates
+    assert all(candidate.frame_id == "odom" for candidate in candidates)
+
+
+def test_go2_data_plane_coverage_strategy_prefers_frontier_candidates() -> None:
+    config = Go2DataPlaneConfig(
+        enabled=True,
+        exploration=Go2ExplorationConfig(
+            enabled=True,
+            sample_radius_m=2.0,
+            sample_count=8,
+        ),
+    )
+    runtime = Go2DataPlaneRuntime(
+        config,
+        bridge=_FakeBridge(localization_available=True, map_available=True, navigation_available=False),
+    )
+    runtime._official_sport_ready = True
+
+    current_pose = Pose(
+        frame_id="odom",
+        position=Vector3(x=0.0, y=0.0, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+    frontier_pose = Pose(
+        frame_id="odom",
+        position=Vector3(x=1.0, y=0.5, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+    occupancy_grid = OccupancyGrid(
+        map_id="frontier_grid",
+        frame_id="odom",
+        width=4,
+        height=4,
+        resolution_m=0.5,
+        origin=Pose(frame_id="odom", position=Vector3(x=-1.0, y=-1.0, z=0.0), orientation=Quaternion(w=1.0)),
+        data=[
+            0, 0, -1, -1,
+            0, 0, -1, -1,
+            0, 0, -1, -1,
+            0, 0, -1, -1,
+        ],
+    )
+
+    runtime.get_current_pose = lambda: current_pose
+    runtime.get_occupancy_grid = lambda: occupancy_grid
+    runtime.get_cost_map = lambda: None
+    runtime._frontier_explorer.select_candidates = lambda **kwargs: [SimpleNamespace(pose=frontier_pose)]
+    runtime._build_ring_exploration_candidates = lambda **kwargs: []
+
+    candidates = runtime._build_exploration_candidates(
+        ExploreAreaRequest(
+            request_id="explore_test",
+            center_pose=current_pose,
+            radius_m=2.0,
+            strategy="coverage",
+        )
+    )
+
+    assert candidates == [frontier_pose]
+
+
+def test_go2_data_plane_routes_motion_through_official_obstacles_avoid_when_enabled() -> None:
+    config = Go2DataPlaneConfig(enabled=True)
+    runtime = Go2DataPlaneRuntime(
+        config,
+        bridge=_FakeBridge(localization_available=True, map_available=True, navigation_available=False),
+    )
+    sport_client = _FakeSportClient()
+    obstacles_client = _FakeObstaclesAvoidClient()
+    runtime._official_sport_client = sport_client
+    runtime._official_sport_ready = True
+    runtime._official_obstacles_avoid_client = obstacles_client
+    runtime._official_obstacles_avoid_ready = True
+
+    result = runtime.set_obstacle_avoidance_enabled(True)
+    code = runtime._send_official_motion_command(0.3, 0.0, 0.2)
+
+    assert code == 0
+    assert result["backend_ready"] is True
+    assert result["control_path"] == "obstacles_avoid"
+    assert obstacles_client.switch_calls[-1] is True
+    assert obstacles_client.remote_calls[-1] is True
+    assert obstacles_client.move_calls[-1] == (0.3, 0.0, 0.2)
+    assert sport_client.move_calls == []
+
+
+def test_go2_data_plane_falls_back_to_sport_client_when_obstacle_avoidance_disabled() -> None:
+    config = Go2DataPlaneConfig(enabled=True)
+    runtime = Go2DataPlaneRuntime(
+        config,
+        bridge=_FakeBridge(localization_available=True, map_available=True, navigation_available=False),
+    )
+    sport_client = _FakeSportClient()
+    obstacles_client = _FakeObstaclesAvoidClient()
+    runtime._official_sport_client = sport_client
+    runtime._official_sport_ready = True
+    runtime._official_obstacles_avoid_client = obstacles_client
+    runtime._official_obstacles_avoid_ready = True
+
+    runtime.set_obstacle_avoidance_enabled(True)
+    runtime._send_official_motion_command(0.2, 0.0, 0.0)
+    result = runtime.set_obstacle_avoidance_enabled(False)
+    code = runtime._send_official_motion_command(0.1, 0.0, -0.1)
+
+    assert code == 0
+    assert result["obstacle_avoidance_enabled"] is False
+    assert result["control_path"] == "sport"
+    assert obstacles_client.remote_calls[-1] is False
+    assert sport_client.move_calls[-1] == (0.1, 0.0, -0.1)
+
+
+def test_go2_data_plane_respects_obstacle_avoidance_default_config(monkeypatch) -> None:
+    monkeypatch.setenv("GO2_OFFICIAL_OBSTACLE_AVOIDANCE_DEFAULT_ENABLED", "false")
+
+    config = go2_settings.load_go2_data_plane_config()
+    runtime = Go2DataPlaneRuntime(
+        config,
+        bridge=_FakeBridge(localization_available=True, map_available=True, navigation_available=False),
+    )
+
+    assert config.official.obstacle_avoidance_default_enabled is False
+    assert runtime.is_obstacle_avoidance_enabled() is False
+    assert runtime.get_obstacle_avoidance_status()["default_enabled"] is False
+
+
+def test_go2_data_plane_startup_syncs_default_obstacle_avoidance_state(monkeypatch) -> None:
+    config = Go2DataPlaneConfig(enabled=True)
+    config.official.auto_start_services = False
+    config.official.obstacle_avoidance_default_enabled = True
+
+    runtime = Go2DataPlaneRuntime(
+        config,
+        bridge=_FakeBridge(localization_available=True, map_available=True, navigation_available=False),
+    )
+    sport_client = _FakeSportClient()
+    robot_state_client = _FakeRobotStateClient()
+    obstacles_client = _FakeObstaclesAvoidClient()
+
+    monkeypatch.setattr(
+        go2_data_plane,
+        "_load_go2_official_sdk_modules",
+        lambda _config, include_dds_topics=False: {
+            "ChannelFactoryInitialize": lambda *args, **kwargs: None,
+            "SportClient": lambda: sport_client,
+            "RobotStateClient": lambda: robot_state_client,
+            "ObstaclesAvoidClient": lambda: obstacles_client,
+        },
+    )
+
+    runtime._start_official_backend()
+
+    assert runtime.is_obstacle_avoidance_enabled() is True
+    assert runtime.is_obstacle_avoidance_control_available() is True
+    assert obstacles_client.switch_calls[-1] is True
+    assert runtime.get_obstacle_avoidance_status()["switch_enabled"] is True

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from adapters.base import AdapterCategory, AdapterConfig
 from adapters.streams import RosImageAdapter
-from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
+from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Twist, Vector3
 from contracts.image import ImageFrame
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
@@ -217,6 +217,8 @@ class FakeGo2DataPlane:
         )
         self.navigation_state = NavigationState(status=NavigationStatus.IDLE, current_pose=self.pose)
         self.exploration_state = ExplorationState(status=ExplorationStatus.IDLE)
+        self.motion_commands: List[Tuple[float, float, float]] = []
+        self.motion_stop_count = 0
 
     def start(self) -> None:
         self.started = True
@@ -301,6 +303,16 @@ class FakeGo2DataPlane:
             "navigation_available": True,
             "exploration_available": True,
         }
+
+    def can_accept_motion_command(self) -> bool:
+        return self.started
+
+    def send_motion_command(self, vx: float, vy: float, vyaw: float) -> int:
+        self.motion_commands.append((vx, vy, vyaw))
+        return 0
+
+    def stop_motion_command(self) -> None:
+        self.motion_stop_count += 1
 
 
 def _build_go2_factories(channel_initializer: FakeChannelInitializer) -> Go2ClientFactories:
@@ -453,3 +465,28 @@ def test_go2_data_plane_is_managed_under_robot_entry() -> None:
 
     assembly.stop()
     assert data_plane.started is False
+
+
+def test_go2_provider_motion_prefers_data_plane_command_path() -> None:
+    """Go2 MotionControl 应优先复用数据面运动链，避免绕开避障后端。"""
+
+    data_plane = FakeGo2DataPlane()
+    assembly = create_go2_assembly(
+        APP_CONFIG,
+        factories=_build_go2_factories(FakeChannelInitializer()),
+        data_plane=data_plane,
+    )
+
+    assembly.start()
+    assembly.providers.send_twist(
+        Twist(
+            frame_id="odom",
+            linear=Vector3(x=0.4, y=0.0, z=0.0),
+            angular=Vector3(x=0.0, y=0.0, z=0.1),
+        )
+    )
+    assembly.providers.stop_motion()
+
+    assert data_plane.motion_commands[-1] == (0.4, 0.0, 0.1)
+    assert data_plane.motion_stop_count == 1
+    assert ("Move", (0.4, 0.0, 0.1)) not in assembly.sport_client.calls

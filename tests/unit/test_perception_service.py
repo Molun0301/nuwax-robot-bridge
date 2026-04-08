@@ -9,7 +9,8 @@ import pytest
 from contracts.artifacts import ArtifactRetentionPolicy
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
-from contracts.runtime_views import LocalizationSnapshot
+from contracts.maps import SemanticMap, SemanticRegion
+from contracts.runtime_views import LocalizationSnapshot, MapSnapshot
 from contracts.perception import TrackState
 from contracts.runtime_views import SceneObjectSummary, SceneSummary
 from core import EventBus, StateNamespace, StateStore
@@ -252,6 +253,69 @@ class _StaticLocalizationService:
 
     def refresh(self):
         return self.get_latest_snapshot()
+
+
+class _RefreshingLocalizationService(_StaticLocalizationService):
+    """只有显式刷新后才暴露最新位姿的定位服务。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.live_pose = self.pose
+        self._cached_pose = self.pose
+        self.refresh_count = 0
+
+    def get_latest_snapshot(self):
+        return LocalizationSnapshot(
+            source_name="test_localization",
+            current_pose=self._cached_pose,
+        )
+
+    def refresh(self):
+        self.refresh_count += 1
+        self._cached_pose = self.live_pose
+        return self.get_latest_snapshot()
+
+
+class _RefreshingMappingService:
+    """只有显式刷新后才暴露最新地图快照的映射服务。"""
+
+    def __init__(self) -> None:
+        self.live_snapshot = self._build_snapshot(region_id="traversable_1")
+        self._cached_snapshot = self.live_snapshot
+        self.refresh_count = 0
+
+    def get_latest_snapshot(self):
+        return self._cached_snapshot
+
+    def is_available(self) -> bool:
+        return True
+
+    def refresh(self):
+        self.refresh_count += 1
+        self._cached_snapshot = self.live_snapshot
+        return self._cached_snapshot
+
+    def _build_snapshot(self, *, region_id: str) -> MapSnapshot:
+        return MapSnapshot(
+            source_name="test_map",
+            version_id=f"mapv_test_{region_id}",
+            revision=1,
+            semantic_map=SemanticMap(
+                map_id="semantic_test_map",
+                frame_id="map",
+                regions=[
+                    SemanticRegion(
+                        region_id=region_id,
+                        label="traversable",
+                        centroid=Pose(
+                            frame_id="map",
+                            position=Vector3(x=0.0, y=0.0, z=0.0),
+                            orientation=Quaternion(w=1.0),
+                        ),
+                    )
+                ],
+            ),
+        )
 
 
 class _FakeMemoryService:
@@ -497,6 +561,98 @@ def test_perception_video_runtime_suppresses_repeated_calls_when_pose_is_static(
     assert second_message is None
     assert len(memory_service.calls) == 1
     assert status.metadata["last_skip_reason"] == "stationary_pose_hold"
+    assert status.metadata["stationary_suppressed"] is True
+
+
+def test_perception_video_runtime_refreshes_live_localization_before_keyframe_decision(tmp_path: Path) -> None:
+    """关键帧判定应读取刷新后的实时位姿，而不是长期复用旧快照。"""
+
+    provider_owner = _ProviderOwner(UsbCameraBundle())
+    service, state_store = _build_perception_service(tmp_path, provider_owner)
+    localization_service = _RefreshingLocalizationService()
+    memory_service = _FakeMemoryService()
+    runtime = PerceptionVideoRuntime(
+        perception_service=service,
+        state_store=state_store,
+        localization_service=localization_service,
+        mapping_service=None,
+        memory_service=memory_service,
+        enabled=True,
+        auto_start=False,
+        camera_id="front_camera",
+        interval_sec=0.1,
+        store_artifact=False,
+        keyframe_min_interval_sec=0.05,
+        keyframe_max_interval_sec=2.0,
+        keyframe_translation_threshold_m=0.3,
+        keyframe_yaw_threshold_deg=10.0,
+        remember_keyframes=True,
+        remember_min_interval_sec=0.05,
+        burst_frame_count=2,
+        burst_interval_sec=0.01,
+    )
+
+    first_message = runtime.run_once()
+    assert first_message is not None
+    assert len(memory_service.calls) == 1
+
+    time.sleep(0.08)
+    localization_service.live_pose = Pose(
+        frame_id="map",
+        position=Vector3(x=0.6, y=0.0, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+
+    second_message = runtime.run_once()
+
+    assert second_message is not None
+    assert len(memory_service.calls) == 2
+    assert localization_service.refresh_count >= 2
+
+
+def test_perception_video_runtime_suppresses_anchor_change_when_pose_is_static(tmp_path: Path) -> None:
+    """静止状态下即使语义区域标识变化，也不应重复触发视觉与记忆调用。"""
+
+    provider_owner = _ProviderOwner(UsbCameraBundle())
+    service, state_store = _build_perception_service(tmp_path, provider_owner)
+    localization_service = _StaticLocalizationService()
+    mapping_service = _RefreshingMappingService()
+    memory_service = _FakeMemoryService()
+    runtime = PerceptionVideoRuntime(
+        perception_service=service,
+        state_store=state_store,
+        localization_service=localization_service,
+        mapping_service=mapping_service,
+        memory_service=memory_service,
+        enabled=True,
+        auto_start=False,
+        camera_id="front_camera",
+        interval_sec=0.1,
+        store_artifact=False,
+        keyframe_min_interval_sec=0.05,
+        keyframe_max_interval_sec=2.0,
+        keyframe_translation_threshold_m=0.3,
+        keyframe_yaw_threshold_deg=10.0,
+        remember_keyframes=True,
+        remember_min_interval_sec=0.05,
+        burst_frame_count=2,
+        burst_interval_sec=0.01,
+    )
+
+    first_message = runtime.run_once()
+    assert first_message is not None
+    assert len(memory_service.calls) == 1
+
+    time.sleep(0.08)
+    mapping_service.live_snapshot = mapping_service._build_snapshot(region_id="traversable_2")
+
+    second_message = runtime.run_once()
+    status = runtime.get_status()
+
+    assert second_message is None
+    assert len(memory_service.calls) == 1
+    assert status.processed_frames == 1
+    assert status.metadata["last_skip_reason"] == "stationary_anchor_hold"
     assert status.metadata["stationary_suppressed"] is True
 
 

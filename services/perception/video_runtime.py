@@ -317,22 +317,22 @@ class PerceptionVideoRuntime:
         localization_service = self._localization_service
         if localization_service is not None:
             snapshot = localization_service.get_latest_snapshot()
-            if snapshot is None and localization_service.is_available():
+            if localization_service.is_available():
                 try:
                     snapshot = localization_service.refresh()
                 except Exception:
-                    snapshot = None
+                    pass
             if snapshot is not None:
                 current_pose = snapshot.current_pose
 
         mapping_service = self._mapping_service
         if mapping_service is not None:
             snapshot = mapping_service.get_latest_snapshot()
-            if snapshot is None and mapping_service.is_available():
+            if mapping_service.is_available():
                 try:
                     snapshot = mapping_service.refresh()
                 except Exception:
-                    snapshot = None
+                    pass
             map_context = self._semantic_map_builder.build(snapshot)
         return current_pose, map_context
 

@@ -322,6 +322,50 @@ class FakeProviderBundle(
         )
 
 
+class FakeObstacleAvoidanceDataPlane:
+    """用于集成测试的避障数据面桩。"""
+
+    def __init__(self) -> None:
+        self.enabled = True
+        self.calls: List[bool] = []
+        self.mapping_runtime_calls: List[str] = []
+        self.mapping_runtime_disable_calls: List[str] = []
+
+    def is_obstacle_avoidance_control_available(self) -> bool:
+        return True
+
+    def ensure_mapping_runtime_enabled(self, *, reason: str = "") -> Dict[str, object]:
+        self.mapping_runtime_calls.append(str(reason or ""))
+        return {
+            "service_names": ["unitree_lidar", "unitree_lidar_slam", "voxel_height_mapping"],
+            "service_states": {},
+            "localization_available": True,
+            "map_available": True,
+            "navigation_available": True,
+        }
+
+    def disable_mapping_runtime(self, *, reason: str = "") -> Dict[str, object]:
+        self.mapping_runtime_disable_calls.append(str(reason or ""))
+        return {
+            "service_names": ["unitree_lidar", "unitree_lidar_slam", "voxel_height_mapping"],
+            "service_states": {},
+            "localization_available": True,
+            "map_available": False,
+            "navigation_available": True,
+        }
+
+    def set_obstacle_avoidance_enabled(self, enabled: bool) -> Dict[str, object]:
+        self.enabled = bool(enabled)
+        self.calls.append(self.enabled)
+        return {
+            "obstacle_avoidance_enabled": self.enabled,
+            "backend_ready": True,
+            "switch_enabled": self.enabled,
+            "remote_command_enabled": self.enabled,
+            "control_path": "obstacles_avoid" if self.enabled else "sport",
+        }
+
+
 class FakeRobotAssembly(RobotAssemblyBase):
     """用于集成测试的假机器人入口。"""
 
@@ -353,6 +397,7 @@ class FakeRobotAssembly(RobotAssemblyBase):
         self.volume_switch_enabled = True
         self.speech_requests: List[Dict[str, object]] = []
         self.action_history: List[Tuple[str, Dict[str, object]]] = []
+        self.data_plane = FakeObstacleAvoidanceDataPlane()
         self.providers = FakeProviderBundle(self)
 
     def start(self) -> None:
@@ -745,6 +790,7 @@ def test_gateway_perception_runtime_auto_start_waits_for_memory_enable(tmp_path:
         initial_status = client.get("/api/perception/runtime", headers=_agent_headers())
         assert initial_status.status_code == 200
         assert initial_status.json()["perception_runtime"]["running"] is False
+        assert robot.data_plane.mapping_runtime_calls == []
 
         enable_memory = client.post(
             "/api/capabilities/enable_memory_library/invoke",
@@ -752,6 +798,7 @@ def test_gateway_perception_runtime_auto_start_waits_for_memory_enable(tmp_path:
             json={"arguments": {"library_name": "自动启动记忆库", "load_history": False, "reset_library": False}},
         )
         assert enable_memory.status_code == 200
+        assert robot.data_plane.mapping_runtime_calls[-1] == "enable_memory_library"
 
         _wait_for_condition(
             lambda: client.get("/api/perception/runtime", headers=_agent_headers()).json()["perception_runtime"]["running"] is True,
@@ -764,6 +811,7 @@ def test_gateway_perception_runtime_auto_start_waits_for_memory_enable(tmp_path:
             json={"arguments": {}},
         )
         assert disable_memory.status_code == 200
+        assert robot.data_plane.mapping_runtime_disable_calls[-1] == "disable_memory_library"
 
         _wait_for_condition(
             lambda: client.get("/api/perception/runtime", headers=_agent_headers()).json()["perception_runtime"]["running"] is False,
@@ -825,6 +873,137 @@ def test_gateway_localization_mapping_navigation_and_exploration(tmp_path: Path)
         assert navigation_history.status_code == 200
         assert len(navigation_history.json()["navigation_history"]) >= 2
         assert len(navigation_history.json()["exploration_history"]) >= 1
+
+
+def test_gateway_navigation_mapping_and_exploration_tools_are_callable_via_mcp(tmp_path: Path) -> None:
+    """地图、导航和探索主能力应可通过 MCP 直接调用。"""
+
+    app, _, robot, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        get_map_snapshot = client.post(
+            "/mcp",
+            headers=_agent_headers(),
+            json={
+                "jsonrpc": "2.0",
+                "id": "map_snapshot",
+                "method": "tools/call",
+                "params": {"name": "get_map_snapshot", "arguments": {}},
+            },
+        )
+        assert get_map_snapshot.status_code == 200
+        map_payload = get_map_snapshot.json()["result"]["structuredContent"]["result"]
+        assert map_payload["map_snapshot"]["semantic_map"]["regions"][0]["region_id"] == "charging_station"
+
+        get_navigation_snapshot = client.post(
+            "/mcp",
+            headers=_agent_headers(),
+            json={
+                "jsonrpc": "2.0",
+                "id": "navigation_snapshot",
+                "method": "tools/call",
+                "params": {"name": "get_navigation_snapshot", "arguments": {}},
+            },
+        )
+        assert get_navigation_snapshot.status_code == 200
+        navigation_payload = get_navigation_snapshot.json()["result"]["structuredContent"]["result"]
+        assert navigation_payload["navigation_context"]["navigation_state"]["status"] == "idle"
+        assert navigation_payload["exploration_context"]["exploration_state"]["status"] == "idle"
+
+        navigate_to_pose = client.post(
+            "/mcp",
+            headers=_agent_headers(),
+            json={
+                "jsonrpc": "2.0",
+                "id": "navigate_pose",
+                "method": "tools/call",
+                "params": {
+                    "name": "navigate_to_pose",
+                    "arguments": {
+                        "frame_id": "map",
+                        "x": 1.0,
+                        "y": 1.0,
+                        "yaw_rad": 0.0,
+                        "timeout_sec": 1.0,
+                    },
+                },
+            },
+        )
+        assert navigate_to_pose.status_code == 200
+        navigate_payload = navigate_to_pose.json()["result"]["structuredContent"]
+        assert navigate_payload["mode"] == "async_task"
+        navigate_task = _wait_for_task(client, navigate_payload["task"]["task_id"])
+        assert navigate_task["status"]["state"] == "succeeded"
+        assert robot.current_pose.position.x == 1.0
+
+        explore_area = client.post(
+            "/mcp",
+            headers=_agent_headers(),
+            json={
+                "jsonrpc": "2.0",
+                "id": "explore_area",
+                "method": "tools/call",
+                "params": {
+                    "name": "explore_area",
+                    "arguments": {
+                        "target_name": "meeting_point",
+                        "strategy": "frontier",
+                        "radius_m": 1.5,
+                        "timeout_sec": 1.0,
+                    },
+                },
+            },
+        )
+        assert explore_area.status_code == 200
+        explore_payload = explore_area.json()["result"]["structuredContent"]
+        assert explore_payload["mode"] == "async_task"
+        explore_task = _wait_for_task(client, explore_payload["task"]["task_id"])
+        assert explore_task["status"]["state"] == "succeeded"
+
+        latest_navigation = client.post(
+            "/mcp",
+            headers=_agent_headers(),
+            json={
+                "jsonrpc": "2.0",
+                "id": "navigation_snapshot_after",
+                "method": "tools/call",
+                "params": {"name": "get_navigation_snapshot", "arguments": {}},
+            },
+        )
+        assert latest_navigation.status_code == 200
+        latest_navigation_payload = latest_navigation.json()["result"]["structuredContent"]["result"]
+        assert latest_navigation_payload["navigation_context"]["goal_reached"] is True
+        assert latest_navigation_payload["exploration_context"]["exploration_state"]["status"] == "succeeded"
+
+
+def test_gateway_explore_area_can_start_without_target_or_coordinates(tmp_path: Path) -> None:
+    """未知环境探索应支持无参数起步，默认以当前位置为中心。"""
+
+    app, _, robot, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        assert robot.data_plane.mapping_runtime_calls == []
+        explore_area = client.post(
+            "/mcp",
+            headers=_agent_headers(),
+            json={
+                "jsonrpc": "2.0",
+                "id": "explore_area_without_target",
+                "method": "tools/call",
+                "params": {
+                    "name": "explore_area",
+                    "arguments": {
+                        "strategy": "frontier",
+                        "radius_m": 1.5,
+                        "timeout_sec": 1.0,
+                    },
+                },
+            },
+        )
+        assert explore_area.status_code == 200
+        explore_payload = explore_area.json()["result"]["structuredContent"]
+        assert explore_payload["mode"] == "async_task"
+        explore_task = _wait_for_task(client, explore_payload["task"]["task_id"])
+        assert explore_task["status"]["state"] == "succeeded"
+        assert robot.data_plane.mapping_runtime_calls[-1] == "explore_area"
 
 
 def test_gateway_memory_tools_and_named_navigation(tmp_path: Path) -> None:
@@ -986,6 +1165,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
         assert "execute_sport_command" in tool_names
         assert "follow_target" in tool_names
         assert "inspect_target" in tool_names
+        assert "set_obstacle_avoidance" in tool_names
 
         execute_sport_tool = next(item for item in tool_items if item["name"] == "execute_sport_command")
         action_schema = execute_sport_tool["inputSchema"]["properties"]["action"]
@@ -993,6 +1173,8 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
         assert "sit" in action_schema["enum"]
         assert "damp" in action_schema["enum"]
         assert "stand_up" in action_schema["enum"]
+        assert "free_avoid" not in action_schema["enum"]
+        assert "free_avoid" not in action_catalog
         assert action_catalog["switch_joystick"]["params_schema"]["properties"]["on"]["type"] == "boolean"
         assert "switch_control_mode" in execute_sport_tool["description"]
 
@@ -1079,6 +1261,22 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
         )
         assert speak_text.json()["result"]["structuredContent"]["result"]["speech"]["accepted"] is True
 
+        set_obstacle_avoidance = client.post(
+            "/mcp",
+            headers=_agent_headers(),
+            json={
+                "jsonrpc": "2.0",
+                "id": "obstacle",
+                "method": "tools/call",
+                "params": {"name": "set_obstacle_avoidance", "arguments": {"enabled": False}},
+            },
+        )
+        assert set_obstacle_avoidance.status_code == 200
+        obstacle_payload = set_obstacle_avoidance.json()["result"]["structuredContent"]["result"]
+        assert obstacle_payload["obstacle_avoidance_enabled"] is False
+        assert obstacle_payload["control_path"] == "sport"
+        assert robot.data_plane.calls[-1] is False
+
         execute_action = client.post(
             "/mcp",
             headers=_agent_headers(),
@@ -1131,6 +1329,7 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
         capability_action_schema = execute_sport_capability["descriptor"]["input_schema"]["properties"]["action"]
         assert "sit" in capability_action_schema["enum"]
         assert "balance_stand" in capability_action_schema["enum"]
+        assert "free_avoid" not in capability_action_schema["enum"]
 
         navigation_task = client.post(
             "/api/capabilities/navigate_to_pose/invoke",

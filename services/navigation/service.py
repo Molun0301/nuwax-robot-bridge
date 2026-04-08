@@ -210,6 +210,15 @@ class NavigationService:
 
         provider = self._get_exploration_provider()
         exploration_state = provider.get_exploration_state()
+        previous_context = self._latest_exploration_context
+        if (
+            previous_context is not None
+            and previous_context.exploration_state.status
+            in {ExplorationStatus.SUCCEEDED, ExplorationStatus.FAILED, ExplorationStatus.CANCELLED}
+            and exploration_state.status == ExplorationStatus.IDLE
+            and previous_context.exploration_state.current_request_id is not None
+        ):
+            exploration_state = previous_context.exploration_state.model_copy(deep=True)
         context = ExplorationContext(
             current_request=self._current_explore_request,
             exploration_state=exploration_state,

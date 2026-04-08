@@ -23,13 +23,18 @@ from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
 from contracts.robot_state import IMUState
-from drivers.robots.go2.frontier_exploration import Go2FrontierExplorer
-from drivers.robots.go2.global_map import Go2GlobalMapBuildResult, Go2SparseGlobalMapBuilder
-from drivers.robots.go2.navigation_backend import Go2GridNavigationPlanner, Go2NavigationSession
 from drivers.robots.go2.collision_detector import Go2CollisionDetector, Go2CollisionDetectorConfig, CollisionStatus
 from drivers.robots.go2.cost_mapper import Go2CostMapper, Go2CostMapperConfig, Go2CostMapperResult
 from drivers.robots.go2.voxel_mapper import Go2VoxelMapper, Go2VoxelMapperConfig, Go2VoxelMapperResult
 from drivers.robots.go2.local_planner import Go2DWALocalPlanner, Go2LocalPlannerConfig, Go2VelocityCommand, LocalPlannerState
+from services.mapping.occupancy_mapping import (
+    OccupancyMapBuildResult as Go2GlobalMapBuildResult,
+    PointCloudScanObservation as LocalMapScan,
+    SparseOccupancyMapBuilder as Go2SparseGlobalMapBuilder,
+    build_sliding_window_map,
+)
+from services.navigation.frontier import FrontierExplorer as Go2FrontierExplorer
+from services.navigation.runtime import GridNavigationPlanner as Go2GridNavigationPlanner, NavigationSession as Go2NavigationSession
 
 if TYPE_CHECKING:
     from drivers.robots.go2.settings import Go2DataPlaneConfig
@@ -63,18 +68,6 @@ _POINT_FIELD_DTYPE_MAP = {
     7: np.float32,
     8: np.float64,
 }
-
-
-@dataclass
-class LocalMapScan:
-    """Go2 端侧局部地图使用的点云扫描。"""
-
-    stamp_sec: float
-    sensor_x: float
-    sensor_y: float
-    source_label: str
-    points_xyz_world: np.ndarray
-
 
 def _prepend_env_path(name: str, value: str) -> None:
     """把路径前置到指定环境变量。"""
@@ -295,6 +288,7 @@ class RclpyGo2RosBridge:
         self._local_map_scans: Deque[LocalMapScan] = deque()
         self._last_global_map_update_monotonic = 0.0
         self._last_local_map_update_monotonic = 0.0
+        self._point_cloud_mapping_runtime_enabled = not self._should_defer_point_cloud_mapping_until_runtime_enabled()
 
         self._collision_detector = Go2CollisionDetector(self.config.collision_detector)
         self._cost_mapper = Go2CostMapper(self.config.cost_mapper)
@@ -615,6 +609,10 @@ class RclpyGo2RosBridge:
                 "ros_point_cloud_ready": self._ros_point_cloud_ready,
                 "point_cloud_source_topic": self._latest_point_cloud_source_topic,
                 "point_cloud_available": self._point_cloud_available,
+                "point_cloud_mapping_runtime_enabled": self._point_cloud_mapping_runtime_enabled,
+                "point_cloud_mapping_deferred_until_runtime_enable": (
+                    self._should_defer_point_cloud_mapping_until_runtime_enabled()
+                ),
                 "ros_map_ready": self._ros_occupancy_ready or self._ros_grid_map_ready or self._ros_cost_map_ready,
                 "global_map_ready": self._global_map_ready,
                 "global_map_source": self._latest_global_map_source,
@@ -941,9 +939,81 @@ class RclpyGo2RosBridge:
         """判断当前是否启用了任意点云地图合成链。"""
 
         return bool(
+            self._point_cloud_mapping_runtime_enabled
+            and (
+                self.config.map_synthesis.local_map_enabled
+                or self.config.map_synthesis.global_map_enabled
+            )
+        )
+
+    def _should_defer_point_cloud_mapping_until_runtime_enabled(self) -> bool:
+        """判断是否应在显式触发前延后点云地图合成。"""
+
+        if not (
             self.config.map_synthesis.local_map_enabled
             or self.config.map_synthesis.global_map_enabled
-        )
+        ):
+            return False
+        official_cfg = getattr(self.config, "official", None)
+        return bool(getattr(official_cfg, "enabled", False) and not getattr(official_cfg, "auto_start_services", True))
+
+    def _clear_point_cloud_mapping_outputs_unlocked(self) -> None:
+        """清理 bridge 内部点云建图产物，恢复到冷启动状态。"""
+
+        self._global_map_builder = Go2SparseGlobalMapBuilder(self.config.map_synthesis)
+        self._local_map_scans.clear()
+        self._last_global_map_update_monotonic = 0.0
+        self._last_local_map_update_monotonic = 0.0
+        self._latest_occupancy_from_global_cloud = None
+        self._latest_cost_from_global_cloud = None
+        self._latest_semantic_map_from_global_cloud = None
+        self._latest_occupancy_from_local_cloud = None
+        self._latest_cost_from_local_cloud = None
+        self._latest_semantic_map_from_local_cloud = None
+        self._global_map_ready = False
+        self._local_map_ready = False
+        self._latest_global_map_source = ""
+        self._latest_local_map_source = ""
+
+    def enable_mapping_runtime(self, *, reason: str = "") -> Dict[str, object]:
+        """显式启用点云地图合成链。"""
+
+        with self._lock:
+            already_enabled = self._point_cloud_mapping_runtime_enabled
+            self._point_cloud_mapping_runtime_enabled = True
+            status = {
+                "point_cloud_mapping_runtime_enabled": self._point_cloud_mapping_runtime_enabled,
+                "point_cloud_mapping_deferred_until_runtime_enable": (
+                    self._should_defer_point_cloud_mapping_until_runtime_enabled()
+                ),
+                "point_cloud_available": self._point_cloud_available,
+                "global_map_ready": self._global_map_ready,
+                "local_map_ready": self._local_map_ready,
+            }
+        if not already_enabled:
+            LOGGER.info("Go2 点云地图合成链已启用 reason=%s", reason or "mapping_runtime")
+        return status
+
+    def disable_mapping_runtime(self, *, reason: str = "") -> Dict[str, object]:
+        """在按需模式下回收点云地图合成链并清理已有建图产物。"""
+
+        with self._lock:
+            supports_runtime_toggle = self._should_defer_point_cloud_mapping_until_runtime_enabled()
+            was_enabled = self._point_cloud_mapping_runtime_enabled
+            if supports_runtime_toggle:
+                self._point_cloud_mapping_runtime_enabled = False
+                self._clear_point_cloud_mapping_outputs_unlocked()
+            status = {
+                "point_cloud_mapping_runtime_enabled": self._point_cloud_mapping_runtime_enabled,
+                "point_cloud_mapping_deferred_until_runtime_enable": supports_runtime_toggle,
+                "point_cloud_available": self._point_cloud_available,
+                "global_map_ready": self._global_map_ready,
+                "local_map_ready": self._local_map_ready,
+                "map_available": self.is_map_available(),
+            }
+        if supports_runtime_toggle and was_enabled:
+            LOGGER.info("Go2 点云地图合成链已回收 reason=%s", reason or "mapping_runtime")
+        return status
 
     def _on_point_cloud(self, message: object, *, source_topic: str = "") -> None:
         with self._lock:
@@ -1295,105 +1365,122 @@ class RclpyGo2RosBridge:
         self,
         current_pose: Pose,
     ) -> Tuple[Optional[OccupancyGrid], Optional[CostMap], Optional[SemanticMap]]:
-        if not self._local_map_scans:
+        build_result = build_sliding_window_map(
+            scans=list(self._local_map_scans),
+            current_pose=current_pose,
+            config=self.config.map_synthesis,
+        )
+        if build_result is None:
             return None, None, None
 
-        map_cfg = self.config.map_synthesis
-        width = int(map_cfg.local_map_width)
-        height = int(map_cfg.local_map_height)
-        resolution = float(map_cfg.local_map_resolution_m)
-        origin_x = float(current_pose.position.x) - (width * resolution) / 2.0
-        origin_y = float(current_pose.position.y) - (height * resolution) / 2.0
-        frame_id = current_pose.frame_id or map_cfg.map_frame
-        observed = np.zeros((height, width), dtype=np.uint8)
-        occupied = np.zeros((height, width), dtype=np.uint8)
-        source_labels = {scan.source_label for scan in self._local_map_scans if str(scan.source_label or "").strip()}
-
-        for scan in list(self._local_map_scans):
-            sensor_cell = self._world_to_grid_cell(
-                x=scan.sensor_x,
-                y=scan.sensor_y,
-                origin_x=origin_x,
-                origin_y=origin_y,
-                resolution=resolution,
-                width=width,
-                height=height,
-            )
-            if sensor_cell is None:
-                continue
-            sensor_row, sensor_col = sensor_cell
-            for point_x, point_y, _point_z in scan.points_xyz_world:
-                point_cell = self._world_to_grid_cell(
-                    x=float(point_x),
-                    y=float(point_y),
-                    origin_x=origin_x,
-                    origin_y=origin_y,
-                    resolution=resolution,
-                    width=width,
-                    height=height,
-                )
-                if point_cell is None:
-                    continue
-                point_row, point_col = point_cell
-                for free_row, free_col in self._bresenham_cells(sensor_row, sensor_col, point_row, point_col)[:-1]:
-                    observed[free_row, free_col] = 1
-                observed[point_row, point_col] = 1
-                occupied[point_row, point_col] = 1
-
-        if not np.any(observed):
-            return None, None, None
-
-        if not source_labels:
-            local_map_source = "local_point_cloud"
-        elif len(source_labels) == 1:
-            local_map_source = next(iter(source_labels))
-        else:
-            local_map_source = "mixed_point_cloud"
-        self._latest_local_map_source = local_map_source
-
-        occupancy_data = np.full((height, width), -1, dtype=np.int32)
-        occupancy_data[observed == 1] = 0
-        occupancy_data[occupied == 1] = 100
-
-        cost_data = np.full((height, width), 100.0, dtype=np.float32)
-        cost_data[observed == 1] = 0.0
-        cost_data[occupied == 1] = 100.0
-        self._inflate_cost_map(cost_data, occupied_mask=occupied.astype(bool), resolution=resolution)
+        build_result = self._clear_navigation_origin_footprint(
+            build_result=build_result,
+            current_pose=current_pose,
+        )
+        frame_id = current_pose.frame_id or self.config.map_synthesis.map_frame
+        self._latest_local_map_source = build_result.source_label
 
         origin_pose = Pose(
             frame_id=frame_id,
-            position=Vector3(x=origin_x, y=origin_y, z=float(current_pose.position.z)),
+            position=Vector3(
+                x=float(build_result.origin_x),
+                y=float(build_result.origin_y),
+                z=float(current_pose.position.z),
+            ),
             orientation=Quaternion(w=1.0),
         )
         occupancy_grid = OccupancyGrid(
             map_id="go2_local_cloud_occupancy",
             frame_id=frame_id,
-            width=width,
-            height=height,
-            resolution_m=resolution,
+            width=int(build_result.width),
+            height=int(build_result.height),
+            resolution_m=float(build_result.resolution_m),
             origin=origin_pose,
-            data=[int(value) for value in occupancy_data.flatten().tolist()],
+            data=[int(value) for value in build_result.occupancy_data.flatten().tolist()],
         )
         cost_map = CostMap(
             map_id="go2_local_cloud_cost",
             frame_id=frame_id,
-            width=width,
-            height=height,
-            resolution_m=resolution,
+            width=int(build_result.width),
+            height=int(build_result.height),
+            resolution_m=float(build_result.resolution_m),
             origin=origin_pose,
-            data=[float(value) for value in cost_data.flatten().tolist()],
+            data=[float(value) for value in build_result.cost_data.flatten().tolist()],
         )
         semantic_map = self._build_semantic_map_from_local_cloud(
-            occupancy=occupancy_data,
-            occupied_mask=occupied.astype(bool),
+            occupancy=build_result.occupancy_data,
+            occupied_mask=build_result.occupied_mask,
             frame_id=frame_id,
             origin=origin_pose,
-            resolution=resolution,
-            width=width,
-            height=height,
-            region_source=local_map_source,
+            resolution=float(build_result.resolution_m),
+            width=int(build_result.width),
+            height=int(build_result.height),
+            region_source=build_result.source_label,
         )
         return occupancy_grid, cost_map, semantic_map
+
+    def _clear_navigation_origin_footprint(
+        self,
+        *,
+        build_result: Go2GlobalMapBuildResult,
+        current_pose: Pose,
+    ) -> Go2GlobalMapBuildResult:
+        """在导航图中为当前位置保留可通行足迹，避免机器人被自身周边膨胀代价封死。"""
+
+        resolution_m = max(1e-6, float(build_result.resolution_m))
+        radius_m = max(
+            float(getattr(self.config.official, "goal_tolerance_m", 0.0)),
+            float(getattr(self.config.local_planning, "goal_tolerance_m", 0.0)),
+            float(getattr(self.config.navigation, "planner_inflation_radius_m", 0.0))
+            + max(
+                float(getattr(self.config.map_synthesis, "global_map_inflation_radius_m", 0.0)),
+                float(getattr(self.config.map_synthesis, "local_map_inflation_radius_m", 0.0)),
+            )
+            + resolution_m * 0.5,
+        )
+        if radius_m <= 1e-6:
+            return build_result
+
+        center_col = int((float(current_pose.position.x) - float(build_result.origin_x)) / resolution_m)
+        center_row = int((float(current_pose.position.y) - float(build_result.origin_y)) / resolution_m)
+        if (
+            center_col < 0
+            or center_row < 0
+            or center_col >= int(build_result.width)
+            or center_row >= int(build_result.height)
+        ):
+            return build_result
+
+        occupancy_data = np.asarray(build_result.occupancy_data, dtype=np.int32).copy()
+        cost_data = np.asarray(build_result.cost_data, dtype=np.float32).copy()
+        occupied_mask = np.asarray(build_result.occupied_mask, dtype=bool).copy()
+
+        radius_cells = max(1, int(math.ceil(radius_m / resolution_m)))
+        updated = False
+        for row in range(max(0, center_row - radius_cells), min(int(build_result.height), center_row + radius_cells + 1)):
+            for col in range(max(0, center_col - radius_cells), min(int(build_result.width), center_col + radius_cells + 1)):
+                if math.hypot((float(row - center_row)) * resolution_m, (float(col - center_col)) * resolution_m) > radius_m + 1e-6:
+                    continue
+                occupancy_data[row, col] = 0
+                cost_data[row, col] = 0.0
+                occupied_mask[row, col] = False
+                updated = True
+
+        if not updated:
+            return build_result
+
+        return Go2GlobalMapBuildResult(
+            width=int(build_result.width),
+            height=int(build_result.height),
+            resolution_m=resolution_m,
+            origin_x=float(build_result.origin_x),
+            origin_y=float(build_result.origin_y),
+            occupancy_data=occupancy_data,
+            cost_data=cost_data,
+            occupied_mask=occupied_mask,
+            source_label=build_result.source_label,
+            known_cell_count=int(build_result.known_cell_count),
+        )
 
     def _build_contract_maps_from_global_result(
         self,
@@ -1403,6 +1490,10 @@ class RclpyGo2RosBridge:
     ) -> Tuple[Optional[OccupancyGrid], Optional[CostMap], Optional[SemanticMap]]:
         if build_result is None:
             return None, None, None
+        build_result = self._clear_navigation_origin_footprint(
+            build_result=build_result,
+            current_pose=current_pose,
+        )
         frame_id = current_pose.frame_id or self.config.map_synthesis.map_frame
         origin_pose = Pose(
             frame_id=frame_id,
@@ -1442,70 +1533,6 @@ class RclpyGo2RosBridge:
             region_source=build_result.source_label,
         )
         return occupancy_grid, cost_map, semantic_map
-
-    def _world_to_grid_cell(
-        self,
-        *,
-        x: float,
-        y: float,
-        origin_x: float,
-        origin_y: float,
-        resolution: float,
-        width: int,
-        height: int,
-    ) -> Optional[Tuple[int, int]]:
-        col = int((x - origin_x) / resolution)
-        row = int((y - origin_y) / resolution)
-        if row < 0 or col < 0 or row >= height or col >= width:
-            return None
-        return row, col
-
-    def _bresenham_cells(self, start_row: int, start_col: int, end_row: int, end_col: int) -> List[Tuple[int, int]]:
-        cells: List[Tuple[int, int]] = []
-        x0 = start_col
-        y0 = start_row
-        x1 = end_col
-        y1 = end_row
-        dx = abs(x1 - x0)
-        sx = 1 if x0 < x1 else -1
-        dy = -abs(y1 - y0)
-        sy = 1 if y0 < y1 else -1
-        error = dx + dy
-        while True:
-            cells.append((y0, x0))
-            if x0 == x1 and y0 == y1:
-                return cells
-            doubled = 2 * error
-            if doubled >= dy:
-                error += dy
-                x0 += sx
-            if doubled <= dx:
-                error += dx
-                y0 += sy
-
-    def _inflate_cost_map(self, cost_data: np.ndarray, *, occupied_mask: np.ndarray, resolution: float) -> None:
-        radius_m = float(self.config.map_synthesis.local_map_inflation_radius_m)
-        if radius_m <= 0.0 or not np.any(occupied_mask):
-            return
-        radius_cells = max(1, int(math.ceil(radius_m / resolution)))
-        kernel: List[Tuple[int, int, float]] = []
-        for row_offset in range(-radius_cells, radius_cells + 1):
-            for col_offset in range(-radius_cells, radius_cells + 1):
-                distance = math.hypot(float(row_offset), float(col_offset))
-                if distance <= 0.0 or distance > radius_cells:
-                    continue
-                cost = max(1.0, 100.0 * (1.0 - (distance / float(radius_cells + 1))))
-                kernel.append((row_offset, col_offset, cost))
-
-        height, width = cost_data.shape
-        occupied_rows, occupied_cols = np.where(occupied_mask)
-        for center_row, center_col in zip(occupied_rows.tolist(), occupied_cols.tolist()):
-            for row_offset, col_offset, inflated_cost in kernel:
-                row = center_row + row_offset
-                col = center_col + col_offset
-                if row < 0 or col < 0 or row >= height or col >= width:
-                    continue
-                cost_data[row, col] = max(float(cost_data[row, col]), float(inflated_cost))
 
     def _build_semantic_map_from_local_cloud(
         self,
@@ -1964,6 +1991,9 @@ class Go2DataPlaneRuntime:
         self._official_sport_ready = False
         self._official_robot_state_ready = False
         self._official_obstacles_avoid_ready = False
+        self._official_obstacles_avoid_remote_control = False
+        self._official_obstacles_avoid_switch_state: Optional[bool] = None
+        self._last_motion_command_route: Optional[str] = None
         self._official_service_states: Dict[str, Dict[str, object]] = {}
         self._official_goal_thread: Optional[threading.Thread] = None
         self._official_goal_stop_event = threading.Event()
@@ -1973,7 +2003,252 @@ class Go2DataPlaneRuntime:
         self._official_last_error: Optional[str] = None
         self._grid_navigation_planner = Go2GridNavigationPlanner(self.config.navigation)
         self._frontier_explorer = Go2FrontierExplorer(self.config.exploration)
+        self._obstacle_avoidance_enabled = bool(
+            getattr(getattr(self.config, "official", None), "obstacle_avoidance_default_enabled", True)
+        )
         self._started = False
+
+    def is_obstacle_avoidance_control_available(self) -> bool:
+        """返回官方避障控制链路是否真正可用。"""
+
+        return self._official_obstacles_avoid_client is not None and self._official_obstacles_avoid_ready
+
+    def _require_obstacle_avoidance_client(self):
+        client = self._official_obstacles_avoid_client
+        if client is None or not self._official_obstacles_avoid_ready:
+            raise RuntimeError("Go2 官方 obstacles_avoid 服务未就绪。")
+        return client
+
+    def _read_obstacle_avoidance_switch_state(self) -> bool:
+        client = self._require_obstacle_avoidance_client()
+        code, enabled = client.SwitchGet()
+        if code != 0:
+            raise RuntimeError(f"读取 Go2 官方 obstacles_avoid 状态失败 code={code}")
+        self._official_obstacles_avoid_switch_state = bool(enabled)
+        return bool(enabled)
+
+    def _set_obstacle_avoidance_switch(self, enabled: bool) -> bool:
+        client = self._require_obstacle_avoidance_client()
+        code = client.SwitchSet(bool(enabled))
+        if code != 0:
+            raise RuntimeError(f"切换 Go2 官方 obstacles_avoid 开关失败 code={code}")
+        try:
+            return self._read_obstacle_avoidance_switch_state()
+        except Exception:
+            self._official_obstacles_avoid_switch_state = bool(enabled)
+            return bool(enabled)
+
+    def _set_obstacle_avoidance_remote_command(self, enabled: bool) -> None:
+        if not enabled and not self._official_obstacles_avoid_remote_control:
+            return
+        client = self._require_obstacle_avoidance_client()
+        code = client.UseRemoteCommandFromApi(bool(enabled))
+        if code != 0:
+            raise RuntimeError(f"切换 Go2 官方 obstacles_avoid 远程命令模式失败 code={code}")
+        self._official_obstacles_avoid_remote_control = bool(enabled)
+        LOGGER.info("Go2 官方避障远程命令模式已%s。", "启用" if enabled else "关闭")
+
+    def set_obstacle_avoidance_enabled(self, enabled: bool) -> Dict[str, Any]:
+        """开关实时避障功能，并返回真实后端状态。"""
+
+        previous_enabled = self._obstacle_avoidance_enabled
+        self._obstacle_avoidance_enabled = bool(enabled)
+        try:
+            self._ensure_official_services_enabled(
+                service_names=("obstacles_avoid",),
+                reason="set_obstacle_avoidance",
+            )
+            switch_enabled = self._set_obstacle_avoidance_switch(bool(enabled))
+            if not enabled and self._official_obstacles_avoid_remote_control:
+                self._require_obstacle_avoidance_client().Move(0.0, 0.0, 0.0)
+                self._set_obstacle_avoidance_remote_command(False)
+        except Exception:
+            self._obstacle_avoidance_enabled = previous_enabled
+            raise
+        LOGGER.info("官方避障已%s。", "启用" if switch_enabled else "禁用")
+        return self.get_obstacle_avoidance_status()
+
+    def is_obstacle_avoidance_enabled(self) -> bool:
+        """返回当前避障是否开启。"""
+        return self._obstacle_avoidance_enabled
+
+    def get_obstacle_avoidance_status(self) -> Dict[str, Any]:
+        """返回实时避障运行状态。"""
+
+        backend_ready = self.is_obstacle_avoidance_control_available()
+        switch_enabled = (
+            bool(self._official_obstacles_avoid_switch_state)
+            if self._official_obstacles_avoid_switch_state is not None
+            else False
+        )
+        if backend_ready:
+            try:
+                switch_enabled = self._read_obstacle_avoidance_switch_state()
+            except Exception as exc:
+                LOGGER.warning("读取官方避障开关状态失败: %s", exc)
+        return {
+            "obstacle_avoidance_enabled": self._obstacle_avoidance_enabled,
+            "default_enabled": bool(
+                getattr(getattr(self.config, "official", None), "obstacle_avoidance_default_enabled", True)
+            ),
+            "backend_ready": backend_ready,
+            "switch_enabled": switch_enabled,
+            "remote_command_enabled": self._official_obstacles_avoid_remote_control,
+            "control_path": "obstacles_avoid" if backend_ready and self._obstacle_avoidance_enabled else "sport",
+        }
+
+    def ensure_mapping_runtime_enabled(self, *, reason: str = "") -> Dict[str, Any]:
+        """按需启用 Go2 官方建图相关服务。"""
+
+        service_names = self._mapping_related_official_service_names()
+        self._ensure_official_services_enabled(service_names=service_names, reason=reason or "mapping_runtime")
+        bridge_mapping_runtime = None
+        enable_bridge_mapping = getattr(self.bridge, "enable_mapping_runtime", None)
+        if callable(enable_bridge_mapping):
+            try:
+                bridge_mapping_runtime = enable_bridge_mapping(reason=reason or "mapping_runtime")
+            except TypeError:
+                bridge_mapping_runtime = enable_bridge_mapping()
+            except Exception:
+                LOGGER.exception("按需启用 Go2 点云地图合成链失败 reason=%s", reason or "mapping_runtime")
+        return {
+            "service_names": list(service_names),
+            "service_states": dict(self._official_service_states),
+            "localization_available": self.is_localization_available(),
+            "map_available": self.is_map_available(),
+            "navigation_available": self.is_navigation_available(),
+            "bridge_mapping_runtime": bridge_mapping_runtime,
+        }
+
+    def disable_mapping_runtime(self, *, reason: str = "") -> Dict[str, Any]:
+        """在按需模式下回收 bridge 侧点云建图运行态。"""
+
+        bridge_mapping_runtime = None
+        disable_bridge_mapping = getattr(self.bridge, "disable_mapping_runtime", None)
+        if callable(disable_bridge_mapping):
+            try:
+                bridge_mapping_runtime = disable_bridge_mapping(reason=reason or "mapping_runtime")
+            except TypeError:
+                bridge_mapping_runtime = disable_bridge_mapping()
+            except Exception:
+                LOGGER.exception("回收 Go2 点云地图合成链失败 reason=%s", reason or "mapping_runtime")
+        return {
+            "service_names": list(self._mapping_related_official_service_names()),
+            "service_states": dict(self._official_service_states),
+            "localization_available": self.is_localization_available(),
+            "map_available": self.is_map_available(),
+            "navigation_available": self.is_navigation_available(),
+            "bridge_mapping_runtime": bridge_mapping_runtime,
+        }
+
+    def _mapping_related_official_service_names(self) -> Tuple[str, ...]:
+        """返回建图相关官方服务名。"""
+
+        service_names = []
+        for raw_name in self.config.official.service_names:
+            normalized = str(raw_name or "").strip()
+            if not normalized or normalized == "obstacles_avoid":
+                continue
+            service_names.append(normalized)
+        return tuple(service_names)
+
+    def _ensure_official_services_enabled(self, *, service_names: Sequence[str], reason: str) -> None:
+        """按需确保指定官方服务已经拉起。"""
+
+        if not self.config.enabled or not self._uses_official_backend():
+            return
+        if not self._official_robot_state_ready or self._official_robot_state_client is None:
+            return
+        normalized_names = tuple(str(item or "").strip() for item in service_names if str(item or "").strip())
+        if not normalized_names:
+            return
+        LOGGER.info("按需检查 Go2 官方服务 reason=%s services=%s", reason, ",".join(normalized_names))
+        self._refresh_official_service_states()
+        for service_name in normalized_names:
+            self._ensure_official_service_enabled(service_name)
+        self._refresh_official_service_states()
+        self._refresh_official_navigation_idle_state()
+
+    def _ensure_obstacle_avoidance_active(self) -> bool:
+        """确保官方避障处于激活状态，并切到官方避障远程命令模式。"""
+
+        if not self._obstacle_avoidance_enabled:
+            return False
+        if not self.is_obstacle_avoidance_control_available():
+            return False
+        switch_enabled = self._set_obstacle_avoidance_switch(True)
+        if not switch_enabled:
+            raise RuntimeError("Go2 官方 obstacles_avoid 已请求开启，但返回状态仍为关闭。")
+        if not self._official_obstacles_avoid_remote_control:
+            self._set_obstacle_avoidance_remote_command(True)
+        return True
+
+    def _release_obstacle_avoidance_remote_command(self) -> None:
+        """在切回普通运动控制前释放官方避障远程命令模式。"""
+
+        if not self._official_obstacles_avoid_remote_control:
+            return
+        if not self.is_obstacle_avoidance_control_available():
+            self._official_obstacles_avoid_remote_control = False
+            return
+        self._set_obstacle_avoidance_remote_command(False)
+
+    def _send_official_motion_command(self, vx: float, vy: float, vyaw: float) -> int:
+        """根据当前避障配置发送官方运动命令。"""
+
+        if self._ensure_obstacle_avoidance_active():
+            route = "obstacles_avoid"
+            code = self._require_obstacle_avoidance_client().Move(
+                float(vx),
+                float(vy),
+                float(vyaw),
+            )
+            self._log_motion_command_route(route, vx, vy, vyaw, code)
+            return code
+        if self._official_sport_client is None:
+            return -1
+        self._release_obstacle_avoidance_remote_command()
+        route = "sport"
+        code = self._official_sport_client.Move(float(vx), float(vy), float(vyaw))
+        self._log_motion_command_route(route, vx, vy, vyaw, code)
+        return code
+
+    def _log_motion_command_route(self, route: str, vx: float, vy: float, vyaw: float, code: int) -> None:
+        """记录当前实际运动命令链路，便于远端排查避障是否接管。"""
+
+        should_log = code != 0 or route != self._last_motion_command_route
+        self._last_motion_command_route = route if code == 0 else None
+        if not should_log:
+            return
+        LOGGER.info(
+            "Go2 运动命令已走 %s 链路 vx=%.3f vy=%.3f vyaw=%.3f code=%s obstacle_avoidance_enabled=%s remote_command_enabled=%s",
+            route,
+            float(vx),
+            float(vy),
+            float(vyaw),
+            code,
+            self._obstacle_avoidance_enabled,
+            self._official_obstacles_avoid_remote_control,
+        )
+
+    def can_accept_motion_command(self) -> bool:
+        """返回当前数据面是否可以直接下发运动命令。"""
+
+        return self._uses_official_backend() and self._official_sport_ready
+
+    def send_motion_command(self, vx: float, vy: float, vyaw: float) -> int:
+        """对外暴露的统一运动命令入口。"""
+
+        if not self.can_accept_motion_command():
+            raise RuntimeError("当前 Go2 数据面未就绪，不能直接下发运动命令。")
+        return self._send_official_motion_command(vx, vy, vyaw)
+
+    def stop_motion_command(self) -> None:
+        """对外暴露的统一停止命令入口。"""
+
+        if not self.can_accept_motion_command():
+            return
+        self._stop_official_motion()
 
     def start(self) -> None:
         """启动数据面运行时。"""
@@ -2095,6 +2370,7 @@ class Go2DataPlaneRuntime:
     def start_exploration(self, request: ExploreAreaRequest) -> bool:
         """启动探索任务。"""
 
+        self.ensure_mapping_runtime_enabled(reason="exploration")
         if not self.is_exploration_available():
             with self._exploration_lock:
                 self._exploration_state = ExplorationState(
@@ -2176,6 +2452,7 @@ class Go2DataPlaneRuntime:
                 "sport_ready": self._official_sport_ready,
                 "robot_state_ready": self._official_robot_state_ready,
                 "obstacles_avoid_ready": self._official_obstacles_avoid_ready,
+                "obstacle_avoidance": self.get_obstacle_avoidance_status(),
                 "last_error": self._official_last_error,
                 "service_states": dict(self._official_service_states),
             },
@@ -2222,6 +2499,8 @@ class Go2DataPlaneRuntime:
     def _should_wait_for_map_ready(self) -> bool:
         """判断启动阶段是否应该等待地图就绪。"""
 
+        if self._uses_official_backend() and not self.config.official.auto_start_services:
+            return False
         if self.config.map_synthesis.local_map_enabled:
             return True
         if str(self.config.topics.occupancy_topic or "").strip():
@@ -2323,6 +2602,12 @@ class Go2DataPlaneRuntime:
             if version_code == 0:
                 self._official_obstacles_avoid_ready = True
                 LOGGER.info("Go2 官方 obstacles_avoid 客户端已连接 server_api_version=%s", version)
+                try:
+                    self._official_obstacles_avoid_switch_state = self._set_obstacle_avoidance_switch(
+                        self._obstacle_avoidance_enabled
+                    )
+                except Exception as exc:
+                    LOGGER.warning("同步 Go2 官方 obstacles_avoid 初始开关状态失败: %s", exc)
             else:
                 message = f"Go2 官方 obstacles_avoid 当前未就绪 code={version_code}"
                 if version_code in {3102, 3104}:
@@ -2335,12 +2620,11 @@ class Go2DataPlaneRuntime:
             self._startup_diagnostics.append(message)
             LOGGER.warning(message)
 
-        if self._official_robot_state_ready:
-            self._refresh_official_service_states()
-            if self.config.official.auto_start_services:
-                for service_name in self.config.official.service_names:
-                    self._ensure_official_service_enabled(service_name)
-                self._refresh_official_service_states()
+        if self._official_robot_state_ready and self.config.official.auto_start_services:
+            self._ensure_official_services_enabled(
+                service_names=self.config.official.service_names,
+                reason="startup_auto_start",
+            )
 
     def _load_official_sdk_modules(self) -> Optional[Dict[str, object]]:
         modules = _load_go2_official_sdk_modules(self.config, include_dds_topics=False)
@@ -2421,7 +2705,7 @@ class Go2DataPlaneRuntime:
             stop_event.set()
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=1.0)
-        self._stop_sport_motion()
+        self._stop_official_motion()
         with self._navigation_lock:
             self._official_goal_thread = None
             self._official_navigation_goal = None
@@ -2436,7 +2720,17 @@ class Go2DataPlaneRuntime:
                 )
         return current_goal is not None
 
-    def _stop_sport_motion(self) -> None:
+    def _stop_official_motion(self) -> None:
+        self._last_motion_command_route = None
+        if self.is_obstacle_avoidance_control_available() and self._official_obstacles_avoid_remote_control:
+            try:
+                self._require_obstacle_avoidance_client().Move(0.0, 0.0, 0.0)
+            except Exception:
+                LOGGER.debug("停止 Go2 官方避障运动失败。", exc_info=True)
+            try:
+                self._release_obstacle_avoidance_remote_command()
+            except Exception:
+                LOGGER.debug("释放 Go2 官方避障远程命令模式失败。", exc_info=True)
         if self._official_sport_client is None:
             return
         try:
@@ -2496,7 +2790,7 @@ class Go2DataPlaneRuntime:
                     now_monotonic=time.monotonic(),
                 )
                 if tick_result.status == NavigationStatus.SUCCEEDED:
-                    self._stop_sport_motion()
+                    self._stop_official_motion()
                     with self._navigation_lock:
                         self._official_goal_reached = True
                         self._official_navigation_state = NavigationState(
@@ -2516,7 +2810,7 @@ class Go2DataPlaneRuntime:
                     self._set_official_navigation_failed(goal, tick_result.message, metadata=tick_result.metadata)
                     return
                 if tick_result.status == NavigationStatus.PLANNING:
-                    self._stop_sport_motion()
+                    self._stop_official_motion()
                     with self._navigation_lock:
                         self._official_navigation_state = NavigationState(
                             current_goal_id=goal.goal_id,
@@ -2531,7 +2825,7 @@ class Go2DataPlaneRuntime:
                     time.sleep(self.config.official.control_loop_interval_sec)
                     continue
 
-                code = self._official_sport_client.Move(
+                code = self._send_official_motion_command(
                     float(tick_result.linear_x_mps),
                     0.0,
                     float(tick_result.angular_z_rps),
@@ -2552,7 +2846,7 @@ class Go2DataPlaneRuntime:
                     )
                 time.sleep(self.config.official.control_loop_interval_sec)
 
-            self._stop_sport_motion()
+            self._stop_official_motion()
         except Exception:
             LOGGER.exception("执行 Go2 官方运动导航失败。")
             self._set_official_navigation_failed(goal, "执行 Go2 官方运动导航时发生异常。")
@@ -2568,7 +2862,7 @@ class Go2DataPlaneRuntime:
         *,
         metadata: Optional[Dict[str, object]] = None,
     ) -> None:
-        self._stop_sport_motion()
+        self._stop_official_motion()
         failure_metadata = {"backend": "official_grid_navigation"}
         if metadata:
             failure_metadata.update(dict(metadata))
@@ -2779,13 +3073,18 @@ class Go2DataPlaneRuntime:
         if center_pose is None:
             return []
 
-        radius = request.radius_m or self.config.exploration.sample_radius_m
+        frontier_search_radius = self._resolve_frontier_search_radius(request)
+        ring_radius = float(
+            request.radius_m
+            if request.radius_m is not None
+            else self.config.exploration.sample_radius_m
+        )
         cost_map = self.get_cost_map()
         occupancy_grid = self.get_occupancy_grid()
         attempted_items = tuple(attempted_poses or [])
 
         if (
-            request.strategy.strip().lower() == "frontier"
+            self._should_prefer_frontier_candidates(strategy=request.strategy)
             and self.config.exploration.frontier_enabled
             and current_pose is not None
             and occupancy_grid is not None
@@ -2796,7 +3095,7 @@ class Go2DataPlaneRuntime:
                 cost_map=cost_map,
                 planner=self._grid_navigation_planner,
                 center_pose=center_pose,
-                radius_m=float(radius),
+                radius_m=frontier_search_radius,
                 attempted_poses=attempted_items,
             )
             if frontier_candidates:
@@ -2805,11 +3104,30 @@ class Go2DataPlaneRuntime:
         return self._build_ring_exploration_candidates(
             center_pose=center_pose,
             current_pose=current_pose,
-            radius=float(radius),
+            radius=ring_radius,
             cost_map=cost_map,
             occupancy_grid=occupancy_grid,
             attempted_poses=attempted_items,
         )
+
+    def _resolve_frontier_search_radius(self, request: ExploreAreaRequest) -> Optional[float]:
+        """解析 frontier 搜索半径。
+
+        无显式半径、也无显式探索中心时，默认做全局 frontier 搜索，
+        避免把探索错误地限制在机器人附近的固定圆域。
+        """
+
+        if request.radius_m is not None:
+            return max(0.1, float(request.radius_m))
+        if request.center_pose is not None or bool(str(request.target_name or "").strip()):
+            return max(0.1, float(self.config.exploration.sample_radius_m))
+        return None
+
+    def _should_prefer_frontier_candidates(self, *, strategy: str) -> bool:
+        """判断当前探索策略是否应优先尝试前沿候选。"""
+
+        normalized = str(strategy or "").strip().lower()
+        return normalized in {"", "frontier", "coverage", "auto"}
 
     def _resolve_exploration_center_pose(
         self,
@@ -2862,14 +3180,20 @@ class Go2DataPlaneRuntime:
                 candidates.append(candidate_pose)
                 if current_pose is None or (cost_map is None and occupancy_grid is None):
                     continue
-                planned_path = self._grid_navigation_planner.plan_preview(
+                planning_outcome = self._grid_navigation_planner.plan(
                     current_pose=current_pose,
                     target_pose=candidate_pose,
                     occupancy_grid=occupancy_grid,
                     cost_map=cost_map,
                 )
-                if planned_path is None or planned_path.planning_mode != "goal":
-                    candidates.pop()
+                planned_path = planning_outcome.plan
+                if planned_path is None:
+                    if occupancy_grid is not None and not self._should_keep_soft_failed_exploration_candidate(
+                        planning_reason=planning_outcome.reason
+                    ):
+                        candidates.pop()
+                    continue
+                if planned_path.planning_mode != "goal":
                     continue
                 reachable_candidates.append((planned_path.total_distance_m, candidate_pose))
             if reachable_candidates:
@@ -2878,6 +3202,17 @@ class Go2DataPlaneRuntime:
             if candidates:
                 return candidates
         return []
+
+    def _should_keep_soft_failed_exploration_candidate(self, *, planning_reason: str) -> bool:
+        """判断探索候选是否应在软失败预检场景下保留。"""
+
+        return str(planning_reason or "").strip().lower() in {
+            "frame_mismatch",
+            "map_unavailable",
+            "start_out_of_bounds",
+            "no_horizon_target",
+            "target_out_of_bounds",
+        }
 
     def _make_exploration_pose(self, *, center_pose: Pose, x: float, y: float) -> Pose:
         return Pose(

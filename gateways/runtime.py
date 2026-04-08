@@ -300,21 +300,6 @@ class GatewayRuntime:
         except Exception:
             pass
         try:
-            if self.mapping_service.is_available():
-                self.mapping_service.refresh()
-        except Exception:
-            pass
-        try:
-            if self.navigation_service.is_navigation_available():
-                self.navigation_service.refresh_navigation()
-        except Exception:
-            pass
-        try:
-            if self.navigation_service.is_exploration_available():
-                self.navigation_service.refresh_exploration()
-        except Exception:
-            pass
-        try:
             if self.perception_video_runtime.should_auto_start():
                 self.perception_video_runtime.start()
         except Exception:
@@ -1011,6 +996,23 @@ class GatewayRuntime:
                 output_schema=_schema_object({"code": {"type": "integer"}, "result": {"type": "object"}}),
                 exposed_to_agent=False,
             ),
+            _descriptor(
+                "set_obstacle_avoidance",
+                "设置实时避障",
+                "开启或关闭 Go2 官方实时避障服务。开启后，Go2 官方导航执行环会改走 obstacles_avoid 服务链路。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object({"enabled": {"type": "boolean"}}, required=("enabled",)),
+                output_schema=_schema_object(
+                    {
+                        "obstacle_avoidance_enabled": {"type": "boolean"},
+                        "backend_ready": {"type": "boolean"},
+                        "switch_enabled": {"type": "boolean"},
+                        "remote_command_enabled": {"type": "boolean"},
+                        "control_path": {"type": "string"},
+                    }
+                ),
+            ),
         )
 
         handlers = {
@@ -1055,6 +1057,7 @@ class GatewayRuntime:
             "set_volume": self._handle_set_volume,
             "speak_text": self._handle_speak_text,
             "switch_control_mode": self._handle_switch_control_mode,
+            "set_obstacle_avoidance": self._handle_set_obstacle_avoidance,
         }
 
         for descriptor in capabilities:
@@ -1358,6 +1361,13 @@ class GatewayRuntime:
                 category=SkillCategory.ADMIN,
                 capability_name="switch_control_mode",
                 exposed_to_agent=False,
+            ),
+            SkillDescriptor(
+                name="set_obstacle_avoidance",
+                display_name="设置实时避障",
+                description="开启或关闭 Go2 官方实时避障服务；仅在 obstacles_avoid 服务就绪时才会暴露给 AI。",
+                category=SkillCategory.SYSTEM,
+                capability_name="set_obstacle_avoidance",
             ),
         )
 
@@ -1732,6 +1742,7 @@ class GatewayRuntime:
             load_history=bool(arguments.get("load_history", True)),
             reset_library=bool(arguments.get("reset_library", False)),
         )
+        self._ensure_robot_mapping_runtime_enabled(trigger="enable_memory_library")
         self._sync_perception_runtime_for_memory_state(enabled=True)
         return {
             "libraries": self.memory_service.list_memory_libraries(),
@@ -1747,6 +1758,7 @@ class GatewayRuntime:
         del requested_by
         self.memory_service.disable_memory_library()
         self._sync_perception_runtime_for_memory_state(enabled=False)
+        self._disable_robot_mapping_runtime(trigger="disable_memory_library")
         return {
             "libraries": self.memory_service.list_memory_libraries(),
             "memory_summary": self.memory_service.get_summary(),
@@ -1763,6 +1775,7 @@ class GatewayRuntime:
         delete_result = self.memory_service.delete_memory_library(library_name=library_name)
         if bool(delete_result.get("was_active")):
             self._sync_perception_runtime_for_memory_state(enabled=False)
+            self._disable_robot_mapping_runtime(trigger="delete_memory_library")
         return {
             "delete_result": delete_result,
             "libraries": self.memory_service.list_memory_libraries(),
@@ -1946,13 +1959,6 @@ class GatewayRuntime:
         center_pose = None
         if "frame_id" in arguments or "x" in arguments or "y" in arguments:
             center_pose = self._build_pose_from_arguments(arguments)
-        if target_name is None and center_pose is None:
-            raise GatewayError(
-                "explore_area 至少需要提供 target_name 或 frame_id/x/y。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
         request = ExploreAreaRequest(
             request_id=self._build_runtime_request_id("explore"),
             center_pose=center_pose,
@@ -2306,6 +2312,37 @@ class GatewayRuntime:
         code, result = self.robot.switch_mode(mode)
         return {"code": code, "result": result or {}, "mode": mode}
 
+    def _handle_set_obstacle_avoidance(
+        self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None
+    ) -> Dict[str, Any]:
+        del requested_by
+        enabled = bool(arguments.get("enabled", True))
+        data_plane = getattr(self.robot, "data_plane", None)
+        if data_plane is None or not hasattr(data_plane, "set_obstacle_avoidance_enabled"):
+            raise GatewayError("当前机器人入口不支持避障开关控制。")
+        availability_checker = getattr(data_plane, "is_obstacle_avoidance_control_available", None)
+        if callable(availability_checker) and not availability_checker():
+            raise GatewayError("Go2 官方 obstacles_avoid 服务未就绪，当前不能切换实时避障。")
+        try:
+            result = data_plane.set_obstacle_avoidance_enabled(enabled)
+        except Exception as exc:
+            raise GatewayError(f"设置实时避障失败：{exc}") from exc
+        if isinstance(result, dict):
+            return result
+        return {"obstacle_avoidance_enabled": enabled}
+
+    def _is_obstacle_avoidance_control_available(self) -> bool:
+        data_plane = getattr(self.robot, "data_plane", None)
+        if data_plane is None or not hasattr(data_plane, "set_obstacle_avoidance_enabled"):
+            return False
+        availability_checker = getattr(data_plane, "is_obstacle_avoidance_control_available", None)
+        if callable(availability_checker):
+            try:
+                return bool(availability_checker())
+            except Exception:
+                return False
+        return True
+
     def _safe_stop_robot(self, reason: Optional[str]) -> None:
         providers = getattr(self.robot, "providers", None)
         if isinstance(providers, SafetyProvider):
@@ -2406,6 +2443,8 @@ class GatewayRuntime:
         poll_interval_sec = max(0.05, poll_interval_sec)
 
         def runner(context) -> Dict[str, Any]:
+            context.update(progress=0.02, stage="prepare_exploration_runtime", message="按需准备探索建图运行时。")
+            self._ensure_robot_mapping_runtime_enabled(trigger="explore_area")
             last_context = self.navigation_service.start_exploration(request)
             context.update(
                 progress=0.05,
@@ -2553,6 +2592,37 @@ class GatewayRuntime:
             return
         if status.running:
             self.perception_video_runtime.stop()
+
+    def _ensure_robot_mapping_runtime_enabled(self, *, trigger: str) -> None:
+        data_plane = getattr(self.robot, "data_plane", None)
+        if data_plane is None:
+            return
+        ensure_mapping = getattr(data_plane, "ensure_mapping_runtime_enabled", None)
+        if not callable(ensure_mapping):
+            return
+        try:
+            ensure_mapping(reason=trigger)
+        except TypeError:
+            ensure_mapping()
+        except Exception:
+            RUNTIME_LOGGER.exception("按需启用机器人建图运行时失败 trigger=%s", trigger)
+
+    def _disable_robot_mapping_runtime(self, *, trigger: str) -> None:
+        data_plane = getattr(self.robot, "data_plane", None)
+        if data_plane is None:
+            return
+        disable_mapping = getattr(data_plane, "disable_mapping_runtime", None)
+        if not callable(disable_mapping):
+            return
+        try:
+            result = disable_mapping(reason=trigger)
+        except TypeError:
+            result = disable_mapping()
+        except Exception:
+            RUNTIME_LOGGER.exception("回收机器人建图运行时失败 trigger=%s", trigger)
+            return
+        if isinstance(result, dict) and not bool(result.get("map_available", True)):
+            self.mapping_service.clear_latest_snapshot()
 
     def _build_gateway_capability_availability(
         self,
@@ -2709,6 +2779,10 @@ class GatewayRuntime:
             "switch_control_mode": (
                 hasattr(self.robot, "switch_mode"),
                 "当前机器人入口未实现 switch_mode。",
+            ),
+            "set_obstacle_avoidance": (
+                self._is_obstacle_avoidance_control_available(),
+                "当前 Go2 官方 obstacles_avoid 服务未就绪，暂不能切换实时避障。",
             ),
             "get_robot_status": (
                 self._has_provider(StateProvider),

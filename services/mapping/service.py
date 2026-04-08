@@ -99,6 +99,11 @@ class MappingService:
 
         return self._latest_snapshot
 
+    def clear_latest_snapshot(self) -> None:
+        """清空当前最新地图快照，避免在地图已回收时继续暴露旧结果。"""
+
+        self._latest_snapshot = None
+
     def list_history(self, *, limit: Optional[int] = None) -> Tuple[MapSnapshot, ...]:
         """返回地图历史。"""
 

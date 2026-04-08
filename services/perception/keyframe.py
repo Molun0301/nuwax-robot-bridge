@@ -24,8 +24,8 @@ class PerceptionKeyframeSelector:
     默认规则采用“时间 + 位姿 + 区域/拓扑变化”的组合触发：
     1. 首帧直接进入关键帧；
     2. 位姿平移或朝向变化达到阈值时触发；
-    3. 进入新的语义区域或拓扑节点时触发；
-    4. 如果位姿几乎不变，则即使超过最大间隔也持续抑制，避免静止时重复调用视觉 API；
+    3. 进入新的语义区域或拓扑节点时，仅在缺少稳定位姿上下文时作为补充触发；
+    4. 如果位姿几乎不变，则区域/拓扑变化和最大间隔都会继续被抑制，避免静止时重复调用视觉 API；
     5. 只有在缺少位姿上下文时，才回退使用最大间隔兜底触发。
     """
 
@@ -66,6 +66,7 @@ class PerceptionKeyframeSelector:
             return KeyframeDecision(False, "below_min_interval", metadata)
 
         has_pose_context = current_pose is not None and self._last_keyframe_pose is not None
+        pose_is_static = False
         if current_pose is not None and self._last_keyframe_pose is not None:
             translation_m = self._distance(current_pose, self._last_keyframe_pose)
             yaw_delta_rad = self._yaw_delta(current_pose, self._last_keyframe_pose)
@@ -79,12 +80,33 @@ class PerceptionKeyframeSelector:
                 return KeyframeDecision(True, "pose_translation", metadata)
             if yaw_delta_rad >= self._yaw_threshold_rad:
                 return KeyframeDecision(True, "pose_rotation", metadata)
+            pose_is_static = True
 
         semantic_region_id = anchor_metadata.get("semantic_region_id")
         topo_node_id = anchor_metadata.get("topo_node_id")
         if semantic_region_id and semantic_region_id != self._last_semantic_region_id:
+            metadata.update(
+                {
+                    "anchor_change_kind": "semantic_region",
+                    "anchor_change_from": self._last_semantic_region_id,
+                    "anchor_change_to": semantic_region_id,
+                }
+            )
+            if has_pose_context and pose_is_static:
+                metadata["stationary_suppressed"] = True
+                return KeyframeDecision(False, "stationary_anchor_hold", metadata)
             return KeyframeDecision(True, "semantic_region_changed", metadata)
         if topo_node_id and topo_node_id != self._last_topo_node_id:
+            metadata.update(
+                {
+                    "anchor_change_kind": "topology_node",
+                    "anchor_change_from": self._last_topo_node_id,
+                    "anchor_change_to": topo_node_id,
+                }
+            )
+            if has_pose_context and pose_is_static:
+                metadata["stationary_suppressed"] = True
+                return KeyframeDecision(False, "stationary_anchor_hold", metadata)
             return KeyframeDecision(True, "topology_node_changed", metadata)
 
         if elapsed_sec >= self._max_interval_sec:

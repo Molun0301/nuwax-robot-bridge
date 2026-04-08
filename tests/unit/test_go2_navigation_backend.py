@@ -354,7 +354,7 @@ def test_go2_runtime_exploration_candidates_skip_path_unreachable_points() -> No
     )
 
     assert candidates
-    assert all(candidate.position.x <= 0.1 for candidate in candidates)
+    assert all(candidate.position.x >= -0.1 for candidate in candidates)
 
 
 def test_frontier_explorer_prefers_reachable_frontier_cluster() -> None:
@@ -398,3 +398,123 @@ def test_frontier_explorer_prefers_reachable_frontier_cluster() -> None:
 
     assert candidates
     assert all(candidate.pose.position.x <= 1.0 for candidate in candidates)
+
+
+def test_frontier_explorer_uses_global_search_when_radius_is_not_explicit() -> None:
+    planner = Go2GridNavigationPlanner(
+        Go2NavigationBackendConfig(
+            planner_inflation_radius_m=0.0,
+            planning_horizon_margin_m=0.2,
+        )
+    )
+    explorer = Go2FrontierExplorer(
+        Go2ExplorationConfig(
+            enabled=True,
+            frontier_enabled=True,
+            frontier_min_cluster_cells=3,
+            frontier_revisit_separation_m=0.4,
+            max_goal_cost=75.0,
+        )
+    )
+
+    free_cells = {(row, col) for row in range(8, 15) for col in range(8, 15)}
+    free_cells.update({(row, col) for row in range(10, 13) for col in range(15, 23)})
+    blocked_cells = {(7, col) for col in range(7, 16)}
+    blocked_cells.update({(15, col) for col in range(7, 16)})
+    blocked_cells.update({(row, 7) for row in range(7, 16)})
+    blocked_cells.update({(row, 15) for row in range(7, 16) if row not in {10, 11, 12}})
+    blocked_cells.update({(9, col) for col in range(15, 23)})
+    blocked_cells.update({(13, col) for col in range(15, 23)})
+
+    occupancy, cost_map = _build_partial_maps(
+        width=32,
+        height=24,
+        resolution_m=0.5,
+        origin_x=-8.0,
+        origin_y=-6.0,
+        free_cells=free_cells,
+        blocked_cells=blocked_cells,
+    )
+    current_pose = _build_pose(x=-2.25, y=-0.25)
+
+    local_candidates = explorer.select_candidates(
+        current_pose=current_pose,
+        occupancy_grid=occupancy,
+        cost_map=cost_map,
+        planner=planner,
+        center_pose=current_pose,
+        radius_m=1.5,
+        attempted_poses=(),
+    )
+    global_candidates = explorer.select_candidates(
+        current_pose=current_pose,
+        occupancy_grid=occupancy,
+        cost_map=cost_map,
+        planner=planner,
+        center_pose=current_pose,
+        radius_m=None,
+        attempted_poses=(),
+    )
+
+    assert local_candidates == []
+    assert global_candidates
+    assert math.hypot(
+        global_candidates[0].pose.position.x - current_pose.position.x,
+        global_candidates[0].pose.position.y - current_pose.position.y,
+    ) > 1.5
+
+
+def test_go2_data_plane_frontier_exploration_without_radius_uses_global_search() -> None:
+    runtime = Go2DataPlaneRuntime(
+        Go2DataPlaneConfig(
+            enabled=True,
+            exploration=Go2ExplorationConfig(
+                enabled=True,
+                sample_radius_m=1.5,
+                sample_count=8,
+                frontier_min_cluster_cells=3,
+                max_goal_cost=75.0,
+            ),
+            navigation=Go2NavigationBackendConfig(
+                planner_inflation_radius_m=0.0,
+                planning_horizon_margin_m=0.2,
+            ),
+        ),
+        bridge=_StaticBridge(),
+    )
+    runtime._official_sport_ready = True
+
+    free_cells = {(row, col) for row in range(8, 15) for col in range(8, 15)}
+    free_cells.update({(row, col) for row in range(10, 13) for col in range(15, 23)})
+    blocked_cells = {(7, col) for col in range(7, 16)}
+    blocked_cells.update({(15, col) for col in range(7, 16)})
+    blocked_cells.update({(row, 7) for row in range(7, 16)})
+    blocked_cells.update({(row, 15) for row in range(7, 16) if row not in {10, 11, 12}})
+    blocked_cells.update({(9, col) for col in range(15, 23)})
+    blocked_cells.update({(13, col) for col in range(15, 23)})
+    occupancy, cost_map = _build_partial_maps(
+        width=32,
+        height=24,
+        resolution_m=0.5,
+        origin_x=-8.0,
+        origin_y=-6.0,
+        free_cells=free_cells,
+        blocked_cells=blocked_cells,
+    )
+    current_pose = _build_pose(x=-2.25, y=-0.25)
+    runtime.get_current_pose = lambda: current_pose
+    runtime.get_occupancy_grid = lambda: occupancy
+    runtime.get_cost_map = lambda: cost_map
+
+    candidates = runtime._build_exploration_candidates(
+        ExploreAreaRequest(
+            request_id="explore_global_frontier",
+            strategy="frontier",
+        )
+    )
+
+    assert candidates
+    assert math.hypot(
+        candidates[0].position.x - current_pose.position.x,
+        candidates[0].position.y - current_pose.position.y,
+    ) > 1.5

@@ -287,8 +287,11 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_localization_latest(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
         snapshot = runtime.localization_service.get_latest_snapshot()
-        if snapshot is None and runtime.localization_service.is_available():
-            snapshot = await run_in_threadpool(runtime.localization_service.refresh)
+        if runtime.localization_service.is_available():
+            try:
+                snapshot = await run_in_threadpool(runtime.localization_service.refresh)
+            except Exception:
+                pass
         return {"localization_snapshot": to_jsonable(snapshot)}
 
     @router.get("/api/localization/history")
@@ -300,8 +303,11 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     async def api_maps_latest(request: Request) -> Dict[str, Any]:
         access_manager.authenticate_http(request)
         snapshot = runtime.mapping_service.get_latest_snapshot()
-        if snapshot is None and runtime.mapping_service.is_available():
-            snapshot = await run_in_threadpool(runtime.mapping_service.refresh)
+        if runtime.mapping_service.is_available():
+            try:
+                snapshot = await run_in_threadpool(runtime.mapping_service.refresh)
+            except Exception:
+                pass
         return {"map_snapshot": to_jsonable(snapshot)}
 
     @router.get("/api/maps/history")
@@ -314,10 +320,16 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         access_manager.authenticate_http(request)
         navigation_context = runtime.navigation_service.get_latest_navigation_context()
         exploration_context = runtime.navigation_service.get_latest_exploration_context()
-        if navigation_context is None and runtime.navigation_service.is_navigation_available():
-            navigation_context = await run_in_threadpool(runtime.navigation_service.refresh_navigation)
-        if exploration_context is None and runtime.navigation_service.is_exploration_available():
-            exploration_context = await run_in_threadpool(runtime.navigation_service.refresh_exploration)
+        if runtime.navigation_service.is_navigation_available():
+            try:
+                navigation_context = await run_in_threadpool(runtime.navigation_service.refresh_navigation)
+            except Exception:
+                pass
+        if runtime.navigation_service.is_exploration_available():
+            try:
+                exploration_context = await run_in_threadpool(runtime.navigation_service.refresh_exploration)
+            except Exception:
+                pass
         return {
             "navigation_context": to_jsonable(navigation_context),
             "exploration_context": to_jsonable(exploration_context),

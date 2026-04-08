@@ -165,7 +165,7 @@ class Go2OfficialBackendConfig:
     """Go2 官方 DDS / RPC 数据面配置。"""
 
     enabled: bool = True
-    auto_start_services: bool = True
+    auto_start_services: bool = False
     service_names: Tuple[str, ...] = (
         "unitree_lidar",
         "unitree_lidar_slam",
@@ -178,6 +178,7 @@ class Go2OfficialBackendConfig:
     control_loop_interval_sec: float = 0.1
     max_linear_velocity_mps: float = 0.35
     max_yaw_rate_rps: float = 0.8
+    obstacle_avoidance_default_enabled: bool = True
 
 
 @dataclass
@@ -188,7 +189,7 @@ class Go2NavigationBackendConfig:
     occupancy_lethal_threshold: int = 65
     lethal_cost_threshold: float = 90.0
     unknown_cell_cost: float = 55.0
-    planner_inflation_radius_m: float = 0.18
+    planner_inflation_radius_m: float = 0.05
     planning_horizon_margin_m: float = 0.60
     lookahead_distance_m: float = 0.80
     obstacle_check_distance_m: float = 1.00
@@ -201,6 +202,10 @@ class Go2NavigationBackendConfig:
     rotate_in_place_heading_rad: float = 0.95
     heading_slowdown_rad: float = 1.20
     yaw_gain: float = 1.35
+    path_resample_spacing_m: float = 0.0
+    path_smoothing_window: int = 0
+    path_mask_robot_width_m: float = 0.0
+    path_mask_max_occupied_ratio: float = 0.05
 
 
 @dataclass
@@ -218,7 +223,7 @@ class Go2MapSynthesisConfig:
     semantic_threshold: float = 0.55
     semantic_min_cells: int = 25
     global_map_enabled: bool = True
-    global_map_resolution_m: float = 0.20
+    global_map_resolution_m: float = 0.05
     global_map_update_interval_sec: float = 0.75
     global_map_max_width: int = 600
     global_map_max_height: int = 600
@@ -227,6 +232,26 @@ class Go2MapSynthesisConfig:
     global_map_free_log_odds_delta: float = 0.35
     global_map_log_odds_min: float = -4.0
     global_map_log_odds_max: float = 4.0
+    global_map_occupied_log_odds_threshold: float = 0.75
+    global_map_inflation_radius_m: float = 0.05
+    navigation_map_strategy: str = "mixed"
+    navigation_smooth_min_neighbor_fraction: float = 0.4
+    navigation_gradient_max_distance_m: float = 1.5
+    local_map_enabled: bool = True
+    local_map_resolution_m: float = 0.05
+    local_map_width: int = 200
+    local_map_height: int = 200
+    local_map_update_interval_sec: float = 0.5
+    local_map_max_scans: int = 12
+    local_map_max_scan_age_sec: float = 20.0
+    local_map_min_obstacle_height_m: float = -0.20
+    local_map_max_obstacle_height_m: float = 1.20
+    local_map_max_range_m: float = 8.0
+    local_map_inflation_radius_m: float = 0.05
+    lidar_offset_x_m: float = 0.0
+    lidar_offset_y_m: float = 0.0
+    lidar_offset_z_m: float = 0.0
+    lidar_yaw_offset_rad: float = 0.0
 
 
 @dataclass
@@ -248,12 +273,12 @@ class Go2CostMapperConfig:
     enabled: bool = True
     width: int = 200
     height: int = 200
-    resolution_m: float = 0.10
+    resolution_m: float = 0.05
     frame_id: str = "odom"
     height_diff_threshold_m: float = 0.10
     max_height_m: float = 1.20
     min_height_m: float = -0.20
-    obstacle_inflation_radius_m: float = 0.35
+    obstacle_inflation_radius_m: float = 0.05
     traversability_threshold: float = 0.55
     max_gradient_rad: float = 0.75
 
@@ -398,7 +423,7 @@ def load_go2_data_plane_config() -> Go2DataPlaneConfig:
         ),
         official=Go2OfficialBackendConfig(
             enabled=_cfg_bool("GO2_OFFICIAL_BACKEND_ENABLED", True),
-            auto_start_services=_cfg_bool("GO2_OFFICIAL_SERVICES_AUTO_START", True),
+            auto_start_services=_cfg_bool("GO2_OFFICIAL_SERVICES_AUTO_START", False),
             service_names=_cfg_csv(
                 "GO2_OFFICIAL_SERVICE_NAMES",
                 (
@@ -414,13 +439,17 @@ def load_go2_data_plane_config() -> Go2DataPlaneConfig:
             control_loop_interval_sec=max(0.05, _cfg_float("GO2_OFFICIAL_CONTROL_LOOP_INTERVAL_SEC", 0.1)),
             max_linear_velocity_mps=max(0.05, _cfg_float("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", 0.35)),
             max_yaw_rate_rps=max(0.1, _cfg_float("GO2_OFFICIAL_MAX_YAW_RATE_RPS", 0.8)),
+            obstacle_avoidance_default_enabled=_cfg_bool(
+                "GO2_OFFICIAL_OBSTACLE_AVOIDANCE_DEFAULT_ENABLED",
+                True,
+            ),
         ),
         navigation=Go2NavigationBackendConfig(
             enabled=_cfg_bool("GO2_NAVIGATION_BACKEND_ENABLED", True),
             occupancy_lethal_threshold=max(1, min(100, _cfg_int("GO2_NAVIGATION_OCCUPANCY_LETHAL_THRESHOLD", 65))),
             lethal_cost_threshold=max(1.0, min(100.0, _cfg_float("GO2_NAVIGATION_LETHAL_COST_THRESHOLD", 90.0))),
             unknown_cell_cost=max(0.0, min(100.0, _cfg_float("GO2_NAVIGATION_UNKNOWN_CELL_COST", 55.0))),
-            planner_inflation_radius_m=max(0.0, _cfg_float("GO2_NAVIGATION_PLANNER_INFLATION_RADIUS_M", 0.18)),
+            planner_inflation_radius_m=max(0.0, _cfg_float("GO2_NAVIGATION_PLANNER_INFLATION_RADIUS_M", 0.05)),
             planning_horizon_margin_m=max(0.05, _cfg_float("GO2_NAVIGATION_PLANNING_HORIZON_MARGIN_M", 0.60)),
             lookahead_distance_m=max(0.2, _cfg_float("GO2_NAVIGATION_LOOKAHEAD_DISTANCE_M", 0.80)),
             obstacle_check_distance_m=max(0.2, _cfg_float("GO2_NAVIGATION_OBSTACLE_CHECK_DISTANCE_M", 1.00)),
@@ -446,7 +475,7 @@ def load_go2_data_plane_config() -> Go2DataPlaneConfig:
             semantic_threshold=max(0.0, min(1.0, _cfg_float("GO2_DATA_PLANE_SEMANTIC_THRESHOLD", 0.55))),
             semantic_min_cells=max(1, _cfg_int("GO2_DATA_PLANE_SEMANTIC_MIN_CELLS", 25)),
             global_map_enabled=_cfg_bool("GO2_DATA_PLANE_GLOBAL_MAP_ENABLED", True),
-            global_map_resolution_m=max(0.05, _cfg_float("GO2_DATA_PLANE_GLOBAL_MAP_RESOLUTION_M", 0.20)),
+            global_map_resolution_m=max(0.05, _cfg_float("GO2_DATA_PLANE_GLOBAL_MAP_RESOLUTION_M", 0.05)),
             global_map_update_interval_sec=max(
                 0.05,
                 _cfg_float("GO2_DATA_PLANE_GLOBAL_MAP_UPDATE_INTERVAL_SEC", 0.75),
@@ -470,10 +499,10 @@ def load_go2_data_plane_config() -> Go2DataPlaneConfig:
             ),
             global_map_inflation_radius_m=max(
                 0.0,
-                _cfg_float("GO2_DATA_PLANE_GLOBAL_MAP_INFLATION_RADIUS_M", 0.25),
+                _cfg_float("GO2_DATA_PLANE_GLOBAL_MAP_INFLATION_RADIUS_M", 0.05),
             ),
             local_map_enabled=_cfg_bool("GO2_DATA_PLANE_LOCAL_MAP_ENABLED", True),
-            local_map_resolution_m=max(0.02, _cfg_float("GO2_DATA_PLANE_LOCAL_MAP_RESOLUTION_M", 0.10)),
+            local_map_resolution_m=max(0.02, _cfg_float("GO2_DATA_PLANE_LOCAL_MAP_RESOLUTION_M", 0.05)),
             local_map_width=max(20, _cfg_int("GO2_DATA_PLANE_LOCAL_MAP_WIDTH", 200)),
             local_map_height=max(20, _cfg_int("GO2_DATA_PLANE_LOCAL_MAP_HEIGHT", 200)),
             local_map_update_interval_sec=max(0.05, _cfg_float("GO2_DATA_PLANE_LOCAL_MAP_UPDATE_INTERVAL_SEC", 0.5)),
@@ -487,7 +516,7 @@ def load_go2_data_plane_config() -> Go2DataPlaneConfig:
             local_map_max_range_m=max(0.5, _cfg_float("GO2_DATA_PLANE_LOCAL_MAP_MAX_RANGE_M", 8.0)),
             local_map_inflation_radius_m=max(
                 0.0,
-                _cfg_float("GO2_DATA_PLANE_LOCAL_MAP_INFLATION_RADIUS_M", 0.25),
+                _cfg_float("GO2_DATA_PLANE_LOCAL_MAP_INFLATION_RADIUS_M", 0.05),
             ),
             lidar_offset_x_m=_cfg_float("GO2_DATA_PLANE_LIDAR_OFFSET_X_M", 0.0),
             lidar_offset_y_m=_cfg_float("GO2_DATA_PLANE_LIDAR_OFFSET_Y_M", 0.0),
@@ -506,12 +535,12 @@ def load_go2_data_plane_config() -> Go2DataPlaneConfig:
             enabled=_cfg_bool("GO2_COST_MAPPER_ENABLED", True),
             width=max(20, _cfg_int("GO2_COST_MAPPER_WIDTH", 200)),
             height=max(20, _cfg_int("GO2_COST_MAPPER_HEIGHT", 200)),
-            resolution_m=max(0.02, _cfg_float("GO2_COST_MAPPER_RESOLUTION_M", 0.10)),
+            resolution_m=max(0.02, _cfg_float("GO2_COST_MAPPER_RESOLUTION_M", 0.05)),
             frame_id=_cfg_str("GO2_COST_MAPPER_FRAME_ID", "odom"),
             height_diff_threshold_m=max(0.01, _cfg_float("GO2_COST_MAPPER_HEIGHT_DIFF_THRESHOLD_M", 0.10)),
             max_height_m=_cfg_float("GO2_COST_MAPPER_MAX_HEIGHT_M", 1.20),
             min_height_m=_cfg_float("GO2_COST_MAPPER_MIN_HEIGHT_M", -0.20),
-            obstacle_inflation_radius_m=max(0.05, _cfg_float("GO2_COST_MAPPER_OBSTACLE_INFLATION_RADIUS_M", 0.35)),
+            obstacle_inflation_radius_m=max(0.05, _cfg_float("GO2_COST_MAPPER_OBSTACLE_INFLATION_RADIUS_M", 0.05)),
             traversability_threshold=max(0.1, min(1.0, _cfg_float("GO2_COST_MAPPER_TRAVERSABILITY_THRESHOLD", 0.55))),
             max_gradient_rad=max(0.1, _cfg_float("GO2_COST_MAPPER_MAX_GRADIENT_RAD", 0.75)),
         ),

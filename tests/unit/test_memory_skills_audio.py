@@ -658,6 +658,62 @@ def test_memory_service_can_query_locations_and_semantic_entries(tmp_path: Path)
     assert resolved.name == "补给点"
 
 
+def test_memory_service_refreshes_live_pose_before_writing_scene_memory(tmp_path: Path) -> None:
+    """写场景记忆时应优先绑定最新位姿，而不是沿用启动时缓存。"""
+
+    stack = _build_memory_stack(tmp_path)
+    providers = stack["providers"]
+    observation_service = stack["observation_service"]
+    perception_service = stack["perception_service"]
+    memory_service = stack["memory_service"]
+
+    observation_service.capture_observation(camera_id="front_camera")
+    perception_service.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+    providers.current_pose = Pose(
+        frame_id="map",
+        position=Vector3(x=2.4, y=1.1, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+
+    memory_entry = memory_service.remember_current_scene(
+        title="移动后场景记录",
+        camera_id="front_camera",
+        metadata={"source": "unit_test"},
+    )
+
+    assert memory_entry.pose is not None
+    assert memory_entry.pose.position.x == pytest.approx(2.4)
+    assert memory_entry.pose.position.y == pytest.approx(1.1)
+
+
+def test_memory_service_can_restore_latest_library_after_restart(tmp_path: Path) -> None:
+    """重建服务后应能自动恢复最近一次使用的命名记忆库。"""
+
+    first_stack = _build_memory_stack(
+        tmp_path,
+        activate_memory=True,
+        library_name="自动恢复测试库",
+    )
+    first_memory = first_stack["memory_service"]
+
+    assert first_memory.is_enabled() is True
+
+    second_stack = _build_memory_stack(
+        tmp_path,
+        activate_memory=False,
+    )
+    second_memory = second_stack["memory_service"]
+
+    assert second_memory.is_enabled() is False
+
+    restored_summary = second_memory.restore_latest_memory_library(load_history=True)
+
+    assert restored_summary is not None
+    assert second_memory.is_enabled() is True
+    assert second_memory.get_summary().metadata["active_library_name"] == "自动恢复测试库"
+    assert second_memory.list_memory_libraries()[0]["active"] is True
+
+
 def test_memory_service_persists_vector_memories_across_restart(tmp_path: Path) -> None:
     """向量记忆库应在服务重建后保留地点、语义记忆和对象实例。"""
 

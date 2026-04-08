@@ -265,6 +265,20 @@ class MemoryService:
             "active": resolved_name == self._active_library_name,
         }
 
+    def restore_latest_memory_library(self, *, load_history: bool = True) -> Optional[Dict[str, object]]:
+        """自动恢复最近一次更新的命名记忆库。"""
+
+        if self.is_enabled():
+            return self.get_summary().model_dump(mode="json")
+        libraries = self._repository.load_memory_libraries()
+        if not libraries:
+            return None
+        return self.activate_memory_library(
+            library_name=libraries[0].library_name,
+            load_history=load_history,
+            reset_library=False,
+        )
+
     def disable_memory_library(self) -> Dict[str, object]:
         """停用当前记忆库，并清空激活态缓存。"""
 
@@ -2481,36 +2495,40 @@ class MemoryService:
 
     def _get_current_pose(self) -> Optional[Pose]:
         snapshot = self._localization_service.get_latest_snapshot()
+        if self._localization_service.is_available():
+            try:
+                snapshot = self._localization_service.refresh()
+            except GatewayError:
+                pass
         if snapshot is not None and snapshot.current_pose is not None:
             return snapshot.current_pose
-        if self._localization_service.is_available():
-            refreshed = self._localization_service.refresh()
-            return refreshed.current_pose
         return None
 
     def _get_or_refresh_localization(self, *, allow_missing: bool = False):
         snapshot = self._localization_service.get_latest_snapshot()
+        if self._localization_service.is_available():
+            try:
+                snapshot = self._localization_service.refresh()
+            except GatewayError:
+                pass
         if snapshot is not None:
             return snapshot
-        if self._localization_service.is_available():
-            return self._localization_service.refresh()
         if allow_missing:
             return None
         raise GatewayError("当前没有可用定位结果。")
 
     def _get_map_snapshot(self):
         snapshot = self._mapping_service.get_latest_snapshot()
-        if snapshot is not None:
-            self._refresh_semantic_map_context(snapshot)
-            return snapshot
         if self._mapping_service.is_available():
             try:
                 snapshot = self._mapping_service.refresh()
             except GatewayError as exc:
-                if "地图快照至少需要包含 occupancy_grid、cost_map、semantic_map 之一。" not in str(exc):
+                if snapshot is None and "地图快照至少需要包含 occupancy_grid、cost_map、semantic_map 之一。" not in str(exc):
                     raise
-                self._refresh_semantic_map_context(None)
-                return None
+                if snapshot is None:
+                    self._refresh_semantic_map_context(None)
+                    return None
+        if snapshot is not None:
             self._refresh_semantic_map_context(snapshot)
             return snapshot
         return None

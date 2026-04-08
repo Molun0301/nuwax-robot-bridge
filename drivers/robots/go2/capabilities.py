@@ -108,7 +108,6 @@ GO2_CAPABILITY_DESCRIPTORS = (
     _descriptor("hand_stand", "倒立", "切换倒立状态。", risk_level=CapabilityRiskLevel.HIGH),
     _descriptor("free_jump", "自由跳跃", "切换自由跳跃模式。", risk_level=CapabilityRiskLevel.HIGH),
     _descriptor("free_bound", "自由弹跳", "切换自由弹跳模式。", risk_level=CapabilityRiskLevel.HIGH),
-    _descriptor("free_avoid", "自主避障", "切换自主避障模式。", risk_level=CapabilityRiskLevel.MEDIUM),
     _descriptor("walk_upright", "直立行走", "切换直立行走模式。", risk_level=CapabilityRiskLevel.HIGH),
     _descriptor("cross_step", "交叉步", "切换交叉步模式。", risk_level=CapabilityRiskLevel.HIGH),
     _descriptor("switch_joystick", "切换遥杆模式", "开启或关闭遥杆模式。", risk_level=CapabilityRiskLevel.MEDIUM),
@@ -176,18 +175,6 @@ GO2_SPORT_COMMAND_SPECS = (
         "free_bound",
         "自由弹跳",
         "切换自由弹跳模式。",
-        params_schema={
-            "flag": {
-                "type": "boolean",
-                "default": True,
-                "description": "true 表示进入或开启；false 表示退出或关闭。",
-            }
-        },
-    ),
-    Go2SportCommandSpec(
-        "free_avoid",
-        "自主避障",
-        "切换自主避障模式。",
         params_schema={
             "flag": {
                 "type": "boolean",
