@@ -310,7 +310,7 @@ def test_navigation_session_uses_local_horizon_when_goal_is_outside_map() -> Non
     assert tick.metadata["planning_mode"] == "local_horizon"
 
 
-def test_go2_runtime_exploration_candidates_skip_path_unreachable_points() -> None:
+def test_go2_runtime_exploration_candidates_return_empty_without_frontier_candidates() -> None:
     runtime = Go2DataPlaneRuntime(
         Go2DataPlaneConfig(
             enabled=True,
@@ -353,8 +353,7 @@ def test_go2_runtime_exploration_candidates_skip_path_unreachable_points() -> No
         )
     )
 
-    assert candidates
-    assert all(candidate.position.x >= -0.1 for candidate in candidates)
+    assert candidates == []
 
 
 def test_frontier_explorer_prefers_reachable_frontier_cluster() -> None:

@@ -17,11 +17,14 @@ from gateways.mcp.protocol import build_mcp_router
 from gateways.relay.server import create_relay_app
 from gateways.runtime import GatewayRuntime, create_default_gateway_runtime
 from gateways.ws.events import build_event_router
+from logging_utils import LogRateLimiter
 from settings import NuwaxRobotBridgeConfig, configure_logging, load_config
 
 
 APP_LOGGER = logging.getLogger("nuwax_robot_bridge.gateway")
 HTTP_LOGGER = logging.getLogger("nuwax_robot_bridge.http")
+_LOW_VALUE_HTTP_PATHS = frozenset(("/api/health", "/events/stream", "/ops"))
+_REQUEST_LOG_RATE_LIMIT_SEC = 30.0
 
 
 def _resolve_client_host(request: Request) -> str:
@@ -33,6 +36,12 @@ def _resolve_client_host(request: Request) -> str:
     return "-"
 
 
+def _should_rate_limit_http_request(path: str, status_code: int) -> bool:
+    if status_code >= 400:
+        return False
+    return path in _LOW_VALUE_HTTP_PATHS
+
+
 def create_gateway_app(
     runtime: GatewayRuntime,
     config: NuwaxRobotBridgeConfig,
@@ -42,6 +51,7 @@ def create_gateway_app(
     """创建宿主机网关应用。"""
 
     access_manager = GatewayAccessManager(config.gateway)
+    request_log_limiter = LogRateLimiter()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -71,23 +81,42 @@ def create_gateway_app(
         except Exception:
             duration_ms = (time.perf_counter() - start_at) * 1000.0
             HTTP_LOGGER.exception(
-                "HTTP 请求异常 method=%s path=%s client=%s duration_ms=%.2f",
-                method,
-                path,
-                client_host,
-                duration_ms,
+                "HTTP 请求异常",
+                extra={
+                    "event": "http.request.failed",
+                    "method": method,
+                    "path": path,
+                    "client_ip": client_host,
+                    "duration_ms": duration_ms,
+                },
             )
             raise
 
         duration_ms = (time.perf_counter() - start_at) * 1000.0
-        HTTP_LOGGER.info(
-            "HTTP 请求完成 method=%s path=%s status=%s client=%s duration_ms=%.2f",
-            method,
-            path,
-            response.status_code,
-            client_host,
-            duration_ms,
-        )
+        level = logging.INFO
+        if response.status_code >= 500:
+            level = logging.ERROR
+        elif response.status_code >= 400:
+            level = logging.WARNING
+        extra = {
+            "event": "http.request.completed",
+            "method": method,
+            "path": path,
+            "status_code": response.status_code,
+            "client_ip": client_host,
+            "duration_ms": duration_ms,
+        }
+        if _should_rate_limit_http_request(path, response.status_code):
+            request_log_limiter.log(
+                HTTP_LOGGER,
+                level,
+                "HTTP 请求完成",
+                key=("http_request", method, path, response.status_code),
+                interval_sec=_REQUEST_LOG_RATE_LIMIT_SEC,
+                extra=extra,
+            )
+        else:
+            HTTP_LOGGER.log(level, "HTTP 请求完成", extra=extra)
         return response
 
     @app.exception_handler(GatewayError)

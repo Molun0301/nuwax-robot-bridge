@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from gateways.relay.server import create_relay_app
+from logging_utils import ContextAwareFormatter, LogRateLimiter
 from settings import LoggingConfig, RelayServerConfig, configure_logging, load_config
 
 
@@ -74,4 +75,108 @@ def test_configure_logging_writes_file_and_request_log(tmp_path: Path) -> None:
 
     content = log_file.read_text(encoding="utf-8")
     assert "Relay 请求完成" in content
+    assert "[nuwax_robot_bridge.relay]" in content
+    assert "event=relay.request.completed" in content
     assert "path=/relay/health" in content
+
+
+def test_context_aware_formatter_appends_extra_fields() -> None:
+    """统一 formatter 应把扩展字段稳定追加到日志末尾。"""
+
+    formatter = ContextAwareFormatter("%(levelname)s %(message)s")
+    record = logging.makeLogRecord(
+        {
+            "name": "nuwax_robot_bridge.test",
+            "levelno": logging.INFO,
+            "levelname": "INFO",
+            "msg": "日志测试",
+            "args": (),
+            "event": "test.logging",
+            "path": "/api/health",
+            "duration_ms": 12.345,
+        }
+    )
+
+    rendered = formatter.format(record)
+
+    assert rendered.startswith("INFO 日志测试")
+    assert "event=test.logging" in rendered
+    assert "path=/api/health" in rendered
+    assert "duration_ms=12.345" in rendered
+
+
+def test_log_rate_limiter_suppresses_repeated_logs() -> None:
+    """重复日志应在时间窗内被压制，并在下一次放行时回填 suppressed 统计。"""
+
+    class _ListHandler(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.records = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.records.append(record)
+
+    now = {"value": 0.0}
+    limiter = LogRateLimiter(clock=lambda: now["value"])
+    logger = logging.getLogger("nuwax_robot_bridge.test.rate_limit")
+    handler = _ListHandler()
+    previous_handlers = list(logger.handlers)
+    previous_level = logger.level
+    previous_propagate = logger.propagate
+    logger.handlers = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    try:
+        limiter.log(logger, logging.INFO, "重复日志测试", key="same", interval_sec=5.0, extra={"event": "test.rate"})
+        limiter.log(logger, logging.INFO, "重复日志测试", key="same", interval_sec=5.0, extra={"event": "test.rate"})
+        now["value"] = 6.0
+        limiter.log(logger, logging.INFO, "重复日志测试", key="same", interval_sec=5.0, extra={"event": "test.rate"})
+    finally:
+        logger.handlers = previous_handlers
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
+
+    assert len(handler.records) == 2
+    assert getattr(handler.records[0], "event") == "test.rate"
+    assert getattr(handler.records[1], "suppressed_count") == 1
+    assert getattr(handler.records[1], "rate_limit_window_sec") == 5.0
+
+
+def test_relay_health_log_is_rate_limited(tmp_path: Path) -> None:
+    """高频健康检查日志应被限流，避免重复刷屏。"""
+
+    log_dir = tmp_path / "logs"
+    log_file = log_dir / "runtime.log"
+    configure_logging(
+        LoggingConfig(
+            log_dir=str(log_dir),
+            log_file=str(log_file),
+            level="INFO",
+            max_lines=1000,
+            trim_check_interval=10,
+        )
+    )
+
+    app = create_relay_app(
+        RelayServerConfig(
+            enabled=True,
+            host="127.0.0.1",
+            port=9766,
+            upstream_base_url="http://example.invalid",
+            incoming_tokens=("relay-token",),
+            upstream_token="agent-token",
+        )
+    )
+
+    with TestClient(app) as client:
+        assert client.get("/relay/health").status_code == 200
+        assert client.get("/relay/health").status_code == 200
+
+    for handler in logging.getLogger().handlers:
+        flush = getattr(handler, "flush", None)
+        if callable(flush):
+            flush()
+
+    content = log_file.read_text(encoding="utf-8")
+    assert content.count("Relay 请求完成") == 1

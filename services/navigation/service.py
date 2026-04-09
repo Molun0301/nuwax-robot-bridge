@@ -4,13 +4,15 @@ from collections import deque
 import time
 
 from contracts.events import RuntimeEventCategory
+from contracts.map_workspace import MapAssetStatus
+from contracts.runtime_views import LocalizationSessionStatus
 from contracts.navigation import ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationStatus
 from contracts.runtime_views import ExplorationContext, NavigationContext
 from core import EventBus, StateNamespace, StateStore
 from gateways.errors import GatewayError
 from providers import ExplorationProvider, NavigationProvider
 from services.localization import LocalizationService
-from services.mapping import MappingService
+from services.mapping.service import MappingService
 from typing import Deque, Optional, Tuple
 
 
@@ -81,12 +83,28 @@ class NavigationService:
                 },
                 deep=True,
             )
+        runtime_metadata = self._build_map_runtime_metadata(
+            map_name=self._current_goal.map_name if self._current_goal is not None else None,
+            existing_waiting_for=navigation_state.metadata.get("waiting_for"),
+        )
+        navigation_state = navigation_state.model_copy(
+            update={
+                "metadata": {
+                    **dict(navigation_state.metadata),
+                    **runtime_metadata,
+                }
+            },
+            deep=True,
+        )
         context = NavigationContext(
             current_goal=self._current_goal,
             navigation_state=navigation_state,
             backend_name=provider.provider_name,
             goal_reached=goal_reached,
-            metadata={"provider_version": provider.provider_version},
+            metadata={
+                "provider_version": provider.provider_version,
+                **runtime_metadata,
+            },
         )
         self._latest_navigation_context = context
         self._navigation_history.append(context)
@@ -219,11 +237,28 @@ class NavigationService:
             and previous_context.exploration_state.current_request_id is not None
         ):
             exploration_state = previous_context.exploration_state.model_copy(deep=True)
+        runtime_metadata = self._build_map_runtime_metadata(
+            map_name=self._current_explore_request.map_name if self._current_explore_request is not None else None,
+            memory_library_name=self._current_explore_request.map_name if self._current_explore_request is not None else None,
+            existing_waiting_for=exploration_state.metadata.get("waiting_for"),
+        )
+        exploration_state = exploration_state.model_copy(
+            update={
+                "metadata": {
+                    **dict(exploration_state.metadata),
+                    **runtime_metadata,
+                }
+            },
+            deep=True,
+        )
         context = ExplorationContext(
             current_request=self._current_explore_request,
             exploration_state=exploration_state,
             backend_name=provider.provider_name,
-            metadata={"provider_version": provider.provider_version},
+            metadata={
+                "provider_version": provider.provider_version,
+                **runtime_metadata,
+            },
         )
         self._latest_exploration_context = context
         self._exploration_history.append(context)
@@ -341,6 +376,55 @@ class NavigationService:
         if limit is not None:
             items = items[-max(0, limit) :]
         return tuple(items)
+
+    def _build_map_runtime_metadata(
+        self,
+        *,
+        map_name: Optional[str],
+        memory_library_name: Optional[str] = None,
+        existing_waiting_for: Optional[object] = None,
+    ) -> dict:
+        map_snapshot = self._mapping_service.get_latest_snapshot()
+        localization_session = self._localization_service.get_active_session()
+        localization_ready = bool(
+            localization_session is not None
+            and localization_session.status == LocalizationSessionStatus.READY
+            and (map_name is None or localization_session.map_name == map_name)
+        )
+        has_map = map_snapshot is not None
+        if has_map and localization_ready:
+            map_status = MapAssetStatus.READY.value
+        elif has_map:
+            map_status = MapAssetStatus.LOCALIZING.value
+        elif map_name:
+            map_status = MapAssetStatus.MAPPING.value
+        else:
+            map_status = MapAssetStatus.CREATED.value
+        waiting_for = str(existing_waiting_for or "").strip() or None
+        if waiting_for is None:
+            if not has_map:
+                waiting_for = "mapping_ready"
+            elif not localization_ready:
+                waiting_for = "localization_ready"
+        return {
+            "map_name": map_name,
+            "map_status": map_status,
+            "map_version_id": map_snapshot.version_id if map_snapshot is not None else None,
+            "latest_map_version_id": map_snapshot.version_id if map_snapshot is not None else None,
+            "memory_library_name": memory_library_name or map_name,
+            "localization_ready": localization_ready,
+            "localization_session_status": (
+                localization_session.status.value
+                if localization_session is not None and (map_name is None or localization_session.map_name == map_name)
+                else None
+            ),
+            "localization_session_map_version_id": (
+                localization_session.map_version_id
+                if localization_session is not None and (map_name is None or localization_session.map_name == map_name)
+                else None
+            ),
+            "waiting_for": waiting_for,
+        }
 
     def _publish_navigation_event(self, event_type: str, message: str, **payload) -> None:
         if self._event_bus is None:

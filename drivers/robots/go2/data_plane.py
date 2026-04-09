@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 import importlib
 import importlib.util
 import json
@@ -35,12 +35,15 @@ from services.mapping.occupancy_mapping import (
 )
 from services.navigation.frontier import FrontierExplorer as Go2FrontierExplorer
 from services.navigation.runtime import GridNavigationPlanner as Go2GridNavigationPlanner, NavigationSession as Go2NavigationSession
+from logging_utils import LogRateLimiter
 
 if TYPE_CHECKING:
     from drivers.robots.go2.settings import Go2DataPlaneConfig
 
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.go2.data_plane")
+_GO2_INFO_LOG_RATE_LIMIT_SEC = 30.0
+_GO2_MOTION_ERROR_LOG_RATE_LIMIT_SEC = 5.0
 
 _KNOWN_GRID_MAP_LAYERS = {
     "elevation",
@@ -2001,12 +2004,215 @@ class Go2DataPlaneRuntime:
         self._official_navigation_state = NavigationState(status=NavigationStatus.IDLE, message="官方导航后端未启用。")
         self._official_goal_reached = False
         self._official_last_error: Optional[str] = None
+        self._loaded_named_map_name: Optional[str] = None
+        self._loaded_named_map_mode: str = "none"
+        self._loaded_named_map_saved_at: Optional[str] = None
+        self._loaded_named_map_requires_localization: bool = False
+        self._archived_occupancy_grid: Optional[OccupancyGrid] = None
+        self._archived_cost_map: Optional[CostMap] = None
+        self._archived_semantic_map: Optional[SemanticMap] = None
         self._grid_navigation_planner = Go2GridNavigationPlanner(self.config.navigation)
         self._frontier_explorer = Go2FrontierExplorer(self.config.exploration)
         self._obstacle_avoidance_enabled = bool(
             getattr(getattr(self.config, "official", None), "obstacle_avoidance_default_enabled", True)
         )
         self._started = False
+        self._info_log_limiter = LogRateLimiter()
+
+    def _named_map_archive_root(self) -> Path:
+        root = str(getattr(self.config, "named_map_archive_root", "") or "").strip()
+        if not root:
+            root = str(Path.cwd() / "runtime_data" / "go2_named_maps")
+        return Path(root).expanduser()
+
+    def _normalize_named_map_name(self, map_name: str) -> str:
+        normalized = []
+        for char in str(map_name or "").strip().lower():
+            if char.isalnum():
+                normalized.append(char)
+            else:
+                normalized.append("_")
+        return "".join(normalized).strip("_") or "map"
+
+    def _named_map_archive_path(self, map_name: str) -> Path:
+        return self._named_map_archive_root() / self._normalize_named_map_name(map_name) / "snapshot.json"
+
+    def _clear_archived_named_map_snapshot(self) -> None:
+        self._archived_occupancy_grid = None
+        self._archived_cost_map = None
+        self._archived_semantic_map = None
+
+    def _has_archived_named_map_snapshot(self) -> bool:
+        return any(
+            item is not None
+            for item in (
+                self._archived_occupancy_grid,
+                self._archived_cost_map,
+                self._archived_semantic_map,
+            )
+        )
+
+    def _uses_archived_named_map_snapshot(self) -> bool:
+        return self._loaded_named_map_mode == "archive_snapshot" and self._has_archived_named_map_snapshot()
+
+    def get_loaded_map_name(self) -> Optional[str]:
+        """返回当前命名地图运行态绑定的地图名称。"""
+
+        return self._loaded_named_map_name
+
+    def load_named_map(
+        self,
+        map_name: str,
+        *,
+        reason: str = "",
+        allow_missing: bool = False,
+    ) -> Dict[str, Any]:
+        """按地图名加载命名地图运行态。
+
+        兼容路径语义：
+        1. 若本地存在归档快照，则进入 `archive_snapshot` 模式。
+        2. 若归档缺失但允许缺失，则只绑定当前 live runtime（实时运行态）到该名称。
+        3. `archive_snapshot` 模式不会伪造定位可用状态。
+
+        说明：
+        该能力仅保留给兼容/调试路径使用，
+        平台主线不再依赖它作为地图真值来源。
+        """
+
+        resolved_name = str(map_name or "").strip()
+        if not resolved_name:
+            raise ValueError("地图名称不能为空。")
+
+        archive_path = self._named_map_archive_path(resolved_name)
+        if archive_path.exists():
+            payload = json.loads(archive_path.read_text(encoding="utf-8"))
+            self._archived_occupancy_grid = (
+                OccupancyGrid.model_validate(payload["occupancy_grid"])
+                if payload.get("occupancy_grid") is not None
+                else None
+            )
+            self._archived_cost_map = (
+                CostMap.model_validate(payload["cost_map"])
+                if payload.get("cost_map") is not None
+                else None
+            )
+            self._archived_semantic_map = (
+                SemanticMap.model_validate(payload["semantic_map"])
+                if payload.get("semantic_map") is not None
+                else None
+            )
+            self._loaded_named_map_name = resolved_name
+            self._loaded_named_map_mode = "archive_snapshot"
+            self._loaded_named_map_saved_at = str(payload.get("saved_at", "") or "") or None
+            self._loaded_named_map_requires_localization = True
+            LOGGER.info("Go2 命名地图归档已加载 map_name=%s reason=%s", resolved_name, reason or "load_named_map")
+            return {
+                "requested_map_name": resolved_name,
+                "loaded_map_name": resolved_name,
+                "loaded": True,
+                "archive_found": True,
+                "runtime_mode": self._loaded_named_map_mode,
+                "requires_localization": True,
+                "archive_path": str(archive_path),
+                "saved_at": self._loaded_named_map_saved_at,
+            }
+
+        if not allow_missing:
+            return {
+                "requested_map_name": resolved_name,
+                "loaded_map_name": self._loaded_named_map_name,
+                "loaded": False,
+                "archive_found": False,
+                "runtime_mode": self._loaded_named_map_mode,
+                "requires_localization": self._loaded_named_map_requires_localization,
+                "archive_path": str(archive_path),
+            }
+
+        self._clear_archived_named_map_snapshot()
+        self._loaded_named_map_name = resolved_name
+        self._loaded_named_map_mode = "live_runtime"
+        self._loaded_named_map_saved_at = None
+        self._loaded_named_map_requires_localization = False
+        LOGGER.info("Go2 命名地图运行态已绑定到 live runtime map_name=%s reason=%s", resolved_name, reason or "load_named_map")
+        return {
+            "requested_map_name": resolved_name,
+            "loaded_map_name": resolved_name,
+            "loaded": True,
+            "archive_found": False,
+            "runtime_mode": self._loaded_named_map_mode,
+            "requires_localization": False,
+            "archive_path": str(archive_path),
+        }
+
+    def save_named_map(self, map_name: str, *, reason: str = "") -> Dict[str, Any]:
+        """把当前地图快照保存为命名地图归档。
+
+        该能力仅保留给兼容/调试路径使用，
+        平台主线不再依赖它作为地图版本保存路径。
+        """
+
+        resolved_name = str(map_name or "").strip()
+        if not resolved_name:
+            raise ValueError("地图名称不能为空。")
+        occupancy_grid = self.bridge.get_occupancy_grid()
+        cost_map = self.bridge.get_cost_map()
+        semantic_map = self.bridge.get_semantic_map()
+        if occupancy_grid is None and cost_map is None and semantic_map is None:
+            return {
+                "map_name": resolved_name,
+                "saved": False,
+                "runtime_mode": self._loaded_named_map_mode,
+                "reason": "当前没有可归档的地图快照。",
+            }
+        archive_path = self._named_map_archive_path(resolved_name)
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        saved_at = datetime.utcnow().isoformat() + "Z"
+        archive_path.write_text(
+            json.dumps(
+                {
+                    "map_name": resolved_name,
+                    "saved_at": saved_at,
+                    "reason": str(reason or ""),
+                    "occupancy_grid": occupancy_grid.model_dump(mode="json") if occupancy_grid is not None else None,
+                    "cost_map": cost_map.model_dump(mode="json") if cost_map is not None else None,
+                    "semantic_map": semantic_map.model_dump(mode="json") if semantic_map is not None else None,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self._clear_archived_named_map_snapshot()
+        self._loaded_named_map_name = resolved_name
+        self._loaded_named_map_mode = "live_runtime"
+        self._loaded_named_map_saved_at = saved_at
+        self._loaded_named_map_requires_localization = False
+        LOGGER.info("Go2 命名地图归档已保存 map_name=%s reason=%s", resolved_name, reason or "save_named_map")
+        return {
+            "map_name": resolved_name,
+            "saved": True,
+            "runtime_mode": self._loaded_named_map_mode,
+            "archive_path": str(archive_path),
+            "saved_at": saved_at,
+        }
+
+    def get_named_map_runtime_status(self) -> Dict[str, Any]:
+        """返回当前命名地图运行态状态。
+
+        该状态仅用于兼容/调试观测，
+        不代表平台当前正式地图真值源。
+        """
+
+        return {
+            "loaded_map_name": self._loaded_named_map_name,
+            "runtime_mode": self._loaded_named_map_mode,
+            "saved_at": self._loaded_named_map_saved_at,
+            "requires_localization": self._loaded_named_map_requires_localization,
+            "archive_root": str(self._named_map_archive_root()),
+            "archive_snapshot_active": self._uses_archived_named_map_snapshot(),
+            "runtime_scope": "compatibility_only",
+            "used_by_platform": False,
+        }
 
     def is_obstacle_avoidance_control_available(self) -> bool:
         """返回官方避障控制链路是否真正可用。"""
@@ -2162,7 +2368,18 @@ class Go2DataPlaneRuntime:
         normalized_names = tuple(str(item or "").strip() for item in service_names if str(item or "").strip())
         if not normalized_names:
             return
-        LOGGER.info("按需检查 Go2 官方服务 reason=%s services=%s", reason, ",".join(normalized_names))
+        self._info_log_limiter.log(
+            LOGGER,
+            logging.INFO,
+            "按需检查 Go2 官方服务",
+            key=("go2_service_ensure_batch", reason, normalized_names),
+            interval_sec=_GO2_INFO_LOG_RATE_LIMIT_SEC,
+            extra={
+                "event": "go2.service.ensure",
+                "reason": reason,
+                "services": list(normalized_names),
+            },
+        )
         self._refresh_official_service_states()
         for service_name in normalized_names:
             self._ensure_official_service_enabled(service_name)
@@ -2220,16 +2437,27 @@ class Go2DataPlaneRuntime:
         self._last_motion_command_route = route if code == 0 else None
         if not should_log:
             return
-        LOGGER.info(
-            "Go2 运动命令已走 %s 链路 vx=%.3f vy=%.3f vyaw=%.3f code=%s obstacle_avoidance_enabled=%s remote_command_enabled=%s",
-            route,
-            float(vx),
-            float(vy),
-            float(vyaw),
-            code,
-            self._obstacle_avoidance_enabled,
-            self._official_obstacles_avoid_remote_control,
-        )
+        extra = {
+            "event": "go2.motion.command_route",
+            "route": route,
+            "vx": float(vx),
+            "vy": float(vy),
+            "vyaw": float(vyaw),
+            "code": code,
+            "obstacle_avoidance_enabled": self._obstacle_avoidance_enabled,
+            "remote_command_enabled": self._official_obstacles_avoid_remote_control,
+        }
+        if code != 0:
+            self._info_log_limiter.log(
+                LOGGER,
+                logging.WARNING,
+                "Go2 运动命令下发异常",
+                key=("go2_motion_command_error", route, code),
+                interval_sec=_GO2_MOTION_ERROR_LOG_RATE_LIMIT_SEC,
+                extra=extra,
+            )
+            return
+        LOGGER.info("Go2 运动命令链路已切换", extra=extra)
 
     def can_accept_motion_command(self) -> bool:
         """返回当前数据面是否可以直接下发运动命令。"""
@@ -2288,11 +2516,15 @@ class Go2DataPlaneRuntime:
     def is_localization_available(self) -> bool:
         """返回定位能力是否可用。"""
 
+        if self._loaded_named_map_requires_localization:
+            return False
         return self.config.enabled and bool(self.bridge.is_localization_available())
 
     def is_map_available(self) -> bool:
         """返回地图能力是否可用。"""
 
+        if self._uses_archived_named_map_snapshot():
+            return True
         return self.config.enabled and bool(self.bridge.is_map_available())
 
     def is_navigation_available(self) -> bool:
@@ -2310,11 +2542,15 @@ class Go2DataPlaneRuntime:
     def get_current_pose(self) -> Optional[Pose]:
         """读取当前位姿。"""
 
+        if self._loaded_named_map_requires_localization:
+            return None
         return self.bridge.get_current_pose()
 
     def get_frame_tree(self) -> Optional[FrameTree]:
         """读取当前 TF 树。"""
 
+        if self._loaded_named_map_requires_localization:
+            return None
         return self.bridge.get_frame_tree()
 
     def get_imu_state(self) -> Optional[IMUState]:
@@ -2325,16 +2561,22 @@ class Go2DataPlaneRuntime:
     def get_occupancy_grid(self) -> Optional[OccupancyGrid]:
         """读取占据栅格地图。"""
 
+        if self._uses_archived_named_map_snapshot():
+            return self._archived_occupancy_grid.model_copy(deep=True) if self._archived_occupancy_grid is not None else None
         return self.bridge.get_occupancy_grid()
 
     def get_cost_map(self) -> Optional[CostMap]:
         """读取代价地图。"""
 
+        if self._uses_archived_named_map_snapshot():
+            return self._archived_cost_map.model_copy(deep=True) if self._archived_cost_map is not None else None
         return self.bridge.get_cost_map()
 
     def get_semantic_map(self) -> Optional[SemanticMap]:
         """读取语义地图。"""
 
+        if self._uses_archived_named_map_snapshot():
+            return self._archived_semantic_map.model_copy(deep=True) if self._archived_semantic_map is not None else None
         return self.bridge.get_semantic_map()
 
     def set_goal(self, goal: NavigationGoal) -> bool:
@@ -2446,6 +2688,7 @@ class Go2DataPlaneRuntime:
             "map_available": self.is_map_available(),
             "navigation_available": self.is_navigation_available(),
             "exploration_available": self.is_exploration_available(),
+            "named_map_runtime": self.get_named_map_runtime_status(),
             "startup_diagnostics": list(self._startup_diagnostics),
             "official_backend": {
                 "enabled": self._uses_official_backend(),
@@ -2665,7 +2908,18 @@ class Go2DataPlaneRuntime:
         if code != 0:
             message = f"启用 Go2 官方服务失败 service={normalized} code={code}"
             if code in {3102, 3104}:
-                LOGGER.info("%s，当前按 Go2 端侧最佳努力模式继续。", message)
+                self._info_log_limiter.log(
+                    LOGGER,
+                    logging.INFO,
+                    "Go2 官方服务当前未就绪，按最佳努力模式继续",
+                    key=("go2_service_best_effort", normalized, code),
+                    interval_sec=_GO2_INFO_LOG_RATE_LIMIT_SEC,
+                    extra={
+                        "event": "go2.service.best_effort",
+                        "service_name": normalized,
+                        "code": code,
+                    },
+                )
                 return
             self._startup_diagnostics.append(message)
             LOGGER.warning(message)
@@ -2911,6 +3165,13 @@ class Go2DataPlaneRuntime:
         return max(minimum, min(maximum, value))
 
     def _build_exploration_unavailable_message(self) -> str:
+        with self._exploration_lock:
+            waiting_for = str((self._exploration_state.metadata or {}).get("waiting_for") or "").strip()
+            current_message = str(self._exploration_state.message or "").strip()
+        if waiting_for:
+            return waiting_for
+        if current_message and "等待" in current_message:
+            return current_message
         if self._startup_diagnostics:
             return self._startup_diagnostics[-1]
         if not self.is_localization_available():
@@ -2946,6 +3207,17 @@ class Go2DataPlaneRuntime:
                     final_message = f"探索超时，已运行 {float(request.max_duration_sec):.1f} 秒。"
                     break
 
+                if not self._wait_for_exploration_prerequisites(
+                    request=request,
+                    completed=completed,
+                    iteration=iteration,
+                    attempted_poses=attempted_poses,
+                    exploration_started_at=exploration_started_at,
+                ):
+                    final_status = ExplorationStatus.FAILED
+                    final_message = self._build_exploration_unavailable_message()
+                    break
+
                 candidate_poses = self._build_exploration_candidates(
                     request,
                     attempted_poses=attempted_poses,
@@ -2972,6 +3244,20 @@ class Go2DataPlaneRuntime:
                 )
                 if not self.set_goal(goal):
                     attempted_poses.append(pose)
+                    with self._exploration_lock:
+                        self._exploration_state = ExplorationState(
+                            current_request_id=request.request_id,
+                            status=ExplorationStatus.RUNNING,
+                            strategy=request.strategy,
+                            covered_ratio=float(completed) / float(max(1, iteration)),
+                            frontier_count=frontier_count,
+                            message="探索候选已生成，但导航后端暂未接受目标，准备重试其他前沿。",
+                            metadata={
+                                "known_cells": known_cells,
+                                "attempted_frontiers": len(attempted_poses),
+                            },
+                        )
+                    time.sleep(max(0.05, float(self.config.exploration.status_poll_interval_sec)))
                     continue
                 success = self._wait_navigation_goal(goal_timeout_sec=self.config.exploration.goal_timeout_sec)
                 attempted_poses.append(pose)
@@ -3036,6 +3322,14 @@ class Go2DataPlaneRuntime:
                         message="探索任务已取消。",
                     )
                 else:
+                    final_metadata = dict(self._exploration_state.metadata or {})
+                    final_metadata.update(
+                        {
+                            "known_cells": known_cells,
+                            "attempted_frontiers": len(attempted_poses),
+                            "completed_frontiers": completed,
+                        }
+                    )
                     self._exploration_state = ExplorationState(
                         current_request_id=request.request_id,
                         status=final_status,
@@ -3043,11 +3337,7 @@ class Go2DataPlaneRuntime:
                         covered_ratio=float(completed) / float(max(1, iteration)),
                         frontier_count=0,
                         message=final_message,
-                        metadata={
-                            "known_cells": known_cells,
-                            "attempted_frontiers": len(attempted_poses),
-                            "completed_frontiers": completed,
-                        },
+                        metadata=final_metadata,
                     )
         except Exception:
             LOGGER.exception("执行 Go2 探索任务失败。")
@@ -3070,24 +3360,17 @@ class Go2DataPlaneRuntime:
     ) -> List[Pose]:
         current_pose = self.get_current_pose()
         center_pose = self._resolve_exploration_center_pose(request, current_pose=current_pose)
-        if center_pose is None:
+        occupancy_grid = self.get_occupancy_grid()
+        if center_pose is None or current_pose is None or occupancy_grid is None:
             return []
 
         frontier_search_radius = self._resolve_frontier_search_radius(request)
-        ring_radius = float(
-            request.radius_m
-            if request.radius_m is not None
-            else self.config.exploration.sample_radius_m
-        )
         cost_map = self.get_cost_map()
-        occupancy_grid = self.get_occupancy_grid()
         attempted_items = tuple(attempted_poses or [])
 
         if (
             self._should_prefer_frontier_candidates(strategy=request.strategy)
             and self.config.exploration.frontier_enabled
-            and current_pose is not None
-            and occupancy_grid is not None
         ):
             frontier_candidates = self._frontier_explorer.select_candidates(
                 current_pose=current_pose,
@@ -3100,15 +3383,220 @@ class Go2DataPlaneRuntime:
             )
             if frontier_candidates:
                 return [candidate.pose for candidate in frontier_candidates]
+        return []
 
-        return self._build_ring_exploration_candidates(
-            center_pose=center_pose,
-            current_pose=current_pose,
-            radius=ring_radius,
+    def _wait_for_exploration_prerequisites(
+        self,
+        *,
+        request: ExploreAreaRequest,
+        completed: int,
+        iteration: int,
+        attempted_poses: Sequence[Pose],
+        exploration_started_at: float,
+    ) -> bool:
+        """等待探索前置条件就绪，避免建图冷启动时过早选点。"""
+
+        wait_timeout_sec = max(0.1, float(self.config.exploration.prerequisite_wait_timeout_sec))
+        poll_interval_sec = max(0.05, float(self.config.exploration.prerequisite_poll_interval_sec))
+        deadline_monotonic = time.monotonic() + wait_timeout_sec
+        if request.max_duration_sec is not None:
+            remaining_duration_sec = float(request.max_duration_sec) - (time.monotonic() - exploration_started_at)
+            if remaining_duration_sec <= 0.0:
+                return False
+            deadline_monotonic = min(deadline_monotonic, time.monotonic() + remaining_duration_sec)
+
+        while not self._exploration_stop_event.is_set():
+            current_pose = self.get_current_pose()
+            occupancy_grid = self.get_occupancy_grid()
+            waiting_metadata: Dict[str, object] = {
+                "attempted_frontiers": len(attempted_poses),
+            }
+            gap_message = self._describe_exploration_prerequisite_gap(
+                current_pose=current_pose,
+                occupancy_grid=occupancy_grid,
+            )
+            if gap_message is None and completed <= 0 and current_pose is not None and occupancy_grid is not None:
+                gap_message, frontier_metadata = self._describe_exploration_frontier_gap(
+                    request=request,
+                    current_pose=current_pose,
+                    occupancy_grid=occupancy_grid,
+                )
+                waiting_metadata.update(frontier_metadata)
+            if gap_message is None:
+                return True
+
+            waiting_metadata["waiting_for"] = gap_message
+            with self._exploration_lock:
+                self._exploration_state = ExplorationState(
+                    current_request_id=request.request_id,
+                    status=ExplorationStatus.RUNNING,
+                    strategy=request.strategy,
+                    covered_ratio=float(completed) / float(max(1, iteration)),
+                    frontier_count=None,
+                    message=gap_message,
+                    metadata=waiting_metadata,
+                )
+            if time.monotonic() >= deadline_monotonic:
+                return False
+            time.sleep(poll_interval_sec)
+        return False
+
+    def _describe_exploration_prerequisite_gap(
+        self,
+        *,
+        current_pose: Optional[Pose],
+        occupancy_grid: Optional[OccupancyGrid],
+    ) -> Optional[str]:
+        """描述当前探索起步仍缺失的前置条件。"""
+
+        if current_pose is None:
+            return "当前定位尚未就绪，等待探索起步条件。"
+        if occupancy_grid is None:
+            return "当前探索地图尚未就绪，等待首帧地图。"
+        if occupancy_grid.frame_id and current_pose.frame_id and occupancy_grid.frame_id != current_pose.frame_id:
+            return "当前地图与定位坐标系尚未对齐，等待探索起步条件。"
+        return None
+
+    def _describe_exploration_frontier_gap(
+        self,
+        *,
+        request: ExploreAreaRequest,
+        current_pose: Pose,
+        occupancy_grid: OccupancyGrid,
+    ) -> Tuple[Optional[str], Dict[str, object]]:
+        """判断当前地图是否已形成与机器人可达区域连通的前沿。"""
+
+        if not self._should_prefer_frontier_candidates(strategy=request.strategy):
+            return None, {}
+        if not bool(self.config.exploration.frontier_enabled):
+            return None, {}
+
+        occupancy = np.asarray(occupancy_grid.data, dtype=np.int32).reshape(occupancy_grid.height, occupancy_grid.width)
+        free_mask = occupancy == 0
+        unknown_mask = occupancy < 0
+        if not np.any(free_mask) or not np.any(unknown_mask):
+            return "当前探索地图仍未形成有效前沿，等待地图继续收敛。", {
+                "frontier_cells": 0,
+                "frontier_clusters_total": 0,
+                "frontier_clusters_ge_min": 0,
+                "reachable_frontier_clusters": 0,
+            }
+
+        cost_map = self.get_cost_map()
+        frontier_mask = self._frontier_explorer._build_frontier_mask(
+            free_mask=free_mask,
+            unknown_mask=unknown_mask,
             cost_map=cost_map,
-            occupancy_grid=occupancy_grid,
-            attempted_poses=attempted_items,
         )
+        frontier_cell_count = int(np.count_nonzero(frontier_mask))
+        if frontier_cell_count == 0:
+            return "当前探索地图仍未形成有效前沿，等待地图继续收敛。", {
+                "frontier_cells": 0,
+                "frontier_clusters_total": 0,
+                "frontier_clusters_ge_min": 0,
+                "reachable_frontier_clusters": 0,
+            }
+
+        center_pose = self._resolve_exploration_center_pose(request, current_pose=current_pose)
+        if center_pose is None:
+            return None, {}
+
+        max_radius_m = self._resolve_frontier_search_radius(request)
+        normalized_radius_m = None if max_radius_m is None else max(0.1, float(max_radius_m))
+        filtered_clusters: List[List[Tuple[int, int]]] = []
+        all_clusters = self._frontier_explorer._cluster_frontiers(frontier_mask)
+        for cluster in all_clusters:
+            if len(cluster) < int(self.config.exploration.frontier_min_cluster_cells):
+                continue
+            if normalized_radius_m is not None:
+                cluster_points_world = [
+                    (
+                        float(occupancy_grid.origin.position.x) + (float(col) + 0.5) * float(occupancy_grid.resolution_m),
+                        float(occupancy_grid.origin.position.y) + (float(row) + 0.5) * float(occupancy_grid.resolution_m),
+                    )
+                    for row, col in cluster
+                ]
+                centroid_x = sum(point[0] for point in cluster_points_world) / float(len(cluster_points_world))
+                centroid_y = sum(point[1] for point in cluster_points_world) / float(len(cluster_points_world))
+                center_distance_m = math.hypot(
+                    centroid_x - center_pose.position.x,
+                    centroid_y - center_pose.position.y,
+                )
+                if center_distance_m > normalized_radius_m:
+                    continue
+            filtered_clusters.append(cluster)
+
+        metadata: Dict[str, object] = {
+            "frontier_cells": frontier_cell_count,
+            "frontier_clusters_total": len(all_clusters),
+            "frontier_clusters_ge_min": len(filtered_clusters),
+            "reachable_frontier_clusters": 0,
+        }
+        if not filtered_clusters:
+            return "当前探索地图仍未形成满足阈值的前沿，等待地图继续收敛。", metadata
+
+        planning_map = self._grid_navigation_planner._build_planning_map(
+            current_frame_id=current_pose.frame_id,
+            occupancy_grid=occupancy_grid,
+            cost_map=cost_map,
+        )
+        if planning_map is None:
+            return None, metadata
+
+        start_cell = planning_map.world_to_cell(current_pose.position.x, current_pose.position.y)
+        if start_cell is None:
+            return "当前定位尚未落入可规划区域，等待地图继续收敛。", metadata
+        start_cell = planning_map.nearest_traversable(
+            start_cell,
+            max_radius_cells=self._grid_navigation_planner._search_radius_cells(planning_map),
+        )
+        if start_cell is None:
+            return "当前机器人附近暂无可规划区域，等待地图继续收敛。", metadata
+
+        reachable = np.zeros((planning_map.height, planning_map.width), dtype=bool)
+        pending_cells: Deque[Tuple[int, int]] = deque([start_cell])
+        reachable[start_cell[0], start_cell[1]] = True
+        while pending_cells:
+            row, col = pending_cells.popleft()
+            for row_offset, col_offset, _step_cost in self._grid_navigation_planner._NEIGHBORS:
+                next_row = row + row_offset
+                next_col = col + col_offset
+                if (
+                    next_row < 0
+                    or next_row >= planning_map.height
+                    or next_col < 0
+                    or next_col >= planning_map.width
+                ):
+                    continue
+                if reachable[next_row, next_col] or bool(planning_map.blocked[next_row, next_col]):
+                    continue
+                reachable[next_row, next_col] = True
+                pending_cells.append((next_row, next_col))
+
+        reachable_cluster_count = 0
+        search_radius_cells = self._grid_navigation_planner._search_radius_cells(planning_map)
+        for cluster in filtered_clusters:
+            cluster_reachable = False
+            for row, col in cluster:
+                adjusted_cell = None if bool(planning_map.blocked[row, col]) else (row, col)
+                if adjusted_cell is None:
+                    adjusted_cell = planning_map.nearest_traversable(
+                        (row, col),
+                        max_radius_cells=search_radius_cells,
+                    )
+                if adjusted_cell is None:
+                    continue
+                if bool(reachable[adjusted_cell[0], adjusted_cell[1]]):
+                    cluster_reachable = True
+                    break
+            if cluster_reachable:
+                reachable_cluster_count += 1
+
+        metadata["reachable_cells"] = int(np.count_nonzero(reachable))
+        metadata["reachable_frontier_clusters"] = reachable_cluster_count
+        if reachable_cluster_count == 0:
+            return "当前地图前沿已生成，但与机器人可达区域仍断开，等待地图继续收敛。", metadata
+        return None, metadata
 
     def _resolve_frontier_search_radius(self, request: ExploreAreaRequest) -> Optional[float]:
         """解析 frontier 搜索半径。
@@ -3152,130 +3640,8 @@ class Go2DataPlaneRuntime:
             center_pose = current_pose
         return center_pose
 
-    def _build_ring_exploration_candidates(
-        self,
-        *,
-        center_pose: Pose,
-        current_pose: Optional[Pose],
-        radius: float,
-        cost_map: Optional[CostMap],
-        occupancy_grid: Optional[OccupancyGrid],
-        attempted_poses: Sequence[Pose],
-    ) -> List[Pose]:
-        sample_count = self.config.exploration.sample_count
-        for candidate_radius in self._build_exploration_sample_radii(radius):
-            reachable_candidates: List[Tuple[float, Pose]] = []
-            candidates: List[Pose] = []
-            for index in range(sample_count):
-                angle = (2.0 * math.pi * float(index)) / float(sample_count)
-                x = center_pose.position.x + candidate_radius * math.cos(angle)
-                y = center_pose.position.y + candidate_radius * math.sin(angle)
-                if any(self._poses_are_near(x=x, y=y, pose=item) for item in attempted_poses):
-                    continue
-                if cost_map is not None:
-                    cost = self._sample_cost(cost_map, x=x, y=y)
-                    if cost is None or cost > self.config.exploration.max_goal_cost:
-                        continue
-                candidate_pose = self._make_exploration_pose(center_pose=center_pose, x=x, y=y)
-                candidates.append(candidate_pose)
-                if current_pose is None or (cost_map is None and occupancy_grid is None):
-                    continue
-                planning_outcome = self._grid_navigation_planner.plan(
-                    current_pose=current_pose,
-                    target_pose=candidate_pose,
-                    occupancy_grid=occupancy_grid,
-                    cost_map=cost_map,
-                )
-                planned_path = planning_outcome.plan
-                if planned_path is None:
-                    if occupancy_grid is not None and not self._should_keep_soft_failed_exploration_candidate(
-                        planning_reason=planning_outcome.reason
-                    ):
-                        candidates.pop()
-                    continue
-                if planned_path.planning_mode != "goal":
-                    continue
-                reachable_candidates.append((planned_path.total_distance_m, candidate_pose))
-            if reachable_candidates:
-                reachable_candidates.sort(key=lambda item: item[0])
-                return [pose for _distance, pose in reachable_candidates]
-            if candidates:
-                return candidates
-        return []
-
-    def _should_keep_soft_failed_exploration_candidate(self, *, planning_reason: str) -> bool:
-        """判断探索候选是否应在软失败预检场景下保留。"""
-
-        return str(planning_reason or "").strip().lower() in {
-            "frame_mismatch",
-            "map_unavailable",
-            "start_out_of_bounds",
-            "no_horizon_target",
-            "target_out_of_bounds",
-        }
-
-    def _make_exploration_pose(self, *, center_pose: Pose, x: float, y: float) -> Pose:
-        return Pose(
-            frame_id=center_pose.frame_id,
-            position=Vector3(x=x, y=y, z=center_pose.position.z),
-            orientation=Quaternion(
-                x=center_pose.orientation.x,
-                y=center_pose.orientation.y,
-                z=center_pose.orientation.z,
-                w=center_pose.orientation.w,
-            ),
-        )
-
-    def _poses_are_near(self, *, x: float, y: float, pose: Pose) -> bool:
-        return (
-            math.hypot(float(pose.position.x) - x, float(pose.position.y) - y)
-            < float(self.config.exploration.frontier_revisit_separation_m)
-        )
-
     def _count_known_map_cells(self) -> int:
         return self._frontier_explorer.count_known_cells(self.get_occupancy_grid())
-
-    def _build_exploration_sample_radii(self, requested_radius: float) -> List[float]:
-        normalized_radius = max(0.1, float(requested_radius))
-        default_radius = max(0.1, float(self.config.exploration.sample_radius_m))
-        minimum_radius = min(
-            normalized_radius,
-            max(0.5, min(normalized_radius, default_radius) * 0.5),
-        )
-        raw_radii = [normalized_radius]
-        if default_radius < normalized_radius:
-            raw_radii.append(default_radius)
-
-        current_radius = normalized_radius
-        for _ in range(6):
-            current_radius *= 0.75
-            if current_radius <= minimum_radius + 1e-6:
-                break
-            raw_radii.append(current_radius)
-        raw_radii.extend([1.0, 0.75, 0.5, minimum_radius])
-
-        radii: List[float] = []
-        for radius in sorted(raw_radii, reverse=True):
-            if radius > normalized_radius + 1e-6:
-                continue
-            rounded_radius = round(max(0.1, float(radius)), 3)
-            if any(abs(existing - rounded_radius) < 1e-6 for existing in radii):
-                continue
-            radii.append(rounded_radius)
-        return radii
-
-    def _sample_cost(self, cost_map: CostMap, *, x: float, y: float) -> Optional[float]:
-        resolution = cost_map.resolution_m
-        origin_x = cost_map.origin.position.x
-        origin_y = cost_map.origin.position.y
-        col = int((x - origin_x) / resolution)
-        row = int((y - origin_y) / resolution)
-        if col < 0 or row < 0 or col >= cost_map.width or row >= cost_map.height:
-            return None
-        index = row * cost_map.width + col
-        if index < 0 or index >= len(cost_map.data):
-            return None
-        return float(cost_map.data[index])
 
     def _wait_navigation_goal(self, *, goal_timeout_sec: float) -> bool:
         deadline = time.time() + max(0.1, goal_timeout_sec)

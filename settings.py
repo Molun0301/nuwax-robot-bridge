@@ -21,6 +21,8 @@ from pathlib import Path
 import threading
 from typing import Deque, Dict, Tuple
 
+from logging_utils import build_default_formatter
+
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
@@ -345,6 +347,10 @@ class RuntimeDataConfig:
     map_history_limit: int = 100
     navigation_history_limit: int = 100
     memory_history_limit: int = 200
+    map_catalog_root: str = ""
+    map_auto_create_library: bool = True
+    map_active_restore_on_start: bool = True
+    map_delete_also_delete_library: bool = False
     memory_db_path: str = ""
     memory_embedding_model: str = DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL
     memory_embedding_dimension: int = 768
@@ -631,6 +637,13 @@ def load_config() -> NuwaxRobotBridgeConfig:
         map_history_limit=max(1, _cfg_int("NUWAX_MAP_HISTORY_LIMIT", 100)),
         navigation_history_limit=max(1, _cfg_int("NUWAX_NAVIGATION_HISTORY_LIMIT", 100)),
         memory_history_limit=max(1, _cfg_int("NUWAX_MEMORY_HISTORY_LIMIT", 200)),
+        map_catalog_root=_cfg_str(
+            "NUWAX_MAP_CATALOG_ROOT",
+            str(BASE_DIR / "runtime_data" / "maps"),
+        ),
+        map_auto_create_library=_cfg_bool("NUWAX_MAP_AUTO_CREATE_LIBRARY", True),
+        map_active_restore_on_start=_cfg_bool("NUWAX_ACTIVE_MAP_RESTORE_ON_START", True),
+        map_delete_also_delete_library=_cfg_bool("NUWAX_MAP_DELETE_ALSO_DELETE_LIBRARY", False),
         memory_db_path=_cfg_str(
             "NUWAX_MEMORY_DB_PATH",
             str(BASE_DIR / "runtime_data" / "memory" / "vector_memory.db"),
@@ -807,6 +820,8 @@ def _configure_third_party_logger_levels() -> None:
         "aioice",
         "asyncio",
         "av",
+        "httpcore",
+        "httpx",
         "pyee",
         "unitree_webrtc_connect",
         "websockets",
@@ -828,6 +843,7 @@ def configure_logging(config: LoggingConfig) -> None:
     level_name = (config.level or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     noisy_filter = _NoisyLogFilter()
+    formatter = build_default_formatter()
 
     file_handler = _LineLimitedFileHandler(
         config.log_file,
@@ -836,13 +852,14 @@ def configure_logging(config: LoggingConfig) -> None:
         encoding="utf-8",
     )
     file_handler.addFilter(noisy_filter)
+    file_handler.setFormatter(formatter)
 
     console_handler = logging.StreamHandler()
     console_handler.addFilter(noisy_filter)
+    console_handler.setFormatter(formatter)
 
     logging.basicConfig(
         level=level,
-        format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[file_handler, console_handler],
         force=True,
     )

@@ -26,6 +26,7 @@ class NavigationGoal(TimestampedContract):
     """导航目标。"""
 
     goal_id: str = Field(description="导航目标标识。")
+    map_name: Optional[str] = Field(default=None, description="目标所属地图名称。")
     target_pose: Optional[Pose] = Field(default=None, description="目标位姿。")
     target_name: Optional[str] = Field(default=None, description="命名目标。")
     tolerance_position_m: float = Field(default=0.3, ge=0.0, description="位置容差。")
@@ -69,6 +70,7 @@ class ExploreAreaRequest(TimestampedContract):
     """探索任务请求。"""
 
     request_id: str = Field(description="探索请求标识。")
+    map_name: Optional[str] = Field(default=None, description="探索所属地图名称。")
     center_pose: Optional[Pose] = Field(default=None, description="探索中心位姿。")
     target_name: Optional[str] = Field(default=None, description="探索区域命名目标。")
     radius_m: Optional[float] = Field(default=None, gt=0.0, description="探索半径。")

@@ -7,7 +7,7 @@ import time
 from typing import Dict, Optional, Tuple, Any, Callable, TYPE_CHECKING
 
 from adapters.base import AdapterBase, AdapterConfig
-from drivers.robots.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
+from drivers.robots.common import ManagedRobotDataPlane, RobotAssemblyBase, RobotAssemblyStatus
 from drivers.robots.go2.capabilities import GO2_CAPABILITY_DESCRIPTORS_BY_NAME
 from drivers.robots.go2.data_plane import Go2DataPlaneRuntime
 from drivers.robots.go2.defaults import GO2_TIMEOUTS, build_go2_defaults
@@ -64,7 +64,7 @@ class Go2RobotAssembly(RobotAssemblyBase):
     factories: Optional[Go2ClientFactories] = None
     adapter_configs: Optional[Dict[str, AdapterConfig]] = None
     prebound_adapters: Tuple[AdapterBase[Any, Any], ...] = ()
-    data_plane: Optional[Go2DataPlaneRuntime] = None
+    data_plane: Optional[ManagedRobotDataPlane] = None
 
     def __post_init__(self) -> None:
         self.factories = self.factories or _load_default_factories()
@@ -504,7 +504,7 @@ def create_go2_assembly(
     factories: Optional[Go2ClientFactories] = None,
     adapter_configs: Optional[Dict[str, AdapterConfig]] = None,
     prebound_adapters: Tuple[AdapterBase[Any, Any], ...] = (),
-    data_plane: Optional[Go2DataPlaneRuntime] = None,
+    data_plane: Optional[ManagedRobotDataPlane] = None,
 ) -> Go2RobotAssembly:
     """创建 Go2 机器人装配入口。"""
 

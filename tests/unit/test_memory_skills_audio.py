@@ -771,6 +771,7 @@ def test_memory_service_supports_payload_filters_navigation_and_arrival_verifica
         camera_id="front_camera",
     )
     assert tagged_location.location_id
+    assert tagged_location.metadata["map_version_id"] == tagged_location.map_version_id
     assert scene_memory is not None
 
     far_filter = MemoryPayloadFilter(
@@ -789,6 +790,8 @@ def test_memory_service_supports_payload_filters_navigation_and_arrival_verifica
     assert navigation_candidate is not None
     assert navigation_candidate.record_id != tagged_location.location_id
     assert navigation_candidate.target_pose.frame_id == "map"
+    assert navigation_candidate.metadata["map_name"] == "单元测试记忆库"
+    assert navigation_candidate.map_version_id is not None
 
     verification = memory_service.verify_arrival(
         "charging dock",
@@ -798,6 +801,7 @@ def test_memory_service_supports_payload_filters_navigation_and_arrival_verifica
     )
     assert verification.verified is True
     assert verification.score >= 0.1
+    assert verification.metadata["map_version_id"] == navigation_candidate.map_version_id
 
 
 def test_memory_service_deeply_integrates_visual_semantics_into_vector_memory(tmp_path: Path) -> None:

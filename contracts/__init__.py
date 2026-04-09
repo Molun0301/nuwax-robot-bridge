@@ -19,6 +19,7 @@ from contracts.events import RuntimeEvent, RuntimeEventCategory, RuntimeEventSev
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Twist, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
+from contracts.map_workspace import MapAsset, MapAssetStatus, MapVersion, MapWorkspace
 from contracts.memory import (
     MemoryArrivalVerification,
     MemoryNavigationCandidate,
@@ -66,6 +67,9 @@ from contracts.runtime_views import (
     DiagnosticLevel,
     DiagnosticSnapshot,
     ExplorationContext,
+    NavigationSemanticContext,
+    LocalizationSession,
+    LocalizationSessionStatus,
     LocalizationSnapshot,
     MapSnapshot,
     NavigationContext,
@@ -74,6 +78,7 @@ from contracts.runtime_views import (
     RobotStatusSnapshot,
     SceneObjectSummary,
     SceneSummary,
+    TopologyNodeSummary,
 )
 from contracts.tasks import TaskEvent, TaskSpec, TaskState, TaskStatus
 
@@ -108,8 +113,14 @@ __all__ = [
     "ImageFrame",
     "JointState",
     "LaserScanFrame",
+    "LocalizationSession",
+    "LocalizationSessionStatus",
     "LocalizationSnapshot",
+    "MapAsset",
+    "MapAssetStatus",
     "MapSnapshot",
+    "MapVersion",
+    "MapWorkspace",
     "MemoryQueryMatch",
     "MemoryQueryResult",
     "MemoryRecordKind",
@@ -118,6 +129,7 @@ __all__ = [
     "MemoryNavigationCandidate",
     "MemoryPayloadFilter",
     "MetadataDict",
+    "NavigationSemanticContext",
     "NavigationContext",
     "NavigationGoal",
     "NavigationState",
@@ -155,6 +167,7 @@ __all__ = [
     "TaskSpec",
     "TaskState",
     "TaskStatus",
+    "TopologyNodeSummary",
     "TimestampedContract",
     "Track",
     "TrackState",

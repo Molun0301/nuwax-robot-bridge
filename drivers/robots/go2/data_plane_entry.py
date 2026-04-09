@@ -7,6 +7,7 @@ import time
 
 from drivers.robots.go2.data_plane import Go2DataPlaneRuntime
 from drivers.robots.go2.settings import load_go2_data_plane_config
+from logging_utils import build_default_formatter
 
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.go2.data_plane_entry")
@@ -15,9 +16,12 @@ LOGGER = logging.getLogger("nuwax_robot_bridge.go2.data_plane_entry")
 def main() -> int:
     """以独立进程启动 Go2 端侧数据面。"""
 
+    handler = logging.StreamHandler()
+    handler.setFormatter(build_default_formatter())
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[handler],
+        force=True,
     )
     runtime = Go2DataPlaneRuntime(load_go2_data_plane_config())
     stop_event = threading.Event()

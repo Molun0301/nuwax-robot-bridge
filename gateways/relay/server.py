@@ -12,10 +12,13 @@ from fastapi.responses import Response
 from fastapi.responses import StreamingResponse
 import httpx
 
+from logging_utils import LogRateLimiter
 from settings import RelayServerConfig
 
 
 RELAY_LOGGER = logging.getLogger("nuwax_robot_bridge.relay")
+_LOW_VALUE_RELAY_PATHS = frozenset(("/relay/health", "/events/stream"))
+_RELAY_REQUEST_LOG_RATE_LIMIT_SEC = 30.0
 
 
 def _resolve_client_host(request: Request) -> str:
@@ -25,6 +28,12 @@ def _resolve_client_host(request: Request) -> str:
     if request.client is not None and request.client.host:
         return request.client.host
     return "-"
+
+
+def _should_rate_limit_relay_request(path: str, status_code: int) -> bool:
+    if status_code >= 400:
+        return False
+    return path in _LOW_VALUE_RELAY_PATHS
 
 
 def create_relay_app(
@@ -37,6 +46,7 @@ def create_relay_app(
     app = FastAPI(title="nuwax_robot_bridge_relay")
     app.state.relay_config = relay_config
     app.state.http_transport = transport
+    request_log_limiter = LogRateLimiter()
 
     @app.middleware("http")
     async def _request_logging_middleware(request: Request, call_next):
@@ -49,23 +59,42 @@ def create_relay_app(
         except Exception:
             duration_ms = (time.perf_counter() - start_at) * 1000.0
             RELAY_LOGGER.exception(
-                "Relay 请求异常 method=%s path=%s client=%s duration_ms=%.2f",
-                method,
-                path,
-                client_host,
-                duration_ms,
+                "Relay 请求异常",
+                extra={
+                    "event": "relay.request.failed",
+                    "method": method,
+                    "path": path,
+                    "client_ip": client_host,
+                    "duration_ms": duration_ms,
+                },
             )
             raise
 
         duration_ms = (time.perf_counter() - start_at) * 1000.0
-        RELAY_LOGGER.info(
-            "Relay 请求完成 method=%s path=%s status=%s client=%s duration_ms=%.2f",
-            method,
-            path,
-            response.status_code,
-            client_host,
-            duration_ms,
-        )
+        level = logging.INFO
+        if response.status_code >= 500:
+            level = logging.ERROR
+        elif response.status_code >= 400:
+            level = logging.WARNING
+        extra = {
+            "event": "relay.request.completed",
+            "method": method,
+            "path": path,
+            "status_code": response.status_code,
+            "client_ip": client_host,
+            "duration_ms": duration_ms,
+        }
+        if _should_rate_limit_relay_request(path, response.status_code):
+            request_log_limiter.log(
+                RELAY_LOGGER,
+                level,
+                "Relay 请求完成",
+                key=("relay_request", method, path, response.status_code),
+                interval_sec=_RELAY_REQUEST_LOG_RATE_LIMIT_SEC,
+                extra=extra,
+            )
+        else:
+            RELAY_LOGGER.log(level, "Relay 请求完成", extra=extra)
         return response
 
     @app.get("/relay/health")
@@ -146,7 +175,14 @@ async def _forward_request(
                 media_type=upstream_response.headers.get("content-type"),
             )
     except httpx.HTTPError as exc:
-        RELAY_LOGGER.exception("Relay 转发失败 upstream=%s stream=%s", upstream_url, stream)
+        RELAY_LOGGER.exception(
+            "Relay 转发失败",
+            extra={
+                "event": "relay.upstream.failed",
+                "upstream_url": upstream_url,
+                "stream": stream,
+            },
+        )
         raise HTTPException(status_code=502, detail=f"relay upstream error: {exc}") from exc
 
 

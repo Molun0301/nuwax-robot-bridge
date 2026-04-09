@@ -21,7 +21,13 @@ from contracts.memory import MemoryPayloadFilter
 from contracts.skills import SkillCategory, SkillDescriptor
 from contracts.navigation import ExploreAreaRequest, NavigationGoal, NavigationStatus
 from core import CapabilityRegistry, EventBus, ResourceLockManager, RuntimeResource, SafetyGuard, StateNamespace, StateStore, TaskManager
-from drivers.robots.common.assembly import RobotAssemblyBase
+from drivers.robots.common import (
+    LoadedMapNameDataPlane,
+    MappingRuntimeControlDataPlane,
+    NamedMapRuntimeStatusDataPlane,
+    ObstacleAvoidanceControlDataPlane,
+    RobotAssemblyBase,
+)
 from drivers.robots.go2.capabilities import (
     GO2_SPORT_COMMAND_NAMES,
     build_go2_sport_command_description,
@@ -34,7 +40,7 @@ from providers import ImageProvider, MotionControl, SafetyProvider, StateProvide
 from services.artifact_service import ArtifactService
 from services.audio import AudioService
 from services.localization import LocalizationService
-from services.mapping import MappingService
+from services.mapping import MappingService, MapWorkspaceService
 from services.memory import MemoryService
 from services.navigation import NavigationService
 from services.observation_service import ObservationService
@@ -48,10 +54,12 @@ from services.perception import (
 )
 from services.robot_state_service import RobotStateService
 from skills import SkillRegistry
+from logging_utils import LogRateLimiter
 from settings import NuwaxRobotBridgeConfig
 
 
 RUNTIME_LOGGER = logging.getLogger("nuwax_robot_bridge.runtime")
+_RUNTIME_EVENT_LOG_RATE_LIMIT_SEC = 10.0
 
 
 def _schema_object(
@@ -263,8 +271,19 @@ class GatewayRuntime:
             event_bus=self.event_bus,
             history_limit=config.runtime_data.navigation_history_limit,
         )
+        self.map_workspace_service = MapWorkspaceService(
+            catalog_root=config.runtime_data.map_catalog_root,
+            mapping_service=self.mapping_service,
+            localization_service=self.localization_service,
+            memory_service=self.memory_service,
+            navigation_service=self.navigation_service,
+            state_store=self.state_store,
+            event_bus=self.event_bus,
+            auto_create_library=config.runtime_data.map_auto_create_library,
+        )
         self._lock = threading.RLock()
         self._started = False
+        self._runtime_event_log_limiter = LogRateLimiter()
         self._event_log_subscription_id = self.event_bus.subscribe(self._log_runtime_event)
         self._base_capability_matrix = robot.manifest.capability_matrix
         self._gateway_capability_names: Tuple[str, ...] = ()
@@ -304,6 +323,11 @@ class GatewayRuntime:
                 self.perception_video_runtime.start()
         except Exception:
             RUNTIME_LOGGER.exception("自动启动持续视频感知运行时失败。")
+        if self.config.runtime_data.map_active_restore_on_start:
+            try:
+                self.map_workspace_service.restore_active_workspace(load_memory_history=True)
+            except Exception:
+                RUNTIME_LOGGER.exception("恢复激活地图工作区失败。")
         self._refresh_dynamic_capability_matrix()
 
         self.event_bus.publish(
@@ -354,17 +378,39 @@ class GatewayRuntime:
             }.get(str(event.severity), logging.INFO)
             payload_preview = self._build_log_preview(event.payload)
             metadata_preview = self._build_log_preview(event.metadata)
-            RUNTIME_LOGGER.log(
+            extra = {
+                "event": "runtime.event",
+                "cursor": event.cursor or "-",
+                "category": str(event.category),
+                "runtime_event_type": event.event_type,
+                "source": event.source,
+                "task_id": event.task_id or "-",
+                "subject_id": event.subject_id or "-",
+                "severity": str(event.severity),
+            }
+            if event.message:
+                extra["runtime_message"] = event.message
+            if payload_preview != "-":
+                extra["payload_preview"] = payload_preview
+            if metadata_preview != "-":
+                extra["metadata_preview"] = metadata_preview
+            if level > logging.INFO:
+                RUNTIME_LOGGER.log(level, "运行时事件", extra=extra)
+                return
+            self._runtime_event_log_limiter.log(
+                RUNTIME_LOGGER,
                 level,
-                "运行时事件 category=%s type=%s source=%s task_id=%s subject_id=%s message=%s payload=%s metadata=%s",
-                event.category,
-                event.event_type,
-                event.source,
-                event.task_id or "-",
-                event.subject_id or "-",
-                event.message or "-",
-                payload_preview,
-                metadata_preview,
+                "运行时事件",
+                key=(
+                    "runtime_event",
+                    str(event.category),
+                    event.event_type,
+                    event.source,
+                    event.task_id or "-",
+                    event.subject_id or "-",
+                ),
+                interval_sec=_RUNTIME_EVENT_LOG_RATE_LIMIT_SEC,
+                extra=extra,
             )
         except Exception:
             RUNTIME_LOGGER.exception("写入运行时事件日志失败。")
@@ -580,10 +626,43 @@ class GatewayRuntime:
             _descriptor(
                 "get_localization_snapshot",
                 "获取定位快照",
-                "读取当前定位与 TF 快照，必要时从本地提供器刷新。",
+                "读取当前定位与 TF 快照；若已激活地图工作区，则优先返回平台地图版本绑定后的定位结果。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.LOW,
-                output_schema=_schema_object({"localization_snapshot": {"type": "object"}}),
+                output_schema=_schema_object(
+                    {
+                        "localization_snapshot": {"type": "object"},
+                        "localization_session": {"type": "object"},
+                    }
+                ),
+            ),
+            _descriptor(
+                "get_localization_session",
+                "获取定位会话",
+                "读取当前激活地图绑定的平台定位会话状态。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                output_schema=_schema_object(
+                    {
+                        "localization_session": {"type": "object"},
+                        "active_workspace": {"type": "object"},
+                    }
+                ),
+            ),
+            _descriptor(
+                "relocalize_active_map",
+                "重定位当前地图",
+                "对当前激活地图执行一次平台重定位刷新，并更新定位会话状态。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object({"map_name": {"type": "string"}}),
+                output_schema=_schema_object(
+                    {
+                        "localization_session": {"type": "object"},
+                        "localization_snapshot": {"type": "object"},
+                        "active_workspace": {"type": "object"},
+                    }
+                ),
             ),
             _descriptor(
                 "get_map_snapshot",
@@ -605,6 +684,121 @@ class GatewayRuntime:
                         "exploration_context": {"type": "object"},
                     }
                 ),
+            ),
+            _descriptor(
+                "get_navigation_semantic_context",
+                "获取导航语义上下文",
+                "读取当前平台地图版本绑定的语义区域、拓扑节点和空间锚点上下文。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                output_schema=_schema_object({"navigation_semantic_context": {"type": "object"}}),
+            ),
+            _descriptor(
+                "list_maps",
+                "列出地图",
+                "列出当前地图资产目录、激活地图和工作区摘要。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                output_schema=_schema_object({"maps": {"type": "array"}, "active_workspace": {"type": "object"}}),
+            ),
+            _descriptor(
+                "create_map",
+                "创建地图",
+                "按名称创建地图资产，并自动确保同名记忆库存在。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object(
+                    {
+                        "map_name": {"type": "string"},
+                    },
+                    required=("map_name",),
+                ),
+                output_schema=_schema_object({"map_asset": {"type": "object"}, "maps": {"type": "array"}, "active_workspace": {"type": "object"}}),
+            ),
+            _descriptor(
+                "activate_map",
+                "启用地图",
+                "启用一个命名地图工作区，并切换到其同名记忆库。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object(
+                    {
+                        "map_name": {"type": "string"},
+                        "load_memory_history": {"type": "boolean", "default": True},
+                        "reset_memory_library": {"type": "boolean", "default": False},
+                    },
+                    required=("map_name",),
+                ),
+                output_schema=_schema_object({"active_workspace": {"type": "object"}, "maps": {"type": "array"}, "memory_summary": {"type": "object"}}),
+            ),
+            _descriptor(
+                "delete_map",
+                "删除地图",
+                "按名称删除地图资产，并按需删除同名记忆库。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object(
+                    {
+                        "map_name": {"type": "string"},
+                        "delete_memory_library": {"type": "boolean"},
+                    },
+                    required=("map_name",),
+                ),
+                output_schema=_schema_object({"delete_result": {"type": "object"}, "maps": {"type": "array"}, "active_workspace": {"type": "object"}}),
+            ),
+            _descriptor(
+                "get_active_map",
+                "获取激活地图",
+                "读取当前激活地图工作区摘要。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                output_schema=_schema_object({"active_workspace": {"type": "object"}}),
+            ),
+            _descriptor(
+                "list_map_versions",
+                "列出地图版本",
+                "列出某张地图在平台侧已经保存的历史版本。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object(
+                    {
+                        "map_name": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1},
+                    },
+                    required=("map_name",),
+                ),
+                output_schema=_schema_object({"map_versions": {"type": "array"}}),
+            ),
+            _descriptor(
+                "save_active_map_version",
+                "保存当前地图版本",
+                "把当前激活地图工作区中的地图快照保存为平台正式版本。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object(
+                    {
+                        "map_name": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                ),
+                output_schema=_schema_object({"map_version": {"type": "object"}, "active_workspace": {"type": "object"}}),
+            ),
+            _descriptor(
+                "load_map_version",
+                "加载地图版本",
+                "把平台侧已保存的地图版本加载到当前地图工作区。",
+                execution_mode=CapabilityExecutionMode.SYNC,
+                risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object(
+                    {
+                        "map_name": {"type": "string"},
+                        "version_id": {"type": "string"},
+                        "load_memory_history": {"type": "boolean", "default": True},
+                        "reset_memory_library": {"type": "boolean", "default": False},
+                    },
+                    required=("map_name",),
+                ),
+                output_schema=_schema_object({"map_version": {"type": "object"}, "active_workspace": {"type": "object"}}),
             ),
             _descriptor(
                 "list_memory_libraries",
@@ -648,7 +842,15 @@ class GatewayRuntime:
                     },
                     required=("library_name",),
                 ),
-                output_schema=_schema_object({"memory_summary": {"type": "object"}, "libraries": {"type": "array"}}),
+                output_schema=_schema_object(
+                    {
+                        "compatibility_mode": {"type": "string"},
+                        "active_workspace": {"type": "object"},
+                        "maps": {"type": "array"},
+                        "memory_summary": {"type": "object"},
+                        "libraries": {"type": "array"},
+                    }
+                ),
             ),
             _descriptor(
                 "disable_memory_library",
@@ -656,7 +858,14 @@ class GatewayRuntime:
                 "停用当前激活的记忆库，并释放激活态向量缓存。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.LOW,
-                output_schema=_schema_object({"memory_summary": {"type": "object"}, "libraries": {"type": "array"}}),
+                output_schema=_schema_object(
+                    {
+                        "active_workspace": {"type": "object"},
+                        "maps": {"type": "array"},
+                        "memory_summary": {"type": "object"},
+                        "libraries": {"type": "array"},
+                    }
+                ),
             ),
             _descriptor(
                 "delete_memory_library",
@@ -673,6 +882,8 @@ class GatewayRuntime:
                 output_schema=_schema_object(
                     {
                         "delete_result": {"type": "object"},
+                        "active_workspace": {"type": "object"},
+                        "maps": {"type": "array"},
                         "memory_summary": {"type": "object"},
                         "libraries": {"type": "array"},
                     }
@@ -781,6 +992,7 @@ class GatewayRuntime:
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
                     {
+                        "map_name": {"type": "string"},
                         "frame_id": {"type": "string"},
                         "x": {"type": "number"},
                         "y": {"type": "number"},
@@ -806,6 +1018,7 @@ class GatewayRuntime:
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
                     {
+                        "map_name": {"type": "string"},
                         "target_name": {"type": "string"},
                         "camera_id": {"type": "string"},
                         "verify_on_arrival": {"type": "boolean", "default": True},
@@ -828,6 +1041,7 @@ class GatewayRuntime:
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
                     {
+                        "map_name": {"type": "string"},
                         "target_name": {"type": "string"},
                         "frame_id": {"type": "string"},
                         "x": {"type": "number"},
@@ -1033,8 +1247,19 @@ class GatewayRuntime:
             "start_perception_runtime": self._handle_start_perception_runtime,
             "stop_perception_runtime": self._handle_stop_perception_runtime,
             "get_localization_snapshot": self._handle_get_localization_snapshot,
+            "get_localization_session": self._handle_get_localization_session,
+            "relocalize_active_map": self._handle_relocalize_active_map,
             "get_map_snapshot": self._handle_get_map_snapshot,
             "get_navigation_snapshot": self._handle_get_navigation_snapshot,
+            "get_navigation_semantic_context": self._handle_get_navigation_semantic_context,
+            "list_maps": self._handle_list_maps,
+            "create_map": self._handle_create_map,
+            "activate_map": self._handle_activate_map,
+            "delete_map": self._handle_delete_map,
+            "get_active_map": self._handle_get_active_map,
+            "list_map_versions": self._handle_list_map_versions,
+            "save_active_map_version": self._handle_save_active_map_version,
+            "load_map_version": self._handle_load_map_version,
             "list_memory_libraries": self._handle_list_memory_libraries,
             "create_memory_library": self._handle_create_memory_library,
             "enable_memory_library": self._handle_enable_memory_library,
@@ -1119,9 +1344,23 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="get_localization_snapshot",
                 display_name="获取定位快照",
-                description="读取当前定位和 TF 快照。",
+                description="读取当前定位和 TF 快照，优先返回平台地图版本绑定后的定位结果。",
                 category=SkillCategory.SYSTEM,
                 capability_name="get_localization_snapshot",
+            ),
+            SkillDescriptor(
+                name="get_localization_session",
+                display_name="获取定位会话",
+                description="读取当前激活地图绑定的平台定位会话状态。",
+                category=SkillCategory.SYSTEM,
+                capability_name="get_localization_session",
+            ),
+            SkillDescriptor(
+                name="relocalize_active_map",
+                display_name="重定位当前地图",
+                description="对当前激活地图执行一次平台重定位刷新。",
+                category=SkillCategory.SYSTEM,
+                capability_name="relocalize_active_map",
             ),
             SkillDescriptor(
                 name="get_map_snapshot",
@@ -1136,6 +1375,13 @@ class GatewayRuntime:
                 description="读取当前导航和探索上下文。",
                 category=SkillCategory.SYSTEM,
                 capability_name="get_navigation_snapshot",
+            ),
+            SkillDescriptor(
+                name="get_navigation_semantic_context",
+                display_name="获取导航语义上下文",
+                description="读取当前平台地图版本绑定的语义区域、拓扑节点和空间锚点上下文。",
+                category=SkillCategory.SYSTEM,
+                capability_name="get_navigation_semantic_context",
             ),
             SkillDescriptor(
                 name="capture_image",
@@ -1262,6 +1508,62 @@ class GatewayRuntime:
                 description="把当前位姿与最新观察写入命名地点记忆。",
                 category=SkillCategory.MEMORY,
                 capability_name="tag_location",
+            ),
+            SkillDescriptor(
+                name="list_maps",
+                display_name="列出地图",
+                description="列出当前地图资产目录、激活地图和工作区摘要。",
+                category=SkillCategory.MEMORY,
+                capability_name="list_maps",
+            ),
+            SkillDescriptor(
+                name="create_map",
+                display_name="创建地图",
+                description="按名称创建地图资产，并自动确保同名记忆库存在。",
+                category=SkillCategory.MEMORY,
+                capability_name="create_map",
+            ),
+            SkillDescriptor(
+                name="activate_map",
+                display_name="启用地图",
+                description="启用一个命名地图工作区，并切换到其同名记忆库。",
+                category=SkillCategory.MEMORY,
+                capability_name="activate_map",
+            ),
+            SkillDescriptor(
+                name="delete_map",
+                display_name="删除地图",
+                description="按名称删除地图资产，并按需删除同名记忆库。",
+                category=SkillCategory.MEMORY,
+                capability_name="delete_map",
+            ),
+            SkillDescriptor(
+                name="get_active_map",
+                display_name="获取激活地图",
+                description="读取当前激活地图工作区摘要。",
+                category=SkillCategory.MEMORY,
+                capability_name="get_active_map",
+            ),
+            SkillDescriptor(
+                name="list_map_versions",
+                display_name="列出地图版本",
+                description="列出某张地图在平台侧已保存的历史版本。",
+                category=SkillCategory.MEMORY,
+                capability_name="list_map_versions",
+            ),
+            SkillDescriptor(
+                name="save_active_map_version",
+                display_name="保存当前地图版本",
+                description="把当前激活地图工作区中的地图快照保存为平台版本。",
+                category=SkillCategory.MEMORY,
+                capability_name="save_active_map_version",
+            ),
+            SkillDescriptor(
+                name="load_map_version",
+                display_name="加载地图版本",
+                description="把平台侧已保存的地图版本加载到当前地图工作区。",
+                category=SkillCategory.MEMORY,
+                capability_name="load_map_version",
             ),
             SkillDescriptor(
                 name="list_memory_libraries",
@@ -1482,6 +1784,7 @@ class GatewayRuntime:
             "latest_navigation": self._serialize(self.navigation_service.get_latest_navigation_context()),
             "latest_exploration": self._serialize(self.navigation_service.get_latest_exploration_context()),
             "memory_summary": self.memory_service.get_summary().model_dump(mode="json"),
+            "active_map_workspace": self._serialize(self.map_workspace_service.get_active_workspace()),
             "audio_state": self.audio_service.get_volume_state(),
             "active_task_count": len(self.task_manager.list_active_tasks()),
             "latest_event_cursor": self.event_bus.latest_cursor(),
@@ -1500,6 +1803,7 @@ class GatewayRuntime:
             "events": self.task_manager.get_task_events(task_id),
             "result": self.task_manager.get_task_result(task_id),
             "error": self.task_manager.get_task_error(task_id),
+            "error_payload": self.task_manager.get_task_error_payload(task_id),
         }
 
     def _handle_get_robot_status(self, _: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
@@ -1668,11 +1972,48 @@ class GatewayRuntime:
         *,
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
-        del requested_by
+        active_workspace = self.map_workspace_service.get_active_workspace()
+        localization_session = None
+        if active_workspace is not None and active_workspace.map_loaded:
+            localization_session = self.map_workspace_service.sync_active_localization_session(
+                refresh=True,
+                metadata={"requested_by": requested_by or "unknown", "source": "get_localization_snapshot"},
+            )
         snapshot = self.localization_service.get_latest_snapshot()
-        if snapshot is None:
+        if snapshot is None and self.localization_service.is_available():
             snapshot = self.localization_service.refresh()
-        return {"localization_snapshot": snapshot}
+        return {
+            "localization_snapshot": snapshot,
+            "localization_session": localization_session or self.map_workspace_service.get_active_localization_session(),
+        }
+
+    def _handle_get_localization_session(
+        self,
+        _: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        return {
+            "localization_session": self.map_workspace_service.get_active_localization_session(),
+            "active_workspace": self.map_workspace_service.get_active_workspace(),
+        }
+
+    def _handle_relocalize_active_map(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        localization_session, active_workspace = self.map_workspace_service.relocalize_active_map(
+            map_name=str(arguments.get("map_name", "")).strip() or None,
+            metadata={"requested_by": requested_by or "unknown", "source": "relocalize_active_map"},
+        )
+        return {
+            "localization_session": localization_session,
+            "localization_snapshot": self.localization_service.get_latest_snapshot(),
+            "active_workspace": active_workspace,
+        }
 
     def _handle_get_map_snapshot(self, _: Dict[str, Any], *, requested_by: Optional[str] = None) -> Dict[str, Any]:
         del requested_by
@@ -1702,6 +2043,20 @@ class GatewayRuntime:
             "exploration_context": exploration_context,
         }
 
+    def _handle_get_navigation_semantic_context(
+        self,
+        _: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        active_workspace = self.map_workspace_service.get_active_workspace()
+        return {
+            "navigation_semantic_context": self.memory_service.get_navigation_semantic_context(
+                map_name=active_workspace.active_map_name if active_workspace is not None else None,
+            )
+        }
+
     def _handle_list_memory_libraries(
         self,
         _: Dict[str, Any],
@@ -1712,6 +2067,154 @@ class GatewayRuntime:
         return {
             "libraries": self.memory_service.list_memory_libraries(),
             "memory_summary": self.memory_service.get_summary(),
+        }
+
+    def _handle_list_maps(
+        self,
+        _: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        return {
+            "maps": self.map_workspace_service.list_maps(),
+            "active_workspace": self.map_workspace_service.get_active_workspace(),
+        }
+
+    def _handle_create_map(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        map_name = self._require_str(arguments, "map_name")
+        map_asset = self.map_workspace_service.create_map(
+            map_name=map_name,
+            metadata={"requested_by": requested_by or "unknown"},
+        )
+        return {
+            "map_asset": map_asset,
+            "maps": self.map_workspace_service.list_maps(),
+            "active_workspace": self.map_workspace_service.get_active_workspace(),
+        }
+
+    def _handle_activate_map(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        map_name = self._require_str(arguments, "map_name")
+        active_workspace = self.map_workspace_service.activate_map(
+            map_name=map_name,
+            create_if_missing=False,
+            load_memory_history=bool(arguments.get("load_memory_history", True)),
+            reset_memory_library=bool(arguments.get("reset_memory_library", False)),
+            metadata={"requested_by": requested_by or "unknown"},
+        )
+        self._ensure_robot_mapping_runtime_enabled(trigger="activate_map")
+        has_platform_map_version = bool(
+            active_workspace is not None
+            and active_workspace.map_asset is not None
+            and active_workspace.map_asset.latest_version_id
+        )
+        if not has_platform_map_version:
+            self._refresh_workspace_snapshots()
+        self._sync_perception_runtime_for_memory_state(enabled=True)
+        active_workspace = self.map_workspace_service.get_active_workspace() or active_workspace
+        return {
+            "active_workspace": active_workspace,
+            "maps": self.map_workspace_service.list_maps(),
+            "memory_summary": self.memory_service.get_summary(),
+            "map_runtime": self._get_robot_named_map_runtime_status(),
+        }
+
+    def _handle_delete_map(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        map_name = self._require_str(arguments, "map_name")
+        delete_result = self.map_workspace_service.delete_map(
+            map_name=map_name,
+            delete_memory_library=bool(
+                arguments.get(
+                    "delete_memory_library",
+                    self.config.runtime_data.map_delete_also_delete_library,
+                )
+            ),
+        )
+        if bool(delete_result.get("was_active")):
+            self._sync_perception_runtime_for_memory_state(enabled=False)
+            self._disable_robot_mapping_runtime(trigger="delete_map")
+        return {
+            "delete_result": delete_result,
+            "maps": self.map_workspace_service.list_maps(),
+            "active_workspace": self.map_workspace_service.get_active_workspace(),
+        }
+
+    def _handle_get_active_map(
+        self,
+        _: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        return {
+            "active_workspace": self.map_workspace_service.get_active_workspace(),
+        }
+
+    def _handle_list_map_versions(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del requested_by
+        map_name = self._require_str(arguments, "map_name")
+        return {
+            "map_versions": self.map_workspace_service.list_map_versions(
+                map_name=map_name,
+                limit=self._int(arguments, "limit", 20),
+            )
+        }
+
+    def _handle_save_active_map_version(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        map_version = self.map_workspace_service.save_map_version(
+            map_name=str(arguments.get("map_name", "")).strip() or None,
+            reason=str(arguments.get("reason", "")).strip(),
+            metadata={"requested_by": requested_by or "unknown"},
+        )
+        return {
+            "map_version": map_version,
+            "active_workspace": self.map_workspace_service.get_active_workspace(),
+        }
+
+    def _handle_load_map_version(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        requested_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        map_name = self._require_str(arguments, "map_name")
+        map_version, workspace = self.map_workspace_service.load_map_version(
+            map_name=map_name,
+            version_id=str(arguments.get("version_id", "")).strip() or None,
+            activate_if_needed=True,
+            load_memory_history=bool(arguments.get("load_memory_history", True)),
+            reset_memory_library=bool(arguments.get("reset_memory_library", False)),
+            metadata={"requested_by": requested_by or "unknown", "source": "load_map_version"},
+        )
+        return {
+            "map_version": map_version,
+            "active_workspace": workspace,
         }
 
     def _handle_create_memory_library(
@@ -1735,18 +2238,36 @@ class GatewayRuntime:
         *,
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
-        del requested_by
         library_name = self._require_str(arguments, "library_name")
-        self.memory_service.activate_memory_library(
-            library_name=library_name,
-            load_history=bool(arguments.get("load_history", True)),
-            reset_library=bool(arguments.get("reset_library", False)),
+        map_asset = self.map_workspace_service.get_map(library_name)
+        active_workspace = None
+        compatibility_mode = "memory_library_only"
+        if map_asset is not None:
+            active_workspace = self.map_workspace_service.activate_map(
+                map_name=library_name,
+                create_if_missing=False,
+                load_memory_history=bool(arguments.get("load_history", True)),
+                reset_memory_library=bool(arguments.get("reset_library", False)),
+                metadata={"requested_by": requested_by or "unknown", "source": "enable_memory_library"},
+            )
+            compatibility_mode = "map_workspace"
+        else:
+            self.memory_service.activate_memory_library(
+                library_name=library_name,
+                load_history=bool(arguments.get("load_history", True)),
+                reset_library=bool(arguments.get("reset_library", False)),
         )
         self._ensure_robot_mapping_runtime_enabled(trigger="enable_memory_library")
+        if compatibility_mode == "map_workspace" and active_workspace is not None:
+            self._refresh_workspace_snapshots()
         self._sync_perception_runtime_for_memory_state(enabled=True)
         return {
+            "compatibility_mode": compatibility_mode,
+            "active_workspace": active_workspace or self.map_workspace_service.get_active_workspace(),
+            "maps": self.map_workspace_service.list_maps(),
             "libraries": self.memory_service.list_memory_libraries(),
             "memory_summary": self.memory_service.get_summary(),
+            "map_runtime": self._get_robot_named_map_runtime_status(),
         }
 
     def _handle_disable_memory_library(
@@ -1756,10 +2277,15 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
         del requested_by
+        active_workspace = self.map_workspace_service.get_active_workspace()
         self.memory_service.disable_memory_library()
+        if active_workspace is not None and active_workspace.active_map_name == active_workspace.active_memory_library_name:
+            self.map_workspace_service.clear_active_map(disable_memory_library=False)
         self._sync_perception_runtime_for_memory_state(enabled=False)
         self._disable_robot_mapping_runtime(trigger="disable_memory_library")
         return {
+            "active_workspace": self.map_workspace_service.get_active_workspace(),
+            "maps": self.map_workspace_service.list_maps(),
             "libraries": self.memory_service.list_memory_libraries(),
             "memory_summary": self.memory_service.get_summary(),
         }
@@ -1772,12 +2298,17 @@ class GatewayRuntime:
     ) -> Dict[str, Any]:
         del requested_by
         library_name = self._require_str(arguments, "library_name")
+        active_workspace = self.map_workspace_service.get_active_workspace()
         delete_result = self.memory_service.delete_memory_library(library_name=library_name)
+        if active_workspace is not None and active_workspace.active_map_name == library_name:
+            self.map_workspace_service.clear_active_map(disable_memory_library=False)
         if bool(delete_result.get("was_active")):
             self._sync_perception_runtime_for_memory_state(enabled=False)
             self._disable_robot_mapping_runtime(trigger="delete_memory_library")
         return {
             "delete_result": delete_result,
+            "active_workspace": self.map_workspace_service.get_active_workspace(),
+            "maps": self.map_workspace_service.list_maps(),
             "libraries": self.memory_service.list_memory_libraries(),
             "memory_summary": self.memory_service.get_summary(),
         }
@@ -1857,9 +2388,23 @@ class GatewayRuntime:
         return {"semantic_memory": entry}
 
     def _handle_navigate_to_pose(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None):
+        map_name, workspace = self._resolve_map_workspace_for_request(
+            arguments,
+            capability_name="navigate_to_pose",
+            requested_by=requested_by,
+            create_if_missing=False,
+        )
+        self._ensure_robot_mapping_runtime_enabled(trigger="navigate_to_pose")
+        self._refresh_workspace_snapshots()
+        self._ensure_localization_ready(
+            capability_name="navigate_to_pose",
+            map_name=map_name,
+            workspace=workspace,
+        )
         pose = self._build_pose_from_arguments(arguments)
         goal = NavigationGoal(
             goal_id=self._build_runtime_request_id("nav_pose"),
+            map_name=map_name,
             target_pose=pose,
             tolerance_position_m=self._float(arguments, "tolerance_position_m", 0.3),
             tolerance_yaw_rad=self._float(arguments, "tolerance_yaw_rad", 0.3),
@@ -1876,24 +2421,57 @@ class GatewayRuntime:
         )
 
     def _handle_navigate_to_named_location(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None):
+        map_name, workspace = self._resolve_map_workspace_for_request(
+            arguments,
+            capability_name="navigate_to_named_location",
+            requested_by=requested_by,
+            create_if_missing=False,
+        )
+        self._ensure_robot_mapping_runtime_enabled(trigger="navigate_to_named_location")
+        self._refresh_workspace_snapshots()
+        self._ensure_localization_ready(
+            capability_name="navigate_to_named_location",
+            map_name=map_name,
+            workspace=workspace,
+        )
+        workspace = self.map_workspace_service.get_active_workspace() or workspace
         target_name = self._require_str(arguments, "target_name")
         camera_id = str(arguments.get("camera_id", "")).strip() or None
         verify_on_arrival = bool(arguments.get("verify_on_arrival", True))
         verify_similarity_threshold = self._float(arguments, "verify_similarity_threshold", 0.55)
+        self._ensure_workspace_memory_library_ready(map_name=map_name)
+        current_map_version_id = (
+            workspace.latest_map_snapshot.version_id
+            if workspace is not None and workspace.latest_map_snapshot is not None
+            else None
+        )
+        current_localization_session_id = (
+            workspace.active_localization_session.session_id
+            if workspace is not None and workspace.active_localization_session is not None
+            else None
+        )
         navigation_candidate = None
-        tagged_location = self.memory_service.resolve_tagged_location(target_name)
+        tagged_location = self.memory_service.resolve_tagged_location(
+            target_name,
+            map_version_id=current_map_version_id,
+        )
         if tagged_location is not None:
             navigation_candidate = self.memory_service.resolve_navigation_candidate(
                 target_name,
                 camera_id=camera_id,
+                map_version_id=current_map_version_id,
+                localization_session_id=current_localization_session_id,
             )
             goal = NavigationGoal(
                 goal_id=self._build_runtime_request_id("nav_memory"),
+                map_name=map_name,
                 target_pose=tagged_location.pose,
                 target_name=tagged_location.name,
                 metadata={
                     "resolved_from": "memory",
                     "location_id": tagged_location.location_id,
+                    "map_version_id": current_map_version_id,
+                    "localization_session_id": current_localization_session_id,
                     "requested_by": requested_by or "unknown",
                 },
             )
@@ -1901,26 +2479,54 @@ class GatewayRuntime:
             navigation_candidate = self.memory_service.resolve_navigation_candidate(
                 target_name,
                 camera_id=camera_id,
+                map_version_id=current_map_version_id,
+                localization_session_id=current_localization_session_id,
             )
             if navigation_candidate is not None:
                 goal = NavigationGoal(
                     goal_id=self._build_runtime_request_id("nav_memory_query"),
+                    map_name=map_name,
                     target_pose=navigation_candidate.target_pose,
                     target_name=navigation_candidate.target_name,
                     metadata={
                         "resolved_from": "semantic_memory",
                         "record_id": navigation_candidate.record_id,
                         "record_kind": navigation_candidate.record_kind.value,
+                        "map_version_id": current_map_version_id,
+                        "localization_session_id": current_localization_session_id,
                         "requested_by": requested_by or "unknown",
                     },
                 )
             else:
-                goal = self.navigation_service.resolve_named_goal(target_name)
+                try:
+                    goal = self.memory_service.resolve_semantic_region_goal(
+                        target_name,
+                        map_name=map_name,
+                    )
+                except GatewayError as exc:
+                    if "没有可导航的中心位姿" in exc.message:
+                        raise GatewayError(
+                            "地图 %s 中的目标 %s 当前不可达。" % (map_name, target_name),
+                            error_code="target_not_reachable",
+                            http_status=409,
+                            jsonrpc_code=-32000,
+                            details={"map_name": map_name, "target_name": target_name},
+                        ) from exc
+                    raise GatewayError(
+                        "未在地图 %s 的记忆库或语义区域中找到目标：%s" % (map_name, target_name),
+                        error_code="target_not_found_in_memory",
+                        http_status=404,
+                        jsonrpc_code=-32004,
+                        details={"map_name": map_name, "target_name": target_name},
+                    ) from exc
         goal = goal.model_copy(
             update={
+                "map_name": map_name,
                 "goal_id": self._build_runtime_request_id("nav_named"),
                 "metadata": {
                     **dict(goal.metadata),
+                    "map_version_id": current_map_version_id,
+                    "localization_session_id": current_localization_session_id,
                     "requested_by": requested_by or "unknown",
                 },
             },
@@ -1928,6 +2534,7 @@ class GatewayRuntime:
         )
         poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.1)
         timeout_sec = self._resolve_async_timeout("navigate_to_named_location", arguments, minimum_sec=0.1)
+        should_fail_on_arrival_verification = navigation_candidate is not None
         return self._submit_navigation_task(
             capability_name="navigate_to_named_location",
             goal=goal,
@@ -1935,32 +2542,45 @@ class GatewayRuntime:
             timeout_sec=timeout_sec,
             requested_by=requested_by,
             completion_callback=(
-                (lambda _navigation_context: {
-                    "burst_messages": self.perception_video_runtime.run_burst(
-                        frame_count=3,
-                        interval_sec=0.05,
-                        requested_reason="arrival_verify",
-                        store_artifact=False,
-                    ),
-                    "arrival_verification": self.memory_service.verify_arrival(
-                        target_name,
-                        navigation_candidate=navigation_candidate,
+                (
+                    lambda _navigation_context: self._build_navigation_arrival_result(
+                        map_name=map_name,
+                        target_name=target_name,
                         camera_id=camera_id,
-                        similarity_threshold=verify_similarity_threshold,
+                        navigation_candidate=navigation_candidate,
+                        verify_similarity_threshold=verify_similarity_threshold,
+                        strict=should_fail_on_arrival_verification,
+                        expected_map_version_id=current_map_version_id,
+                        localization_session_id=current_localization_session_id,
                     )
-                })
+                )
                 if verify_on_arrival
                 else None
             ),
         )
 
     def _handle_explore_area(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None):
+        map_name, workspace = self._resolve_map_workspace_for_request(
+            arguments,
+            capability_name="explore_area",
+            requested_by=requested_by,
+            create_if_missing=True,
+        )
+        self._ensure_robot_mapping_runtime_enabled(trigger="explore_area")
+        self._refresh_workspace_snapshots()
+        if self._workspace_requires_localization_before_explore(workspace):
+            self._ensure_localization_ready(
+                capability_name="explore_area",
+                map_name=map_name,
+                workspace=workspace,
+            )
         target_name = str(arguments.get("target_name", "")).strip() or None
         center_pose = None
         if "frame_id" in arguments or "x" in arguments or "y" in arguments:
             center_pose = self._build_pose_from_arguments(arguments)
         request = ExploreAreaRequest(
             request_id=self._build_runtime_request_id("explore"),
+            map_name=map_name,
             center_pose=center_pose,
             target_name=target_name,
             radius_m=self._float(arguments, "radius_m", 0.0) or None,
@@ -2318,10 +2938,9 @@ class GatewayRuntime:
         del requested_by
         enabled = bool(arguments.get("enabled", True))
         data_plane = getattr(self.robot, "data_plane", None)
-        if data_plane is None or not hasattr(data_plane, "set_obstacle_avoidance_enabled"):
+        if data_plane is None or not isinstance(data_plane, ObstacleAvoidanceControlDataPlane):
             raise GatewayError("当前机器人入口不支持避障开关控制。")
-        availability_checker = getattr(data_plane, "is_obstacle_avoidance_control_available", None)
-        if callable(availability_checker) and not availability_checker():
+        if not data_plane.is_obstacle_avoidance_control_available():
             raise GatewayError("Go2 官方 obstacles_avoid 服务未就绪，当前不能切换实时避障。")
         try:
             result = data_plane.set_obstacle_avoidance_enabled(enabled)
@@ -2333,15 +2952,164 @@ class GatewayRuntime:
 
     def _is_obstacle_avoidance_control_available(self) -> bool:
         data_plane = getattr(self.robot, "data_plane", None)
-        if data_plane is None or not hasattr(data_plane, "set_obstacle_avoidance_enabled"):
+        if data_plane is None or not isinstance(data_plane, ObstacleAvoidanceControlDataPlane):
             return False
-        availability_checker = getattr(data_plane, "is_obstacle_avoidance_control_available", None)
-        if callable(availability_checker):
-            try:
-                return bool(availability_checker())
-            except Exception:
-                return False
-        return True
+        try:
+            return bool(data_plane.is_obstacle_avoidance_control_available())
+        except Exception:
+            return False
+
+    def _resolve_map_workspace_for_request(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        capability_name: str,
+        requested_by: Optional[str],
+        create_if_missing: bool,
+    ):
+        explicit_map_name = str(arguments.get("map_name", "")).strip() or None
+        if explicit_map_name:
+            workspace = self.map_workspace_service.ensure_workspace(
+                map_name=explicit_map_name,
+                create_if_missing=create_if_missing,
+                load_memory_history=True,
+                reset_memory_library=False,
+                metadata={"requested_by": requested_by or "unknown", "source": capability_name},
+            )
+            return explicit_map_name, workspace
+        workspace = self.map_workspace_service.get_active_workspace()
+        if workspace is None or not workspace.active_map_name:
+            raise GatewayError(
+                "执行 %s 前必须先提供 map_name 或先调用 activate_map。" % capability_name,
+                error_code="map_not_activated",
+                http_status=409,
+                jsonrpc_code=-32000,
+            )
+        return workspace.active_map_name, workspace
+
+    def _refresh_workspace_snapshots(self) -> None:
+        active_workspace = self.map_workspace_service.get_active_workspace()
+        refresh_live_map = True
+        if active_workspace is not None and active_workspace.latest_map_snapshot is not None:
+            refresh_live_map = (
+                active_workspace.latest_map_snapshot.metadata.get("source_kind") != "platform_map_version"
+            )
+        try:
+            if refresh_live_map and self.mapping_service.is_available():
+                self.mapping_service.refresh()
+        except Exception:
+            pass
+        try:
+            if active_workspace is not None:
+                self.map_workspace_service.sync_active_localization_session(
+                    refresh=True,
+                    metadata={"source": "refresh_workspace_snapshots"},
+                )
+            elif self.localization_service.is_available():
+                self.localization_service.refresh()
+        except Exception:
+            pass
+
+    def _ensure_workspace_memory_library_ready(self, *, map_name: str) -> None:
+        active_library_name = self.memory_service.get_active_library_name()
+        if active_library_name == map_name:
+            return
+        raise GatewayError(
+            "地图 %s 缺少可用的同名记忆库激活态。" % map_name,
+            error_code="memory_library_missing",
+            http_status=409,
+            jsonrpc_code=-32000,
+            details={
+                "map_name": map_name,
+                "expected_library_name": map_name,
+                "active_library_name": active_library_name,
+            },
+        )
+
+    def _workspace_requires_localization_before_explore(self, workspace) -> bool:
+        if workspace is None or workspace.map_asset is None:
+            return False
+        if workspace.map_loaded:
+            return True
+        return bool(workspace.map_asset.latest_version_id)
+
+    def _ensure_localization_ready(
+        self,
+        *,
+        capability_name: str,
+        map_name: str,
+        workspace,
+    ):
+        localization_session = self.map_workspace_service.get_active_localization_session()
+        localization_snapshot = self.localization_service.get_latest_snapshot()
+        if (
+            localization_session is not None
+            and localization_session.map_name == map_name
+            and localization_session.status.value == "ready"
+            and localization_snapshot is not None
+            and localization_snapshot.current_pose is not None
+        ):
+            return localization_snapshot
+        raise GatewayError(
+            "地图 %s 当前尚未完成定位，无法执行 %s。" % (map_name, capability_name),
+            error_code="localization_unavailable",
+            http_status=409,
+            jsonrpc_code=-32000,
+            details={
+                "map_name": map_name,
+                "capability_name": capability_name,
+                "workspace_active": bool(workspace is not None and workspace.active_map_name == map_name),
+                "localization_session_status": (
+                    localization_session.status.value if localization_session is not None else None
+                ),
+                "map_version_id": (
+                    localization_session.map_version_id if localization_session is not None else None
+                ),
+            },
+        )
+
+    def _build_navigation_arrival_result(
+        self,
+        *,
+        map_name: str,
+        target_name: str,
+        camera_id: Optional[str],
+        navigation_candidate,
+        verify_similarity_threshold: float,
+        strict: bool,
+        expected_map_version_id: Optional[str],
+        localization_session_id: Optional[str],
+    ) -> Dict[str, Any]:
+        burst_messages = self.perception_video_runtime.run_burst(
+            frame_count=3,
+            interval_sec=0.05,
+            requested_reason="arrival_verify",
+            store_artifact=False,
+        )
+        arrival_verification = self.memory_service.verify_arrival(
+            target_name,
+            navigation_candidate=navigation_candidate,
+            camera_id=camera_id,
+            similarity_threshold=verify_similarity_threshold,
+            expected_map_version_id=expected_map_version_id,
+            localization_session_id=localization_session_id,
+        )
+        if strict and not arrival_verification.verified:
+            raise GatewayError(
+                "到点复核失败：%s" % arrival_verification.reason,
+                error_code="arrival_verification_failed",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={
+                    "map_name": map_name,
+                    "target_name": target_name,
+                    "arrival_verification": arrival_verification.model_dump(mode="json"),
+                },
+            )
+        return {
+            "burst_messages": burst_messages,
+            "arrival_verification": arrival_verification,
+        }
 
     def _safe_stop_robot(self, reason: Optional[str]) -> None:
         providers = getattr(self.robot, "providers", None)
@@ -2374,6 +3142,7 @@ class GatewayRuntime:
 
         def runner(context) -> Dict[str, Any]:
             last_context = self.navigation_service.set_goal(goal)
+            finalized = False
             context.update(
                 progress=0.05,
                 stage="accepted",
@@ -2403,13 +3172,52 @@ class GatewayRuntime:
                         }
                         if completion_callback is not None:
                             result.update(dict(completion_callback(last_context) or {}))
+                        result.update(
+                            self._finalize_workspace_assets_after_task(
+                                map_name=goal.map_name,
+                                trigger=f"{capability_name}_completed",
+                            )
+                        )
+                        finalized = True
                         return result
                     if status == NavigationStatus.FAILED:
-                        raise GatewayError(last_context.navigation_state.message or "导航执行失败。")
+                        raise GatewayError(
+                            last_context.navigation_state.message or "导航执行失败。",
+                            error_code="target_not_reachable",
+                            http_status=409,
+                            jsonrpc_code=-32000,
+                            details={
+                                "goal_id": goal.goal_id,
+                                "map_name": goal.map_name,
+                                "target_name": goal.target_name,
+                            },
+                        )
                     if status == NavigationStatus.CANCELLED:
-                        raise GatewayError(last_context.navigation_state.message or "导航已取消。")
+                        raise GatewayError(
+                            last_context.navigation_state.message or "导航已取消。",
+                            error_code="navigation_cancelled",
+                            http_status=409,
+                            jsonrpc_code=-32000,
+                            details={
+                                "goal_id": goal.goal_id,
+                                "map_name": goal.map_name,
+                                "target_name": goal.target_name,
+                            },
+                        )
                     time.sleep(poll_interval_sec)
             finally:
+                if not finalized:
+                    try:
+                        self._finalize_workspace_assets_after_task(
+                            map_name=goal.map_name,
+                            trigger=f"{capability_name}_finalize",
+                        )
+                    except Exception:
+                        RUNTIME_LOGGER.exception(
+                            "导航任务结束后刷新地图工作区失败 capability=%s map_name=%s",
+                            capability_name,
+                            goal.map_name,
+                        )
                 if context.is_cancel_requested() or context.is_timed_out():
                     try:
                         self.navigation_service.cancel_goal()
@@ -2421,6 +3229,7 @@ class GatewayRuntime:
             runner,
             input_payload={
                 "goal_id": goal.goal_id,
+                "map_name": goal.map_name,
                 "target_name": goal.target_name,
                 "target_pose": goal.target_pose.model_dump(mode="json") if goal.target_pose is not None else None,
                 "poll_interval_sec": poll_interval_sec,
@@ -2446,6 +3255,7 @@ class GatewayRuntime:
             context.update(progress=0.02, stage="prepare_exploration_runtime", message="按需准备探索建图运行时。")
             self._ensure_robot_mapping_runtime_enabled(trigger="explore_area")
             last_context = self.navigation_service.start_exploration(request)
+            finalized = False
             context.update(
                 progress=0.05,
                 stage="accepted",
@@ -2469,16 +3279,35 @@ class GatewayRuntime:
                     )
                     if status.value == "succeeded":
                         context.update(progress=1.0, stage="completed", message="探索任务已完成。")
-                        return {
+                        result = {
                             "request_id": request.request_id,
                             "exploration_context": last_context,
                         }
+                        result.update(
+                            self._finalize_workspace_assets_after_task(
+                                map_name=request.map_name,
+                                trigger="explore_area_completed",
+                            )
+                        )
+                        finalized = True
+                        return result
                     if status.value == "failed":
                         raise GatewayError(last_context.exploration_state.message or "探索执行失败。")
                     if status.value == "cancelled":
                         raise GatewayError(last_context.exploration_state.message or "探索已取消。")
                     time.sleep(poll_interval_sec)
             finally:
+                if not finalized:
+                    try:
+                        self._finalize_workspace_assets_after_task(
+                            map_name=request.map_name,
+                            trigger="explore_area_finalize",
+                        )
+                    except Exception:
+                        RUNTIME_LOGGER.exception(
+                            "探索任务结束后刷新地图工作区失败 map_name=%s",
+                            request.map_name,
+                        )
                 if context.is_cancel_requested() or context.is_timed_out():
                     try:
                         self.navigation_service.stop_exploration()
@@ -2490,6 +3319,7 @@ class GatewayRuntime:
             runner,
             input_payload={
                 "request_id": request.request_id,
+                "map_name": request.map_name,
                 "target_name": request.target_name,
                 "center_pose": request.center_pose.model_dump(mode="json") if request.center_pose is not None else None,
                 "radius_m": request.radius_m,
@@ -2593,31 +3423,63 @@ class GatewayRuntime:
         if status.running:
             self.perception_video_runtime.stop()
 
-    def _ensure_robot_mapping_runtime_enabled(self, *, trigger: str) -> None:
+    def _get_robot_named_map_runtime_status(self) -> Optional[Dict[str, Any]]:
         data_plane = getattr(self.robot, "data_plane", None)
         if data_plane is None:
-            return
-        ensure_mapping = getattr(data_plane, "ensure_mapping_runtime_enabled", None)
-        if not callable(ensure_mapping):
+            return None
+        payload: Optional[Dict[str, Any]] = None
+        try:
+            if isinstance(data_plane, NamedMapRuntimeStatusDataPlane):
+                raw_payload = data_plane.get_named_map_runtime_status()
+                if isinstance(raw_payload, dict):
+                    payload = dict(raw_payload)
+            elif isinstance(data_plane, LoadedMapNameDataPlane):
+                payload = {
+                    "loaded_map_name": data_plane.get_loaded_map_name(),
+                }
+        except Exception:
+            RUNTIME_LOGGER.exception("读取机器人命名地图兼容状态失败。")
+            return None
+        if payload is None:
+            return None
+        payload.setdefault("runtime_scope", "compatibility_only")
+        payload.setdefault("used_by_platform", False)
+        return payload
+
+    def _finalize_workspace_assets_after_task(
+        self,
+        *,
+        map_name: Optional[str],
+        trigger: str,
+    ) -> Dict[str, Any]:
+        if not map_name:
+            return {}
+        self._refresh_workspace_snapshots()
+        active_workspace = self.map_workspace_service.get_active_workspace()
+        return {
+            "map_runtime": self._get_robot_named_map_runtime_status(),
+            "active_workspace": active_workspace,
+        }
+
+    def _ensure_robot_mapping_runtime_enabled(self, *, trigger: str) -> None:
+        data_plane = getattr(self.robot, "data_plane", None)
+        if data_plane is None or not isinstance(data_plane, MappingRuntimeControlDataPlane):
             return
         try:
-            ensure_mapping(reason=trigger)
+            data_plane.ensure_mapping_runtime_enabled(reason=trigger)
         except TypeError:
-            ensure_mapping()
+            data_plane.ensure_mapping_runtime_enabled()
         except Exception:
             RUNTIME_LOGGER.exception("按需启用机器人建图运行时失败 trigger=%s", trigger)
 
     def _disable_robot_mapping_runtime(self, *, trigger: str) -> None:
         data_plane = getattr(self.robot, "data_plane", None)
-        if data_plane is None:
-            return
-        disable_mapping = getattr(data_plane, "disable_mapping_runtime", None)
-        if not callable(disable_mapping):
+        if data_plane is None or not isinstance(data_plane, MappingRuntimeControlDataPlane):
             return
         try:
-            result = disable_mapping(reason=trigger)
+            result = data_plane.disable_mapping_runtime(reason=trigger)
         except TypeError:
-            result = disable_mapping()
+            result = data_plane.disable_mapping_runtime()
         except Exception:
             RUNTIME_LOGGER.exception("回收机器人建图运行时失败 trigger=%s", trigger)
             return
@@ -2671,6 +3533,14 @@ class GatewayRuntime:
                 self.localization_service.is_available(),
                 "当前机器人入口未提供定位提供器，且还没有外部定位快照。",
             ),
+            "get_localization_session": (
+                True,
+                None,
+            ),
+            "relocalize_active_map": (
+                self.localization_service.is_available(),
+                "当前机器人入口未提供定位提供器。",
+            ),
             "get_map_snapshot": (
                 self.mapping_service.is_available(),
                 "当前机器人入口未提供地图提供器，且还没有外部地图快照。",
@@ -2678,6 +3548,42 @@ class GatewayRuntime:
             "get_navigation_snapshot": (
                 self.navigation_service.is_navigation_available() or self.navigation_service.is_exploration_available(),
                 "当前机器人入口未提供导航或探索后端。",
+            ),
+            "get_navigation_semantic_context": (
+                self.mapping_service.is_available(),
+                "当前机器人入口未提供地图提供器，且还没有平台地图快照。",
+            ),
+            "list_maps": (
+                True,
+                None,
+            ),
+            "create_map": (
+                True,
+                None,
+            ),
+            "activate_map": (
+                True,
+                None,
+            ),
+            "delete_map": (
+                True,
+                None,
+            ),
+            "get_active_map": (
+                True,
+                None,
+            ),
+            "list_map_versions": (
+                True,
+                None,
+            ),
+            "save_active_map_version": (
+                True,
+                None,
+            ),
+            "load_map_version": (
+                True,
+                None,
             ),
             "list_memory_libraries": (
                 True,

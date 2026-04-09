@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from typing import Any
 
 from contracts.events import RuntimeEventCategory
 from contracts.runtime_views import MapSnapshot
@@ -48,25 +49,45 @@ class MappingService:
         cost_map=None,
         semantic_map=None,
         metadata: Optional[Dict[str, object]] = None,
+        version_id_override: Optional[str] = None,
+        revision_override: Optional[int] = None,
     ) -> MapSnapshot:
         """写入来自适配器或外部系统的地图快照。"""
 
         if occupancy_grid is None and cost_map is None and semantic_map is None:
             raise GatewayError("地图快照至少需要包含 occupancy_grid、cost_map、semantic_map 之一。")
 
-        revision = self._revision_by_source.get(source_name, 0) + 1
-        self._revision_by_source[source_name] = revision
+        snapshot_metadata = {
+            "available_layers": self._build_available_layers(occupancy_grid, cost_map, semantic_map),
+            **dict(metadata or {}),
+        }
+        # 对实时 provider 刷新做内容去重，避免同一张地图在无变化时反复生成新版本。
+        if (
+            version_id_override is None
+            and revision_override is None
+            and self._is_equivalent_to_latest_snapshot(
+                source_name=source_name,
+                occupancy_grid=occupancy_grid,
+                cost_map=cost_map,
+                semantic_map=semantic_map,
+                metadata=snapshot_metadata,
+            )
+        ):
+            return self._latest_snapshot  # type: ignore[return-value]
+
+        if revision_override is not None:
+            revision = max(1, int(revision_override))
+        else:
+            revision = self._revision_by_source.get(source_name, 0) + 1
+        self._revision_by_source[source_name] = max(self._revision_by_source.get(source_name, 0), revision)
         snapshot = MapSnapshot(
             source_name=source_name,
-            version_id=self._build_version_id(source_name, revision),
+            version_id=str(version_id_override or self._build_version_id(source_name, revision)),
             revision=revision,
             occupancy_grid=occupancy_grid,
             cost_map=cost_map,
             semantic_map=semantic_map,
-            metadata={
-                "available_layers": self._build_available_layers(occupancy_grid, cost_map, semantic_map),
-                **dict(metadata or {}),
-            },
+            metadata=snapshot_metadata,
         )
         self._latest_snapshot = snapshot
         self._history.append(snapshot)
@@ -144,6 +165,44 @@ class MappingService:
                 normalized.append("_")
         safe_source = "".join(normalized).strip("_") or "map"
         return f"mapv_{safe_source}_{revision:06d}"
+
+    def _is_equivalent_to_latest_snapshot(
+        self,
+        *,
+        source_name: str,
+        occupancy_grid,
+        cost_map,
+        semantic_map,
+        metadata: Dict[str, object],
+    ) -> bool:
+        latest = self._latest_snapshot
+        if latest is None or latest.source_name != source_name:
+            return False
+        return (
+            self._normalize_snapshot_value(latest.occupancy_grid)
+            == self._normalize_snapshot_value(occupancy_grid)
+            and self._normalize_snapshot_value(latest.cost_map)
+            == self._normalize_snapshot_value(cost_map)
+            and self._normalize_snapshot_value(latest.semantic_map)
+            == self._normalize_snapshot_value(semantic_map)
+            and self._normalize_snapshot_value(latest.metadata)
+            == self._normalize_snapshot_value(metadata)
+        )
+
+    def _normalize_snapshot_value(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if hasattr(value, "model_dump"):
+            return self._normalize_snapshot_value(value.model_dump(mode="json"))
+        if isinstance(value, dict):
+            return {
+                key: self._normalize_snapshot_value(inner)
+                for key, inner in sorted(value.items())
+                if key != "timestamp"
+            }
+        if isinstance(value, list):
+            return [self._normalize_snapshot_value(item) for item in value]
+        return value
 
     def _get_map_provider(self) -> MapProvider:
         provider = self._find_map_provider()

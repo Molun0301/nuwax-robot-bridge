@@ -8,7 +8,8 @@ from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Twist, Ve
 from contracts.image import ImageFrame
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
-from contracts.robot_state import RobotControlMode
+from contracts.robot_state import IMUState, RobotControlMode
+from drivers.robots.common import ManagedRobotDataPlane, MotionCommandDataPlane
 from drivers.robots.g1 import G1_MANIFEST, create_g1_assembly
 from drivers.robots.go2 import GO2_CAPABILITY_DESCRIPTORS, GO2_CAPABILITY_MATRIX, create_go2_assembly
 from drivers.robots.go2.assembly import Go2ClientFactories
@@ -304,6 +305,9 @@ class FakeGo2DataPlane:
             "exploration_available": True,
         }
 
+    def get_imu_state(self) -> Optional[IMUState]:
+        return IMUState(frame_id="odom/imu")
+
     def can_accept_motion_command(self) -> bool:
         return self.started
 
@@ -313,6 +317,15 @@ class FakeGo2DataPlane:
 
     def stop_motion_command(self) -> None:
         self.motion_stop_count += 1
+
+
+def test_fake_go2_data_plane_matches_common_protocols() -> None:
+    """Go2 数据面桩应满足通用数据面协议，避免平台继续耦合具体实现。"""
+
+    data_plane = FakeGo2DataPlane()
+
+    assert isinstance(data_plane, ManagedRobotDataPlane)
+    assert isinstance(data_plane, MotionCommandDataPlane)
 
 
 def _build_go2_factories(channel_initializer: FakeChannelInitializer) -> Go2ClientFactories:

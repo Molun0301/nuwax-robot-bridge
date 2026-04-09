@@ -5,10 +5,11 @@ from pathlib import Path
 import struct
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 from contracts.geometry import Pose, Quaternion, Vector3
-from contracts.maps import CostMap, OccupancyGrid
+from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.navigation import ExplorationStatus, ExploreAreaRequest
 from drivers.robots.go2 import data_plane as go2_data_plane
 from drivers.robots.go2.data_plane import Go2DataPlaneRuntime, RclpyGo2RosBridge
@@ -90,6 +91,104 @@ class _FakeBridge:
 
     def is_goal_reached(self):
         return False
+
+
+class _DelayedMapBridge(_FakeBridge):
+    """测试用延迟地图桥，模拟建图冷启动后稍晚才给出首帧地图。"""
+
+    def __init__(self, *, ready_after_reads: int = 3) -> None:
+        super().__init__(localization_available=True, map_available=False, navigation_available=False)
+        self.ready_after_reads = max(1, int(ready_after_reads))
+        self.occupancy_read_count = 0
+        self.current_pose = Pose(
+            frame_id="odom",
+            position=Vector3(x=0.0, y=0.0, z=0.0),
+            orientation=Quaternion(w=1.0),
+        )
+        self.occupancy_grid = OccupancyGrid(
+            map_id="delayed_frontier_grid",
+            frame_id="odom",
+            width=6,
+            height=6,
+            resolution_m=0.5,
+            origin=Pose(
+                frame_id="odom",
+                position=Vector3(x=-1.5, y=-1.5, z=0.0),
+                orientation=Quaternion(w=1.0),
+            ),
+            data=[
+                0, 0, 0, -1, -1, -1,
+                0, 0, 0, -1, -1, -1,
+                0, 0, 0, -1, -1, -1,
+                0, 0, 0, -1, -1, -1,
+                0, 0, 0, -1, -1, -1,
+                0, 0, 0, -1, -1, -1,
+            ],
+        )
+
+    def get_current_pose(self):
+        return self.current_pose
+
+    def get_occupancy_grid(self):
+        self.occupancy_read_count += 1
+        if self.occupancy_read_count >= self.ready_after_reads:
+            self.map_available = True
+            return self.occupancy_grid
+        return None
+
+
+class _NamedMapArchiveBridge(_FakeBridge):
+    """测试用命名地图归档桥。"""
+
+    def __init__(self) -> None:
+        super().__init__(localization_available=True, map_available=True, navigation_available=True)
+        self.current_pose = Pose(
+            frame_id="odom",
+            position=Vector3(x=1.0, y=2.0, z=0.0),
+            orientation=Quaternion(w=1.0),
+        )
+        self.occupancy_grid = OccupancyGrid(
+            map_id="named_map_grid",
+            frame_id="odom",
+            width=2,
+            height=2,
+            resolution_m=0.5,
+            origin=Pose(frame_id="odom", position=Vector3(x=0.0, y=0.0, z=0.0), orientation=Quaternion(w=1.0)),
+            data=[0, 0, 0, 100],
+        )
+        self.cost_map = CostMap(
+            map_id="named_map_cost",
+            frame_id="odom",
+            width=2,
+            height=2,
+            resolution_m=0.5,
+            origin=Pose(frame_id="odom", position=Vector3(x=0.0, y=0.0, z=0.0), orientation=Quaternion(w=1.0)),
+            data=[1.0, 1.0, 2.0, 100.0],
+        )
+        self.semantic_map = SemanticMap(
+            map_id="named_map_semantic",
+            frame_id="odom",
+            regions=[
+                SemanticRegion(
+                    region_id="dock",
+                    label="dock",
+                    centroid=Pose(frame_id="odom", position=Vector3(x=0.5, y=0.5, z=0.0), orientation=Quaternion(w=1.0)),
+                    attributes={"alias": "充电桩"},
+                )
+            ],
+        )
+
+    def get_current_pose(self):
+        return self.current_pose
+
+    def get_occupancy_grid(self):
+        return self.occupancy_grid
+
+    def get_cost_map(self):
+        return self.cost_map
+
+    def get_semantic_map(self):
+        return self.semantic_map
 
 
 class _FakeSportClient:
@@ -451,6 +550,52 @@ def test_go2_data_plane_runtime_disables_bridge_mapping_runtime_on_demand() -> N
     }
 
 
+def test_go2_data_plane_runtime_can_save_and_load_named_map_archive(tmp_path: Path) -> None:
+    bridge = _NamedMapArchiveBridge()
+    runtime = Go2DataPlaneRuntime(
+        Go2DataPlaneConfig(
+            enabled=True,
+            named_map_archive_root=str(tmp_path / "named_maps"),
+        ),
+        bridge=bridge,
+    )
+
+    save_result = runtime.save_named_map("一楼大厅", reason="unit_test")
+    assert save_result["saved"] is True
+    assert runtime.get_loaded_map_name() == "一楼大厅"
+    assert (tmp_path / "named_maps").exists()
+
+    load_result = runtime.load_named_map("一楼大厅", reason="unit_test_reload")
+    assert load_result["loaded"] is True
+    assert load_result["archive_found"] is True
+    assert runtime.get_loaded_map_name() == "一楼大厅"
+    assert runtime.is_map_available() is True
+    assert runtime.is_localization_available() is False
+    assert runtime.get_current_pose() is None
+    assert runtime.get_occupancy_grid() is not None
+    assert runtime.get_semantic_map() is not None
+
+
+def test_go2_data_plane_runtime_can_bind_new_named_map_without_archive(tmp_path: Path) -> None:
+    bridge = _NamedMapArchiveBridge()
+    runtime = Go2DataPlaneRuntime(
+        Go2DataPlaneConfig(
+            enabled=True,
+            named_map_archive_root=str(tmp_path / "named_maps"),
+        ),
+        bridge=bridge,
+    )
+
+    load_result = runtime.load_named_map("全新地图", reason="unit_test_new_map", allow_missing=True)
+
+    assert load_result["loaded"] is True
+    assert load_result["archive_found"] is False
+    assert load_result["runtime_mode"] == "live_runtime"
+    assert runtime.get_loaded_map_name() == "全新地图"
+    assert runtime.is_localization_available() is True
+    assert runtime.get_current_pose() is not None
+
+
 def test_go2_bridge_can_use_ros_point_cloud_as_local_map_fallback() -> None:
     bridge = RclpyGo2RosBridge(
         Go2DataPlaneConfig(
@@ -564,14 +709,110 @@ def test_go2_data_plane_status_exposes_effective_navigation_availability() -> No
     assert status["bridge"]["navigation_availability_source"] == "official_backend"
 
 
-def test_go2_data_plane_exploration_falls_back_to_inner_radius_when_outer_ring_blocked() -> None:
+def test_go2_data_plane_exploration_waits_for_map_before_frontier_selection() -> None:
     config = Go2DataPlaneConfig(
         enabled=True,
         exploration=Go2ExplorationConfig(
             enabled=True,
-            sample_radius_m=1.5,
-            sample_count=8,
-            max_goal_cost=75.0,
+            prerequisite_wait_timeout_sec=0.2,
+            prerequisite_poll_interval_sec=0.01,
+        ),
+    )
+    bridge = _DelayedMapBridge(ready_after_reads=3)
+    runtime = Go2DataPlaneRuntime(
+        config,
+        bridge=bridge,
+    )
+    runtime._official_sport_ready = True
+
+    frontier_pose = Pose(
+        frame_id="odom",
+        position=Vector3(x=1.0, y=0.5, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+    runtime._frontier_explorer.select_candidates = lambda **kwargs: (
+        [SimpleNamespace(pose=frontier_pose)] if not kwargs["attempted_poses"] else []
+    )
+    runtime.set_goal = lambda goal: True
+    runtime._wait_navigation_goal = lambda **kwargs: True
+
+    accepted = runtime.start_exploration(
+        ExploreAreaRequest(
+            request_id="explore_wait_map",
+            strategy="frontier",
+            max_duration_sec=1.0,
+        )
+    )
+
+    assert accepted is True
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        state = runtime.get_exploration_state()
+        if state.status in {ExplorationStatus.SUCCEEDED, ExplorationStatus.FAILED, ExplorationStatus.CANCELLED}:
+            break
+        time.sleep(0.01)
+    thread = runtime._exploration_thread
+    if thread is not None:
+        thread.join(timeout=0.5)
+
+    state = runtime.get_exploration_state()
+    assert state.status == ExplorationStatus.SUCCEEDED
+    assert bridge.occupancy_read_count >= 3
+
+
+def test_go2_data_plane_exploration_fails_when_map_never_becomes_ready() -> None:
+    config = Go2DataPlaneConfig(
+        enabled=True,
+        exploration=Go2ExplorationConfig(
+            enabled=True,
+            prerequisite_wait_timeout_sec=0.05,
+            prerequisite_poll_interval_sec=0.01,
+        ),
+    )
+    runtime = Go2DataPlaneRuntime(
+        config,
+        bridge=_FakeBridge(localization_available=True, map_available=False, navigation_available=False),
+    )
+    runtime._official_sport_ready = True
+
+    current_pose = Pose(
+        frame_id="odom",
+        position=Vector3(x=0.0, y=0.0, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+    runtime.get_current_pose = lambda: current_pose
+
+    accepted = runtime.start_exploration(
+        ExploreAreaRequest(
+            request_id="explore_wait_timeout",
+            strategy="frontier",
+            max_duration_sec=1.0,
+        )
+    )
+
+    assert accepted is True
+    deadline = time.time() + 0.5
+    while time.time() < deadline:
+        state = runtime.get_exploration_state()
+        if state.status in {ExplorationStatus.SUCCEEDED, ExplorationStatus.FAILED, ExplorationStatus.CANCELLED}:
+            break
+        time.sleep(0.01)
+    thread = runtime._exploration_thread
+    if thread is not None:
+        thread.join(timeout=0.5)
+
+    state = runtime.get_exploration_state()
+    assert state.status == ExplorationStatus.FAILED
+    assert "地图" in (state.message or "")
+
+
+def test_go2_data_plane_exploration_waits_when_frontiers_are_disconnected() -> None:
+    config = Go2DataPlaneConfig(
+        enabled=True,
+        exploration=Go2ExplorationConfig(
+            enabled=True,
+            prerequisite_wait_timeout_sec=0.05,
+            prerequisite_poll_interval_sec=0.01,
         ),
     )
     runtime = Go2DataPlaneRuntime(
@@ -580,65 +821,77 @@ def test_go2_data_plane_exploration_falls_back_to_inner_radius_when_outer_ring_b
     )
     runtime._official_sport_ready = True
 
-    center_pose = Pose(
+    current_pose = Pose(
         frame_id="odom",
-        position=Vector3(x=0.0, y=0.0, z=0.0),
+        position=Vector3(x=1.75, y=1.75, z=0.0),
         orientation=Quaternion(w=1.0),
     )
-    width = 240
-    resolution = 0.1
-    origin = Pose(
+    occupancy_grid = OccupancyGrid(
+        map_id="disconnected_frontier_grid",
         frame_id="odom",
-        position=Vector3(x=-12.0, y=-12.0, z=0.0),
-        orientation=Quaternion(w=1.0),
-    )
-    data = [100.0] * (width * width)
-    for x, y, cost in (
-        (1.5, 0.0, 75.0),
-        (-1.5, 0.0, 50.0),
-    ):
-        index = _grid_cell_index(
-            width=width,
-            resolution=resolution,
-            origin_x=origin.position.x,
-            origin_y=origin.position.y,
-            x=x,
-            y=y,
-        )
-        data[index] = cost
-
-    cost_map = CostMap(
-        map_id="test_cost_map",
-        frame_id="odom",
-        width=width,
-        height=width,
-        resolution_m=resolution,
-        origin=origin,
-        data=data,
+        width=12,
+        height=12,
+        resolution_m=0.5,
+        origin=Pose(
+            frame_id="odom",
+            position=Vector3(x=-3.0, y=-3.0, z=0.0),
+            orientation=Quaternion(w=1.0),
+        ),
+        data=[
+            100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+            100, 0, 0, 0, 0, -1, -1, -1, -1, 100, 100, 100,
+            100, 0, 0, 0, 0, -1, -1, -1, -1, 100, 100, 100,
+            100, 0, 0, 0, 0, -1, -1, -1, -1, 100, 100, 100,
+            100, 0, 0, 0, 0, -1, -1, -1, -1, 100, 100, 100,
+            100, 0, 0, 0, 0, -1, -1, -1, -1, 100, 100, 100,
+            100, 0, 0, 0, 0, -1, -1, -1, -1, 100, 100, 100,
+            100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+            100, 100, 100, 100, 100, 100, 100, 100, 0, 0, 0, 100,
+            100, 100, 100, 100, 100, 100, 100, 100, 0, 0, 0, 100,
+            100, 100, 100, 100, 100, 100, 100, 100, 0, 0, 0, 100,
+            100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+        ],
     )
 
-    runtime.get_current_pose = lambda: center_pose
-    runtime.get_cost_map = lambda: cost_map
+    runtime.get_current_pose = lambda: current_pose
+    runtime.get_occupancy_grid = lambda: occupancy_grid
+    runtime.get_cost_map = lambda: None
+    frontier_selection_called = {"value": False}
 
-    candidates = runtime._build_exploration_candidates(
+    def _unexpected_frontier_selection(**kwargs):
+        frontier_selection_called["value"] = True
+        return []
+
+    runtime._frontier_explorer.select_candidates = _unexpected_frontier_selection
+
+    accepted = runtime.start_exploration(
         ExploreAreaRequest(
-            request_id="explore_test",
-            center_pose=center_pose,
-            radius_m=5.0,
+            request_id="explore_wait_disconnected_frontier",
             strategy="frontier",
+            max_duration_sec=1.0,
         )
     )
 
-    assert candidates
-    candidate_radii = [
-        round((candidate.position.x**2 + candidate.position.y**2) ** 0.5, 3)
-        for candidate in candidates
-    ]
-    assert max(candidate_radii) < 5.0
-    assert min(candidate_radii) <= 1.582
+    assert accepted is True
+    deadline = time.time() + 0.5
+    while time.time() < deadline:
+        state = runtime.get_exploration_state()
+        if state.status in {ExplorationStatus.SUCCEEDED, ExplorationStatus.FAILED, ExplorationStatus.CANCELLED}:
+            break
+        time.sleep(0.01)
+    thread = runtime._exploration_thread
+    if thread is not None:
+        thread.join(timeout=0.5)
+
+    state = runtime.get_exploration_state()
+    assert frontier_selection_called["value"] is False
+    assert state.status == ExplorationStatus.FAILED
+    assert "前沿已生成，但与机器人可达区域仍断开" in (state.message or "")
+    assert state.metadata["reachable_frontier_clusters"] == 0
+    assert state.metadata["frontier_clusters_ge_min"] > 0
 
 
-def test_go2_data_plane_exploration_keeps_ring_candidates_when_preview_map_is_temporarily_unusable() -> None:
+def test_go2_data_plane_exploration_without_frontier_candidates_returns_empty_list() -> None:
     config = Go2DataPlaneConfig(
         enabled=True,
         exploration=Go2ExplorationConfig(
@@ -660,33 +913,33 @@ def test_go2_data_plane_exploration_keeps_ring_candidates_when_preview_map_is_te
         orientation=Quaternion(w=1.0),
     )
     occupancy_grid = OccupancyGrid(
-        map_id="mismatched_frontier_grid",
-        frame_id="map",
-        width=40,
-        height=40,
-        resolution_m=0.1,
-        origin=Pose(
-            frame_id="map",
-            position=Vector3(x=-2.0, y=-2.0, z=0.0),
-            orientation=Quaternion(w=1.0),
-        ),
-        data=[0] * (40 * 40),
+        map_id="frontier_grid",
+        frame_id="odom",
+        width=4,
+        height=4,
+        resolution_m=0.5,
+        origin=Pose(frame_id="odom", position=Vector3(x=-1.0, y=-1.0, z=0.0), orientation=Quaternion(w=1.0)),
+        data=[
+            0, 0, -1, -1,
+            0, 0, -1, -1,
+            0, 0, -1, -1,
+            0, 0, -1, -1,
+        ],
     )
 
     runtime.get_current_pose = lambda: current_pose
     runtime.get_occupancy_grid = lambda: occupancy_grid
     runtime.get_cost_map = lambda: None
+    runtime._frontier_explorer.select_candidates = lambda **kwargs: []
 
     candidates = runtime._build_exploration_candidates(
         ExploreAreaRequest(
-            request_id="explore_unknown_area",
+            request_id="explore_no_frontier",
             strategy="frontier",
-            radius_m=2.0,
         )
     )
 
-    assert candidates
-    assert all(candidate.frame_id == "odom" for candidate in candidates)
+    assert candidates == []
 
 
 def test_go2_data_plane_coverage_strategy_prefers_frontier_candidates() -> None:
@@ -733,7 +986,6 @@ def test_go2_data_plane_coverage_strategy_prefers_frontier_candidates() -> None:
     runtime.get_occupancy_grid = lambda: occupancy_grid
     runtime.get_cost_map = lambda: None
     runtime._frontier_explorer.select_candidates = lambda **kwargs: [SimpleNamespace(pose=frontier_pose)]
-    runtime._build_ring_exploration_candidates = lambda **kwargs: []
 
     candidates = runtime._build_exploration_candidates(
         ExploreAreaRequest(

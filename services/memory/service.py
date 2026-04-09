@@ -12,7 +12,7 @@ import numpy as np
 
 from contracts.base import utc_now
 from contracts.events import RuntimeEventCategory
-from contracts.geometry import Pose, Vector3
+from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.maps import SemanticMap, SemanticRegion
 from contracts.memory import (
     MemoryArrivalVerification,
@@ -25,7 +25,9 @@ from contracts.memory import (
     SemanticMemoryEntry,
     TaggedLocation,
 )
+from contracts.navigation import NavigationGoal
 from contracts.naming import build_location_id, build_memory_id, build_observation_event_id
+from contracts.runtime_views import NavigationSemanticContext, TopologyNodeSummary
 from contracts.spatial_memory import (
     GroundingQueryPlan,
     NavigationCandidate,
@@ -37,7 +39,7 @@ from core import EventBus, StateNamespace, StateStore
 from gateways.artifacts import LocalArtifactStore
 from gateways.errors import GatewayError
 from services.localization import LocalizationService
-from services.mapping import MappingService
+from services.mapping.service import MappingService
 from services.memory.grounding_query_planner import GroundingQueryPlanner
 from services.memory.instance_association_service import AssociationOutcome, InstanceAssociationService
 from services.memory.inspection_pose_planner import InspectionPosePlanner
@@ -192,6 +194,32 @@ class MemoryService:
         """返回记忆库当前是否已启用。"""
 
         return self._memory_enabled and bool(self._active_library_name)
+
+    def get_active_library_name(self) -> Optional[str]:
+        """返回当前激活记忆库名称。"""
+
+        return self._active_library_name
+
+    def has_memory_library(self, library_name: str) -> bool:
+        """判断某个命名记忆库是否存在。"""
+
+        resolved_name = str(library_name or "").strip()
+        if not resolved_name:
+            return False
+        return any(item["library_name"] == resolved_name for item in self.list_memory_libraries())
+
+    def ensure_memory_library(self, *, library_name: str) -> Dict[str, object]:
+        """确保命名记忆库存在。"""
+
+        resolved_name = str(library_name or "").strip()
+        if not resolved_name:
+            raise GatewayError(
+                "记忆库名称不能为空。",
+                error_code="invalid_params",
+                http_status=422,
+                jsonrpc_code=-32602,
+            )
+        return self.create_memory_library(library_name=resolved_name)
 
     def activate_memory_library(
         self,
@@ -574,7 +602,7 @@ class MemoryService:
                 jsonrpc_code=-32602,
             )
 
-        localization_snapshot = self._get_or_refresh_localization()
+        localization_snapshot = self._get_or_refresh_localization(prefer_live=True)
         if localization_snapshot.current_pose is None:
             raise GatewayError("当前没有可用定位结果，无法标记地点。")
 
@@ -603,10 +631,14 @@ class MemoryService:
         )
         merged_metadata = self._attach_library_metadata(
             {
-            "description": description or "",
-            "camera_id": camera_id or "",
-            "anchor_id": anchor_id or "",
-            **dict(metadata or {}),
+                "description": description or "",
+                "camera_id": camera_id or "",
+                "anchor_id": anchor_id or "",
+                **self._build_platform_semantic_metadata(
+                    map_snapshot=map_snapshot,
+                    localization_snapshot=localization_snapshot,
+                ),
+                **dict(metadata or {}),
             }
         )
         if perception_context is not None:
@@ -829,12 +861,26 @@ class MemoryService:
         query: str,
         *,
         similarity_threshold: float = 0.55,
+        map_version_id: Optional[str] = None,
     ) -> Optional[TaggedLocation]:
         """返回最优地点命中。"""
 
         if not self.is_enabled():
             return None
-        result = self.query_location(query, similarity_threshold=similarity_threshold, limit=1)
+        payload_filter = (
+            MemoryPayloadFilter(
+                record_kinds=[MemoryRecordKind.TAGGED_LOCATION],
+                map_version_id=map_version_id,
+            )
+            if map_version_id
+            else None
+        )
+        result = self.query_location(
+            query,
+            similarity_threshold=similarity_threshold,
+            limit=1,
+            payload_filter=payload_filter,
+        )
         if not result.matches:
             return None
         return result.matches[0].tagged_location
@@ -846,6 +892,8 @@ class MemoryService:
         camera_id: Optional[str] = None,
         similarity_threshold: float = 0.25,
         max_age_sec: Optional[float] = None,
+        map_version_id: Optional[str] = None,
+        localization_session_id: Optional[str] = None,
     ) -> Optional[MemoryNavigationCandidate]:
         """把自由文本查询解析成可导航的记忆候选。"""
 
@@ -854,11 +902,14 @@ class MemoryService:
         current_pose = self._get_current_pose()
         map_snapshot = self._get_map_snapshot()
         self._refresh_semantic_map_context(map_snapshot)
+        effective_map_version_id = str(
+            map_version_id or (map_snapshot.version_id if map_snapshot is not None else "")
+        ).strip() or None
         known_labels = self._collect_known_grounding_labels()
         grounding_plan = self._grounding_query_planner.plan(query, known_labels=known_labels)
         payload_filter = self._grounding_query_planner.build_payload_filter(
             grounding_plan,
-            map_version_id=map_snapshot.version_id if map_snapshot is not None else None,
+            map_version_id=effective_map_version_id,
         )
         if max_age_sec is not None:
             payload_filter.max_age_sec = max_age_sec
@@ -879,7 +930,10 @@ class MemoryService:
         for match in result.matches:
             if match.navigation_candidate is not None:
                 return self._to_legacy_navigation_candidate(match.navigation_candidate)
-        tagged_location = self.resolve_tagged_location(query)
+        tagged_location = self.resolve_tagged_location(
+            query,
+            map_version_id=effective_map_version_id,
+        )
         if tagged_location is not None:
             spatial_candidate = self._build_navigation_candidate(
                 query,
@@ -898,9 +952,45 @@ class MemoryService:
                 verification_memory_id=tagged_location.memory_id,
                 verification_text=tagged_location.perception_headline or query,
                 camera_id=camera_id,
+                localization_session_id=localization_session_id,
             )
             return self._to_legacy_navigation_candidate(spatial_candidate)
         return None
+
+    def resolve_semantic_region_goal(
+        self,
+        target_name: str,
+        *,
+        map_name: Optional[str] = None,
+    ) -> NavigationGoal:
+        """从当前平台语义导航上下文解析语义区域导航目标。"""
+
+        semantic_context = self.get_navigation_semantic_context(map_name=map_name)
+        normalized_target = self._normalize_text(target_name)
+        for region in semantic_context.semantic_regions:
+            aliases = [*region.aliases, str(region.attributes.get("alias", "") or "")]
+            candidates = {
+                self._normalize_text(region.region_id),
+                self._normalize_text(region.label),
+                *(self._normalize_text(item) for item in aliases if self._normalize_text(item)),
+            }
+            if normalized_target not in candidates:
+                continue
+            target_pose = region.inspection_poses[0] if region.inspection_poses else region.centroid
+            if target_pose is None:
+                raise GatewayError("语义区域 %s 没有可导航的中心位姿。" % target_name)
+            return NavigationGoal(
+                goal_id="nav_semantic_%s" % self._normalize_text(target_name),
+                target_pose=target_pose,
+                target_name=target_name,
+                metadata={
+                    "resolved_region_id": region.region_id,
+                    "map_version_id": semantic_context.map_version_id,
+                    "localization_session_id": semantic_context.localization_session_id,
+                    "source": "platform_navigation_semantics",
+                },
+            )
+        raise GatewayError("未在平台语义区域中找到命名位置：%s" % target_name)
 
     def verify_arrival(
         self,
@@ -909,6 +999,8 @@ class MemoryService:
         navigation_candidate: Optional[Union[MemoryNavigationCandidate, NavigationCandidate]] = None,
         camera_id: Optional[str] = None,
         similarity_threshold: float = 0.55,
+        expected_map_version_id: Optional[str] = None,
+        localization_session_id: Optional[str] = None,
     ) -> MemoryArrivalVerification:
         """到点后用当前场景与目标记忆做一次复核。"""
 
@@ -923,6 +1015,43 @@ class MemoryService:
                 metadata={"memory_enabled": False},
             )
         legacy_candidate = self._coerce_legacy_navigation_candidate(navigation_candidate)
+        effective_map_version_id = str(
+            expected_map_version_id
+            or (legacy_candidate.map_version_id if legacy_candidate is not None else "")
+        ).strip() or None
+        semantic_context = self.get_navigation_semantic_context()
+        active_localization_session_id = str(semantic_context.localization_session_id or "").strip() or None
+        if effective_map_version_id and semantic_context.map_version_id not in {None, effective_map_version_id}:
+            return MemoryArrivalVerification(
+                query=query,
+                verified=False,
+                score=0.0,
+                matched_labels=[],
+                matched_memory_id=None,
+                reason="当前平台地图版本与导航候选版本不一致，已拒绝到点复核。",
+                metadata={
+                    "expected_map_version_id": effective_map_version_id,
+                    "active_map_version_id": semantic_context.map_version_id,
+                    "localization_session_id": localization_session_id or active_localization_session_id,
+                    "map_name": semantic_context.map_name,
+                },
+            )
+        if localization_session_id and active_localization_session_id and localization_session_id != active_localization_session_id:
+            return MemoryArrivalVerification(
+                query=query,
+                verified=False,
+                score=0.0,
+                matched_labels=[],
+                matched_memory_id=None,
+                reason="当前平台定位会话已变化，已拒绝在旧定位上下文中执行到点复核。",
+                metadata={
+                    "expected_map_version_id": effective_map_version_id,
+                    "active_map_version_id": semantic_context.map_version_id,
+                    "expected_localization_session_id": localization_session_id,
+                    "active_localization_session_id": active_localization_session_id,
+                    "map_name": semantic_context.map_name,
+                },
+            )
         effective_query = (
             legacy_candidate.verification_query
             if legacy_candidate is not None and legacy_candidate.verification_query
@@ -998,6 +1127,9 @@ class MemoryService:
                 "camera_id": perception_context.camera_id,
                 "requested_query": query,
                 "verification_query": effective_query,
+                "map_name": semantic_context.map_name,
+                "map_version_id": effective_map_version_id or semantic_context.map_version_id,
+                "localization_session_id": localization_session_id or active_localization_session_id,
             },
         )
         self._state_store.write(
@@ -1041,6 +1173,124 @@ class MemoryService:
             },
         )
 
+    def get_navigation_semantic_context(
+        self,
+        *,
+        map_name: Optional[str] = None,
+    ) -> NavigationSemanticContext:
+        """返回当前平台地图版本绑定的语义导航上下文。"""
+
+        map_snapshot = self._get_map_snapshot()
+        map_context = self._refresh_semantic_map_context(map_snapshot)
+        active_session = self._localization_service.get_active_session()
+        resolved_map_name = (
+            str(map_name or "").strip()
+            or (active_session.map_name if active_session is not None else "")
+            or str(self._active_library_name or "").strip()
+            or None
+        )
+        localization_session_id = None
+        localization_ready = False
+        if active_session is not None and (
+            map_context.map_version_id is None or active_session.map_version_id == map_context.map_version_id
+        ):
+            localization_session_id = active_session.session_id
+            localization_ready = bool(active_session.pose_available)
+        context = NavigationSemanticContext(
+            map_name=resolved_map_name,
+            map_version_id=map_context.map_version_id,
+            localization_session_id=localization_session_id,
+            localization_ready=localization_ready,
+            semantic_regions=[item.model_copy(deep=True) for item in map_context.semantic_regions],
+            topology_nodes=self._build_topology_node_summaries(map_context),
+            anchors=[item.model_copy(deep=True) for item in map_context.anchors_by_id.values()],
+            metadata={
+                "active_library_name": self._active_library_name,
+                "frame_id": map_context.frame_id,
+                "semantic_region_count": len(map_context.semantic_regions),
+                "topology_node_count": len(map_context.topology_nodes_by_id),
+                "anchor_count": len(map_context.anchors_by_id),
+                "localization_session_status": active_session.status.value if active_session is not None else None,
+            },
+        )
+        self._state_store.write(
+            StateNamespace.MEMORY,
+            "navigation_semantic_context",
+            context,
+            source="memory_service",
+            metadata={
+                "kind": "navigation_semantic_context",
+                "map_name": resolved_map_name,
+                "map_version_id": context.map_version_id,
+            },
+        )
+        return context
+
+    def _build_topology_node_summaries(
+        self,
+        map_context: SemanticMapBuildResult,
+    ) -> List[TopologyNodeSummary]:
+        items: List[TopologyNodeSummary] = []
+        for node_id, node in sorted(map_context.topology_nodes_by_id.items()):
+            label = str(node.get("label") or node.get("name") or node_id).strip() or node_id
+            items.append(
+                TopologyNodeSummary(
+                    node_id=node_id,
+                    label=label,
+                    frame_id=map_context.frame_id,
+                    map_version_id=map_context.map_version_id,
+                    anchor_id=str(node.get("anchor_id") or "") or None,
+                    pose=self._build_topology_node_pose(node, frame_id=map_context.frame_id),
+                    aliases=self._normalize_aliases([*(node.get("aliases") or []), *(node.get("labels") or [])]),
+                    metadata={
+                        key: value
+                        for key, value in dict(node).items()
+                        if key not in {"x", "y", "z", "anchor_id", "label", "name", "aliases", "labels"}
+                    },
+                )
+            )
+        return items
+
+    def _build_platform_semantic_metadata(
+        self,
+        *,
+        map_snapshot=None,
+        localization_snapshot=None,
+        map_version_id: Optional[str] = None,
+    ) -> Dict[str, object]:
+        active_session = self._localization_service.get_active_session()
+        resolved_map_version_id = str(
+            map_version_id
+            or (map_snapshot.version_id if map_snapshot is not None else "")
+            or (active_session.map_version_id if active_session is not None else "")
+        ).strip() or None
+        resolved_map_name = str(
+            (active_session.map_name if active_session is not None else "")
+            or (self._active_library_name or "")
+        ).strip() or None
+        return {
+            "map_name": resolved_map_name,
+            "map_version_id": resolved_map_version_id,
+            "localization_session_id": active_session.session_id if active_session is not None else None,
+            "localization_session_status": active_session.status.value if active_session is not None else None,
+            "localization_source_name": (
+                localization_snapshot.source_name if localization_snapshot is not None else None
+            ),
+        }
+
+    def _build_topology_node_pose(self, node: Dict[str, object], *, frame_id: str) -> Optional[Pose]:
+        try:
+            x = float(node.get("x"))
+            y = float(node.get("y"))
+            z = float(node.get("z", 0.0))
+        except (TypeError, ValueError):
+            return None
+        return Pose(
+            frame_id=frame_id,
+            position=Vector3(x=x, y=y, z=z),
+            orientation=Quaternion(w=1.0),
+        )
+
     def list_tagged_locations(self, *, limit: Optional[int] = None) -> Tuple[TaggedLocation, ...]:
         """列出地点记忆。"""
 
@@ -1067,7 +1317,7 @@ class MemoryService:
         camera_id: Optional[str],
         metadata: Optional[Dict[str, object]],
     ) -> SemanticMemoryEntry:
-        localization_snapshot = self._get_or_refresh_localization(allow_missing=True)
+        localization_snapshot = self._get_or_refresh_localization(allow_missing=True, prefer_live=True)
         map_snapshot = self._get_map_snapshot()
         observation_context = self._observation_service.get_latest_observation(camera_id)
         perception_context = self._perception_service.get_latest_perception(camera_id)
@@ -1101,7 +1351,16 @@ class MemoryService:
                 metadata,
             )
 
-        merged_metadata = self._attach_library_metadata({"camera_id": camera_id or "", **dict(metadata or {})})
+        merged_metadata = self._attach_library_metadata(
+            {
+                "camera_id": camera_id or "",
+                **self._build_platform_semantic_metadata(
+                    map_snapshot=map_snapshot,
+                    localization_snapshot=localization_snapshot,
+                ),
+                **dict(metadata or {}),
+            }
+        )
         if perception_context is not None:
             merged_metadata.update(self._build_scene_memory_metadata(perception_context))
 
@@ -1466,9 +1725,11 @@ class MemoryService:
         verification_memory_id: Optional[str],
         verification_text: Optional[str],
         camera_id: Optional[str],
+        localization_session_id: Optional[str] = None,
     ) -> NavigationCandidate:
         _, distance_m = self._compute_spatial_score(current_pose, inspection_pose)
         verification_artifact_id = artifact_ids[0] if artifact_ids else None
+        platform_binding = self._build_platform_semantic_metadata(map_version_id=map_version_id)
         return NavigationCandidate(
             candidate_id=self._build_navigation_candidate_id(record_id),
             anchor_id=anchor_id or self._fallback_anchor_id(record_id),
@@ -1489,6 +1750,13 @@ class MemoryService:
                 "record_kind": record_kind.value,
                 "linked_location_id": linked_location_id or "",
                 "verification_memory_id": verification_memory_id or "",
+                "map_name": str(platform_binding.get("map_name") or "") or "",
+                "map_version_id": str(map_version_id or "") or "",
+                "localization_session_id": str(
+                    localization_session_id
+                    or platform_binding.get("localization_session_id")
+                    or ""
+                ) or "",
             },
         )
 
@@ -2230,6 +2498,9 @@ class MemoryService:
                     "camera_id": camera_id or "",
                     "projection_count": len(projected),
                     "linked_memory_id": memory_entry.memory_id,
+                    **self._build_platform_semantic_metadata(
+                        map_snapshot=map_snapshot,
+                    ),
                 }
             ),
         )
@@ -2382,6 +2653,8 @@ class MemoryService:
                 "camera_id": str(candidate.metadata.get("camera_id") or ""),
                 "anchor_id": candidate.anchor_id,
                 "candidate_id": candidate.candidate_id,
+                "map_name": str(candidate.metadata.get("map_name") or ""),
+                "localization_session_id": str(candidate.metadata.get("localization_session_id") or ""),
             },
         )
 
@@ -2494,19 +2767,28 @@ class MemoryService:
         return best_node_id
 
     def _get_current_pose(self) -> Optional[Pose]:
-        snapshot = self._localization_service.get_latest_snapshot()
-        if self._localization_service.is_available():
-            try:
-                snapshot = self._localization_service.refresh()
-            except GatewayError:
-                pass
+        snapshot = self._get_or_refresh_localization(allow_missing=True)
         if snapshot is not None and snapshot.current_pose is not None:
             return snapshot.current_pose
         return None
 
-    def _get_or_refresh_localization(self, *, allow_missing: bool = False):
+    def _get_or_refresh_localization(
+        self,
+        *,
+        allow_missing: bool = False,
+        prefer_live: bool = False,
+    ):
         snapshot = self._localization_service.get_latest_snapshot()
-        if self._localization_service.is_available():
+        active_session = self._localization_service.get_active_session()
+        if active_session is not None:
+            try:
+                self._localization_service.refresh_current_session(
+                    metadata={"source": "memory_service"},
+                )
+            except GatewayError:
+                pass
+            snapshot = self._localization_service.get_latest_snapshot()
+        elif self._localization_service.is_available() and (snapshot is None or prefer_live):
             try:
                 snapshot = self._localization_service.refresh()
             except GatewayError:
@@ -2519,7 +2801,7 @@ class MemoryService:
 
     def _get_map_snapshot(self):
         snapshot = self._mapping_service.get_latest_snapshot()
-        if self._mapping_service.is_available():
+        if snapshot is None and self._mapping_service.is_available():
             try:
                 snapshot = self._mapping_service.refresh()
             except GatewayError as exc:

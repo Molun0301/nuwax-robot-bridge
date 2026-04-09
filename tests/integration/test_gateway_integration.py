@@ -11,6 +11,7 @@ from contracts.capabilities import CapabilityMatrix
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Twist, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
+from contracts.memory import MemoryArrivalVerification
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
 from contracts.robot_state import IMUState, JointState, RobotControlMode, RobotState, SafetyState
 from drivers.robots.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
@@ -330,6 +331,10 @@ class FakeObstacleAvoidanceDataPlane:
         self.calls: List[bool] = []
         self.mapping_runtime_calls: List[str] = []
         self.mapping_runtime_disable_calls: List[str] = []
+        self.loaded_map_name: Optional[str] = None
+        self.saved_maps: set[str] = set()
+        self.load_named_map_calls: List[Dict[str, object]] = []
+        self.save_named_map_calls: List[Dict[str, object]] = []
 
     def is_obstacle_avoidance_control_available(self) -> bool:
         return True
@@ -352,6 +357,63 @@ class FakeObstacleAvoidanceDataPlane:
             "localization_available": True,
             "map_available": False,
             "navigation_available": True,
+        }
+
+    def get_loaded_map_name(self) -> Optional[str]:
+        return self.loaded_map_name
+
+    def get_named_map_runtime_status(self) -> Dict[str, object]:
+        return {
+            "loaded_map_name": self.loaded_map_name,
+            "runtime_mode": "live_runtime" if self.loaded_map_name else "none",
+            "saved_maps": sorted(self.saved_maps),
+            "runtime_scope": "compatibility_only",
+            "used_by_platform": False,
+        }
+
+    def load_named_map(
+        self,
+        map_name: str,
+        *,
+        reason: str = "",
+        allow_missing: bool = False,
+    ) -> Dict[str, object]:
+        resolved_name = str(map_name or "").strip()
+        archive_found = resolved_name in self.saved_maps
+        loaded = archive_found or bool(allow_missing)
+        if loaded:
+            self.loaded_map_name = resolved_name
+        self.load_named_map_calls.append(
+            {
+                "map_name": resolved_name,
+                "reason": str(reason or ""),
+                "allow_missing": bool(allow_missing),
+                "loaded": loaded,
+            }
+        )
+        return {
+            "requested_map_name": resolved_name,
+            "loaded_map_name": self.loaded_map_name,
+            "loaded": loaded,
+            "archive_found": archive_found,
+            "runtime_mode": "archive_snapshot" if archive_found else "live_runtime",
+            "requires_localization": False,
+        }
+
+    def save_named_map(self, map_name: str, *, reason: str = "") -> Dict[str, object]:
+        resolved_name = str(map_name or "").strip()
+        self.loaded_map_name = resolved_name
+        self.saved_maps.add(resolved_name)
+        self.save_named_map_calls.append(
+            {
+                "map_name": resolved_name,
+                "reason": str(reason or ""),
+            }
+        )
+        return {
+            "map_name": resolved_name,
+            "saved": True,
+            "runtime_mode": "live_runtime",
         }
 
     def set_obstacle_avoidance_enabled(self, enabled: bool) -> Dict[str, object]:
@@ -449,6 +511,7 @@ def _build_test_config(tmp_path: Path):
     config.gateway.sse_keepalive_sec = 0.05
     config.gateway.ws_ping_interval_sec = 0.05
     config.runtime_data.memory_db_path = str(tmp_path / "runtime_data" / "memory" / "vector_memory.db")
+    config.runtime_data.map_catalog_root = str(tmp_path / "runtime_data" / "maps")
     config.runtime_data.memory_embedding_model = "hashing-v1"
     config.runtime_data.memory_embedding_dimension = 128
     config.runtime_data.memory_image_embedding_model = "disabled"
@@ -520,6 +583,34 @@ def _create_memory_library(
         "/api/capabilities/create_memory_library/invoke",
         headers=_agent_headers(),
         json={"arguments": {"library_name": library_name}},
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
+def _create_map(
+    client: TestClient,
+    *,
+    map_name: str,
+) -> dict:
+    response = client.post(
+        "/api/capabilities/create_map/invoke",
+        headers=_agent_headers(),
+        json={"arguments": {"map_name": map_name}},
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
+def _activate_map(
+    client: TestClient,
+    *,
+    map_name: str,
+) -> dict:
+    response = client.post(
+        "/api/capabilities/activate_map/invoke",
+        headers=_agent_headers(),
+        json={"arguments": {"map_name": map_name}},
     )
     assert response.status_code == 200
     return response.json()
@@ -824,6 +915,9 @@ def test_gateway_localization_mapping_navigation_and_exploration(tmp_path: Path)
 
     app, _, robot, _ = _build_host_app(tmp_path)
     with TestClient(app) as client:
+        _create_map(client, map_name="主测试地图")
+        _activate_map(client, map_name="主测试地图")
+
         localization = client.get("/api/localization/latest", headers=_agent_headers())
         assert localization.status_code == 200
         assert localization.json()["localization_snapshot"]["current_pose"]["position"]["x"] == 0.0
@@ -845,6 +939,7 @@ def test_gateway_localization_mapping_navigation_and_exploration(tmp_path: Path)
         navigate_pose_task = _wait_for_task(client, navigate_pose.json()["task"]["task_id"])
         assert navigate_pose_task["status"]["state"] == "succeeded"
         assert robot.current_pose.position.x == 1.0
+        assert robot.data_plane.save_named_map_calls == []
 
         navigate_named = client.post(
             "/api/capabilities/navigate_to_named_location/invoke",
@@ -854,6 +949,7 @@ def test_gateway_localization_mapping_navigation_and_exploration(tmp_path: Path)
         assert navigate_named.status_code == 200
         navigate_named_task = _wait_for_task(client, navigate_named.json()["task"]["task_id"])
         assert navigate_named_task["status"]["state"] == "succeeded"
+        assert robot.data_plane.load_named_map_calls == []
 
         explore = client.post(
             "/api/capabilities/explore_area/invoke",
@@ -863,16 +959,103 @@ def test_gateway_localization_mapping_navigation_and_exploration(tmp_path: Path)
         assert explore.status_code == 200
         explore_task = _wait_for_task(client, explore.json()["task"]["task_id"])
         assert explore_task["status"]["state"] == "succeeded"
+        assert robot.data_plane.save_named_map_calls == []
 
         navigation_latest = client.get("/api/navigation/latest", headers=_agent_headers())
         navigation_history = client.get("/api/navigation/history?limit=10", headers=_agent_headers())
 
         assert navigation_latest.status_code == 200
         assert navigation_latest.json()["navigation_context"]["goal_reached"] is True
+        assert navigation_latest.json()["navigation_context"]["metadata"]["map_status"] == "ready"
+        assert navigation_latest.json()["navigation_context"]["metadata"]["localization_ready"] is True
+        assert navigation_latest.json()["navigation_context"]["metadata"]["localization_session_status"] == "ready"
         assert navigation_latest.json()["exploration_context"]["exploration_state"]["status"] == "succeeded"
+        assert navigation_latest.json()["exploration_context"]["metadata"]["map_status"] == "ready"
+        assert navigation_latest.json()["exploration_context"]["metadata"]["latest_map_version_id"]
         assert navigation_history.status_code == 200
         assert len(navigation_history.json()["navigation_history"]) >= 2
         assert len(navigation_history.json()["exploration_history"]) >= 1
+
+
+def test_gateway_navigation_returns_specific_workspace_errors(tmp_path: Path) -> None:
+    """导航入口应返回明确的地图工作区错误码。"""
+
+    app, _, robot, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        _create_map(client, map_name="错误语义测试地图")
+        _activate_map(client, map_name="错误语义测试地图")
+
+        missing_target = client.post(
+            "/api/capabilities/navigate_to_named_location/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {"target_name": "根本不存在的地点", "timeout_sec": 1.0}},
+        )
+        assert missing_target.status_code == 404
+        assert missing_target.json()["error"]["code"] == "target_not_found_in_memory"
+
+        original_get_current_pose = robot.providers.get_current_pose
+        original_get_frame_tree = robot.providers.get_frame_tree
+        robot.providers.get_current_pose = lambda: None
+        robot.providers.get_frame_tree = lambda: None
+        try:
+            missing_localization = client.post(
+                "/api/capabilities/navigate_to_pose/invoke",
+                headers=_agent_headers(),
+                json={"arguments": {"frame_id": "map", "x": 1.0, "y": 0.5, "timeout_sec": 1.0}},
+            )
+        finally:
+            robot.providers.get_current_pose = original_get_current_pose
+            robot.providers.get_frame_tree = original_get_frame_tree
+        assert missing_localization.status_code == 409
+        assert missing_localization.json()["error"]["code"] == "localization_unavailable"
+        assert missing_localization.json()["error"]["details"]["localization_session_status"] == "localizing"
+
+
+def test_gateway_navigation_task_reports_arrival_verification_failure(tmp_path: Path) -> None:
+    """命名导航到点复核失败时，任务快照应保留结构化错误。"""
+
+    app, runtime, _, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        _create_map(client, map_name="到点复核测试地图")
+        _activate_map(client, map_name="到点复核测试地图")
+
+        describe = client.post(
+            "/api/capabilities/describe_current_scene/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {"camera_id": "front_camera"}},
+        )
+        assert describe.status_code == 200
+
+        tag_location = client.post(
+            "/api/capabilities/tag_location/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {"name": "复核失败点", "aliases": ["严格复核点"], "camera_id": "front_camera"}},
+        )
+        assert tag_location.status_code == 200
+
+        original_verify_arrival = runtime.memory_service.verify_arrival
+        runtime.memory_service.verify_arrival = lambda *args, **kwargs: MemoryArrivalVerification(
+            query="严格复核点",
+            verified=False,
+            score=0.1,
+            matched_labels=[],
+            matched_memory_id=None,
+            reason="测试强制到点复核失败。",
+            metadata={"source": "integration_test"},
+        )
+        try:
+            navigate_named = client.post(
+                "/api/capabilities/navigate_to_named_location/invoke",
+                headers=_agent_headers(),
+                json={"arguments": {"target_name": "严格复核点", "timeout_sec": 1.0}},
+            )
+            assert navigate_named.status_code == 200
+            task_payload = _wait_for_task(client, navigate_named.json()["task"]["task_id"])
+        finally:
+            runtime.memory_service.verify_arrival = original_verify_arrival
+
+        assert task_payload["status"]["state"] == "failed"
+        assert task_payload["error_payload"]["code"] == "arrival_verification_failed"
 
 
 def test_gateway_navigation_mapping_and_exploration_tools_are_callable_via_mcp(tmp_path: Path) -> None:
@@ -880,6 +1063,9 @@ def test_gateway_navigation_mapping_and_exploration_tools_are_callable_via_mcp(t
 
     app, _, robot, _ = _build_host_app(tmp_path)
     with TestClient(app) as client:
+        _create_map(client, map_name="MCP测试地图")
+        _activate_map(client, map_name="MCP测试地图")
+
         get_map_snapshot = client.post(
             "/mcp",
             headers=_agent_headers(),
@@ -945,6 +1131,7 @@ def test_gateway_navigation_mapping_and_exploration_tools_are_callable_via_mcp(t
                 "params": {
                     "name": "explore_area",
                     "arguments": {
+                        "map_name": "MCP测试地图",
                         "target_name": "meeting_point",
                         "strategy": "frontier",
                         "radius_m": 1.5,
@@ -991,6 +1178,7 @@ def test_gateway_explore_area_can_start_without_target_or_coordinates(tmp_path: 
                 "params": {
                     "name": "explore_area",
                     "arguments": {
+                        "map_name": "未知环境测试地图",
                         "strategy": "frontier",
                         "radius_m": 1.5,
                         "timeout_sec": 1.0,
@@ -1006,11 +1194,208 @@ def test_gateway_explore_area_can_start_without_target_or_coordinates(tmp_path: 
         assert robot.data_plane.mapping_runtime_calls[-1] == "explore_area"
 
 
+def test_gateway_map_catalog_tools_and_memory_compatibility(tmp_path: Path) -> None:
+    """地图资产目录应可通过网关管理，并兼容旧记忆库启用入口。"""
+
+    app, _, robot, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        create_map = client.post(
+            "/api/capabilities/create_map/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {"map_name": "一楼大厅"}},
+        )
+        assert create_map.status_code == 200
+        create_payload = create_map.json()["result"]
+        assert create_payload["map_asset"]["map_name"] == "一楼大厅"
+
+        maps_catalog = client.get("/api/maps/catalog", headers=_agent_headers())
+        assert maps_catalog.status_code == 200
+        assert maps_catalog.json()["maps"][0]["map_name"] == "一楼大厅"
+
+        activate_map = client.post(
+            "/api/capabilities/activate_map/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {"map_name": "一楼大厅"}},
+        )
+        assert activate_map.status_code == 200
+        activate_payload = activate_map.json()["result"]
+        assert activate_payload["active_workspace"]["active_map_name"] == "一楼大厅"
+        assert activate_payload["memory_summary"]["metadata"]["active_library_name"] == "一楼大厅"
+        assert robot.data_plane.mapping_runtime_calls[-1] == "activate_map"
+        assert activate_payload["map_runtime"]["runtime_scope"] == "compatibility_only"
+        assert activate_payload["map_runtime"]["used_by_platform"] is False
+        assert robot.data_plane.load_named_map_calls == []
+
+        enable_memory = client.post(
+            "/api/capabilities/enable_memory_library/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {"library_name": "一楼大厅"}},
+        )
+        assert enable_memory.status_code == 200
+        enable_payload = enable_memory.json()["result"]
+        assert enable_payload["compatibility_mode"] == "map_workspace"
+        assert enable_payload["active_workspace"]["active_map_name"] == "一楼大厅"
+
+        active_map = client.get("/api/maps/active", headers=_agent_headers())
+        assert active_map.status_code == 200
+        assert active_map.json()["active_workspace"]["active_map_name"] == "一楼大厅"
+
+        delete_map = client.post(
+            "/api/capabilities/delete_map/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {"map_name": "一楼大厅", "delete_memory_library": True}},
+        )
+        assert delete_map.status_code == 200
+        delete_payload = delete_map.json()["result"]
+        assert delete_payload["delete_result"]["deleted"] is True
+        assert delete_payload["delete_result"]["deleted_memory_library"] is True
+        assert delete_payload["active_workspace"] is None
+
+
+def test_gateway_platform_map_versions_can_save_and_reload_latest_snapshot(tmp_path: Path) -> None:
+    """平台应能保存地图版本，并在重新激活地图时自动加载最新平台版本。"""
+
+    app, runtime, robot, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        _create_map(client, map_name="平台版本地图")
+        _activate_map(client, map_name="平台版本地图")
+
+        save_version = client.post(
+            "/api/capabilities/save_active_map_version/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {"map_name": "平台版本地图", "reason": "integration_test"}},
+        )
+        assert save_version.status_code == 200
+        save_payload = save_version.json()["result"]
+        version_id = save_payload["map_version"]["version_id"]
+        assert save_payload["active_workspace"]["map_asset"]["latest_version_id"] == version_id
+
+        list_versions = client.post(
+            "/api/capabilities/list_map_versions/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {"map_name": "平台版本地图", "limit": 10}},
+        )
+        assert list_versions.status_code == 200
+        versions_payload = list_versions.json()["result"]["map_versions"]
+        assert versions_payload[0]["version_id"] == version_id
+
+        original_get_occupancy_grid = robot.providers.get_occupancy_grid
+        original_get_cost_map = robot.providers.get_cost_map
+        original_get_semantic_map = robot.providers.get_semantic_map
+        robot.providers.get_occupancy_grid = lambda: OccupancyGrid(
+            map_id="changed_map",
+            frame_id="map",
+            width=3,
+            height=3,
+            resolution_m=0.2,
+            origin=Pose(frame_id="map", position=Vector3(x=-1.0, y=-1.0, z=0.0)),
+            data=[0, 0, 0, 0, 50, 50, 0, 50, 100],
+        )
+        robot.providers.get_cost_map = lambda: CostMap(
+            map_id="changed_cost",
+            frame_id="map",
+            width=3,
+            height=3,
+            resolution_m=0.2,
+            origin=Pose(frame_id="map", position=Vector3(x=-1.0, y=-1.0, z=0.0)),
+            data=[1.0, 1.0, 1.0, 1.0, 20.0, 20.0, 1.0, 20.0, 100.0],
+        )
+        robot.providers.get_semantic_map = lambda: SemanticMap(
+            map_id="changed_semantic",
+            frame_id="map",
+            regions=[
+                SemanticRegion(
+                    region_id="changed_region",
+                    label="changed_region",
+                    centroid=Pose(frame_id="map", position=Vector3(x=3.0, y=3.0, z=0.0)),
+                    attributes={"alias": "变化区域"},
+                )
+            ],
+        )
+        try:
+            runtime.mapping_service.refresh()
+
+            changed_workspace = client.get("/api/maps/active", headers=_agent_headers())
+            assert changed_workspace.status_code == 200
+            assert changed_workspace.json()["active_workspace"]["latest_map_snapshot"]["occupancy_grid"]["width"] == 3
+
+            _create_map(client, map_name="临时切换地图")
+            switched = _activate_map(client, map_name="临时切换地图")
+            assert switched["result"]["active_workspace"]["latest_map_snapshot"]["occupancy_grid"]["width"] == 3
+
+            reactivated = _activate_map(client, map_name="平台版本地图")
+            reactivated_workspace = reactivated["result"]["active_workspace"]
+            assert reactivated_workspace["map_asset"]["latest_version_id"] == version_id
+            assert reactivated_workspace["latest_map_snapshot"]["version_id"] == version_id
+            assert reactivated_workspace["latest_map_snapshot"]["occupancy_grid"]["width"] == 2
+            assert reactivated_workspace["latest_map_snapshot"]["semantic_map"]["regions"][0]["region_id"] == "charging_station"
+            assert reactivated_workspace["localization_ready"] is False
+            assert reactivated_workspace["active_localization_session"]["status"] == "localizing"
+            assert reactivated_workspace["active_localization_session"]["map_version_id"] == version_id
+
+            latest_map = client.get("/api/maps/latest", headers=_agent_headers())
+            assert latest_map.status_code == 200
+            assert latest_map.json()["map_snapshot"]["version_id"] == version_id
+
+            semantic_context = client.get("/api/navigation/semantic_context", headers=_agent_headers())
+            assert semantic_context.status_code == 200
+            semantic_payload = semantic_context.json()["navigation_semantic_context"]
+            assert semantic_payload["map_version_id"] == version_id
+            assert semantic_payload["localization_ready"] is False
+            assert semantic_payload["localization_session_id"] == reactivated_workspace["active_localization_session"]["session_id"]
+            assert semantic_payload["semantic_regions"][0]["region_id"] == "charging_station"
+        finally:
+            robot.providers.get_occupancy_grid = original_get_occupancy_grid
+            robot.providers.get_cost_map = original_get_cost_map
+            robot.providers.get_semantic_map = original_get_semantic_map
+
+
+def test_gateway_platform_relocalization_session_can_be_promoted_to_ready(tmp_path: Path) -> None:
+    """平台地图版本重新激活后，应能通过平台重定位入口进入 ready。"""
+
+    app, _, _, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        _create_map(client, map_name="重定位测试地图")
+        _activate_map(client, map_name="重定位测试地图")
+
+        save_version = client.post(
+            "/api/capabilities/save_active_map_version/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {"map_name": "重定位测试地图", "reason": "integration_test_relocalize"}},
+        )
+        assert save_version.status_code == 200
+        version_id = save_version.json()["result"]["map_version"]["version_id"]
+
+        _create_map(client, map_name="重定位临时地图")
+        _activate_map(client, map_name="重定位临时地图")
+        _activate_map(client, map_name="重定位测试地图")
+
+        session_before = client.get("/api/localization/session", headers=_agent_headers())
+        assert session_before.status_code == 200
+        assert session_before.json()["localization_session"]["status"] == "localizing"
+        assert session_before.json()["localization_session"]["map_version_id"] == version_id
+
+        relocalize = client.post(
+            "/api/capabilities/relocalize_active_map/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {}},
+        )
+        assert relocalize.status_code == 200
+        relocalize_payload = relocalize.json()["result"]
+        assert relocalize_payload["localization_session"]["status"] == "ready"
+        assert relocalize_payload["localization_session"]["map_version_id"] == version_id
+        assert relocalize_payload["localization_snapshot"]["current_pose"]["frame_id"] == "map"
+        assert relocalize_payload["localization_snapshot"]["metadata"]["platform_map_version_id"] == version_id
+        assert relocalize_payload["active_workspace"]["localization_ready"] is True
+        assert relocalize_payload["active_workspace"]["active_localization_session"]["status"] == "ready"
+
+
 def test_gateway_memory_tools_and_named_navigation(tmp_path: Path) -> None:
     """地点记忆、语义记忆和命名导航应形成可复用链路。"""
 
     app, _, robot, _ = _build_host_app(tmp_path)
     with TestClient(app) as client:
+        _create_map(client, map_name="网关记忆链路")
         _enable_memory_library(client, library_name="网关记忆链路")
         tools = client.get("/api/tools", headers=_agent_headers())
         admin_tools = client.get("/api/tools", headers=_admin_headers())
@@ -1065,6 +1450,9 @@ def test_gateway_memory_tools_and_named_navigation(tmp_path: Path) -> None:
         )
         assert tag_location.status_code == 200
         location_id = tag_location.json()["result"]["tagged_location"]["location_id"]
+        assert tag_location.json()["result"]["tagged_location"]["metadata"]["map_name"] == "网关记忆链路"
+        assert tag_location.json()["result"]["tagged_location"]["metadata"]["map_version_id"]
+        assert tag_location.json()["result"]["tagged_location"]["metadata"]["localization_session_id"]
 
         remember_scene = client.post(
             "/api/capabilities/remember_current_scene/invoke",
@@ -1107,6 +1495,15 @@ def test_gateway_memory_tools_and_named_navigation(tmp_path: Path) -> None:
         assert locations.json()["locations"][0]["name"] == "补给点"
         assert semantic.status_code == 200
         assert len(semantic.json()["entries"]) >= 2
+        assert semantic.json()["entries"][0]["metadata"]["map_name"] == "网关记忆链路"
+
+        semantic_context = client.get("/api/navigation/semantic_context", headers=_agent_headers())
+        assert semantic_context.status_code == 200
+        semantic_payload = semantic_context.json()["navigation_semantic_context"]
+        assert semantic_payload["map_name"] == "网关记忆链路"
+        assert semantic_payload["map_version_id"]
+        assert semantic_payload["localization_session_id"]
+        assert any(item["region_id"] == "charging_station" for item in semantic_payload["semantic_regions"])
 
         robot.current_pose = Pose(frame_id="map", position=Vector3(x=0.0, y=0.0, z=0.0))
         nav_named = client.post(
@@ -1118,6 +1515,12 @@ def test_gateway_memory_tools_and_named_navigation(tmp_path: Path) -> None:
         nav_named_payload = _wait_for_task(client, nav_named.json()["task"]["task_id"])
         assert nav_named_payload["status"]["state"] == "succeeded"
         assert nav_named_payload["result"]["arrival_verification"]["verified"] is True
+        assert nav_named_payload["result"]["arrival_verification"]["metadata"]["map_version_id"] == semantic_payload["map_version_id"]
+        assert (
+            nav_named_payload["result"]["arrival_verification"]["metadata"]["localization_session_id"]
+            == semantic_payload["localization_session_id"]
+        )
+        assert robot.data_plane.save_named_map_calls == []
 
         list_capabilities = client.post(
             "/mcp",
@@ -1138,6 +1541,7 @@ def test_gateway_memory_tools_and_named_navigation(tmp_path: Path) -> None:
         assert "disable_memory_library" in skill_names
         assert "delete_memory_library" in skill_names
         assert "tag_location" in skill_names
+        assert "get_navigation_semantic_context" in skill_names
         assert "navigate_to_named_location" in skill_names
 
         delete_result = _delete_memory_library(client, library_name="网关记忆链路")
@@ -1153,6 +1557,9 @@ def test_gateway_audio_motion_and_task_tools(tmp_path: Path) -> None:
 
     app, _, robot, _ = _build_host_app(tmp_path)
     with TestClient(app) as client:
+        _create_map(client, map_name="任务测试地图")
+        _activate_map(client, map_name="任务测试地图")
+
         tools = client.post(
             "/mcp",
             headers=_agent_headers(),
@@ -1484,6 +1891,9 @@ def test_gateway_navigation_task_cancel_and_timeout(tmp_path: Path) -> None:
 
     app, _, robot, _ = _build_host_app(tmp_path)
     with TestClient(app) as client:
+        _create_map(client, map_name="取消超时测试地图")
+        _activate_map(client, map_name="取消超时测试地图")
+
         cancel_response = client.post(
             "/api/capabilities/navigate_to_pose/invoke",
             headers=_agent_headers(),

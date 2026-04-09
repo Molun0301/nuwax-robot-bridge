@@ -35,6 +35,7 @@ class TaskRecord:
     timeout_timer: Optional[Timer] = None
     result: Any = None
     error: Optional[str] = None
+    error_payload: Optional[MetadataDict] = None
     cancel_requested: bool = False
     timeout_triggered: bool = False
 
@@ -179,6 +180,13 @@ class TaskManager:
 
         with self._lock:
             return self._records[task_id].error
+
+    def get_task_error_payload(self, task_id: str) -> Optional[MetadataDict]:
+        """获取任务结构化错误载荷。"""
+
+        with self._lock:
+            payload = self._records[task_id].error_payload
+            return dict(payload) if payload is not None else None
 
     def list_active_tasks(self) -> Tuple[TaskStatus, ...]:
         """列出活动任务。"""
@@ -327,7 +335,13 @@ class TaskManager:
             if self.is_cancel_requested(task_id):
                 self._set_terminal_state(task_id, TaskState.CANCELLED, f"任务已取消: {exc}")
                 return None
-            self._set_terminal_state(task_id, TaskState.FAILED, f"任务执行失败: {exc}", error=str(exc))
+            self._set_terminal_state(
+                task_id,
+                TaskState.FAILED,
+                f"任务执行失败: {exc}",
+                error=str(exc),
+                error_payload=self._extract_error_payload(exc),
+            )
             raise
         finally:
             self._release_resources(task_id)
@@ -358,6 +372,7 @@ class TaskManager:
         *,
         result: Any = None,
         error: Optional[str] = None,
+        error_payload: Optional[MetadataDict] = None,
     ) -> None:
         with self._lock:
             record = self._records[task_id]
@@ -377,6 +392,7 @@ class TaskManager:
             )
             record.result = result
             record.error = error
+            record.error_payload = dict(error_payload or {}) or None
             if task_id not in self._history_order:
                 self._history_order.append(task_id)
             status = record.status
@@ -390,7 +406,23 @@ class TaskManager:
         payload: MetadataDict = {}
         if error is not None:
             payload["error"] = error
+        if error_payload is not None:
+            payload["error_payload"] = dict(error_payload)
         self._append_task_event(task_id, event_type, state=status.state, message=message, payload=payload)
+
+    def _extract_error_payload(self, exc: Exception) -> Optional[MetadataDict]:
+        exporter = getattr(exc, "to_payload", None)
+        if callable(exporter):
+            try:
+                payload = exporter()
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                return dict(payload)
+        message = str(exc).strip()
+        if not message:
+            return None
+        return {"code": exc.__class__.__name__, "message": message, "details": {}}
 
     def _append_task_event(
         self,

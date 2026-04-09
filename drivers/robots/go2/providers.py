@@ -8,6 +8,7 @@ from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap
 from contracts.navigation import ExplorationState, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
 from contracts.robot_state import IMUState, JointState, RobotControlMode, RobotState, SafetyState
+from drivers.robots.common import MotionCommandDataPlane
 from drivers.robots.go2.defaults import GO2_DEFAULT_CAMERA_INFO
 from providers.exploration import ExplorationProvider
 from providers.image import ImageProvider
@@ -28,6 +29,16 @@ def _to_control_mode(mode: str) -> RobotControlMode:
     if mode == "high":
         return RobotControlMode.HIGH_LEVEL
     return RobotControlMode.UNKNOWN
+
+
+def _resolve_motion_command_data_plane(data_plane) -> Optional[MotionCommandDataPlane]:
+    """返回支持底层运动命令链路的数据面。"""
+
+    if data_plane is None or not isinstance(data_plane, MotionCommandDataPlane):
+        return None
+    if not data_plane.can_accept_motion_command():
+        return None
+    return data_plane
 
 
 @dataclass
@@ -232,8 +243,8 @@ class Go2ProviderBundle(
         return self.assembly.data_plane.get_exploration_state()
 
     def send_twist(self, twist: Twist) -> None:
-        data_plane = self.assembly.data_plane
-        if data_plane is not None and hasattr(data_plane, "can_accept_motion_command") and data_plane.can_accept_motion_command():
+        data_plane = _resolve_motion_command_data_plane(self.assembly.data_plane)
+        if data_plane is not None:
             code = data_plane.send_motion_command(
                 twist.linear.x,
                 twist.linear.y,
@@ -249,8 +260,8 @@ class Go2ProviderBundle(
         )
 
     def stop_motion(self) -> None:
-        data_plane = self.assembly.data_plane
-        if data_plane is not None and hasattr(data_plane, "can_accept_motion_command") and data_plane.can_accept_motion_command():
+        data_plane = _resolve_motion_command_data_plane(self.assembly.data_plane)
+        if data_plane is not None:
             data_plane.stop_motion_command()
             return
         self.assembly.stop_move()

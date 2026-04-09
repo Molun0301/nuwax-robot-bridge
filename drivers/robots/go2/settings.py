@@ -334,6 +334,8 @@ class Go2ExplorationConfig:
     frontier_revisit_separation_m: float = 0.75
     frontier_max_no_gain_rounds: int = 2
     frontier_min_information_gain_cells: int = 12
+    prerequisite_wait_timeout_sec: float = 15.0
+    prerequisite_poll_interval_sec: float = 0.2
     sample_radius_m: float = 1.5
     sample_count: int = 8
     max_goal_cost: float = 75.0
@@ -352,6 +354,7 @@ class Go2DataPlaneConfig:
     cyclonedds_lib_dir: str = ""
     sdk_path: str = ""
     dds_iface: str = ""
+    named_map_archive_root: str = str(_PROJECT_ROOT / "runtime_data" / "go2_named_maps")
     startup_wait_for_ready: bool = True
     startup_localization_timeout_sec: float = 6.0
     startup_map_timeout_sec: float = 6.0
@@ -383,6 +386,10 @@ def load_go2_data_plane_config() -> Go2DataPlaneConfig:
         cyclonedds_lib_dir=_resolve_cyclonedds_lib_dir(_cfg_str("GO2_CYCLONEDDS_LIB_DIR", "")),
         sdk_path=_cfg_str("GO2_SDK_PATH", ""),
         dds_iface=_cfg_str("GO2_DATA_PLANE_DDS_IFACE", _cfg_str("GO2_DDS_IFACE", "")),
+        named_map_archive_root=_cfg_str(
+            "GO2_NAMED_MAP_ARCHIVE_ROOT",
+            str(_PROJECT_ROOT / "runtime_data" / "go2_named_maps"),
+        ),
         startup_wait_for_ready=_cfg_bool("GO2_DATA_PLANE_STARTUP_WAIT_FOR_READY", True),
         startup_localization_timeout_sec=max(
             0.1,
@@ -589,6 +596,14 @@ def load_go2_data_plane_config() -> Go2DataPlaneConfig:
             frontier_min_information_gain_cells=max(
                 0,
                 _cfg_int("GO2_EXPLORATION_FRONTIER_MIN_INFORMATION_GAIN_CELLS", 12),
+            ),
+            prerequisite_wait_timeout_sec=max(
+                0.1,
+                _cfg_float("GO2_EXPLORATION_PREREQUISITE_WAIT_TIMEOUT_SEC", 15.0),
+            ),
+            prerequisite_poll_interval_sec=max(
+                0.05,
+                _cfg_float("GO2_EXPLORATION_PREREQUISITE_POLL_INTERVAL_SEC", 0.2),
             ),
             sample_radius_m=max(0.1, _cfg_float("GO2_EXPLORATION_SAMPLE_RADIUS_M", 1.5)),
             sample_count=max(1, _cfg_int("GO2_EXPLORATION_SAMPLE_COUNT", 8)),
