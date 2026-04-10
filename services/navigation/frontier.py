@@ -7,6 +7,7 @@ from typing import List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 
+from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.maps import CostMap, OccupancyGrid
 
@@ -151,7 +152,7 @@ class Go2FrontierExplorer:
         if (
             occupancy_grid.frame_id
             and current_pose.frame_id
-            and occupancy_grid.frame_id != current_pose.frame_id
+            and not frame_ids_semantically_equal(occupancy_grid.frame_id, current_pose.frame_id)
         ):
             return []
 

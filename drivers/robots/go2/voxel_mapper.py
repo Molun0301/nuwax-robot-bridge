@@ -61,6 +61,7 @@ class Go2VoxelMapper:
         self._latest_frame_ts: float = 0.0
         self._initialized: bool = False
         self._frame_count: int = 0
+        self._fallback_points_xyz: Optional[np.ndarray] = None
 
     def _ensure_initialized(self) -> None:
         if self._initialized:
@@ -108,13 +109,6 @@ class Go2VoxelMapper:
         self._latest_frame_ts = timestamp
         self._frame_count += 1
 
-        if self._voxel_block_grid is None:
-            return Go2VoxelMapperResult(
-                points_xyz=points_xyz,
-                voxel_count=0,
-                timestamp=timestamp,
-            )
-
         filtered_mask = (
             (points_xyz[:, 2] >= self.config.min_z_m) &
             (points_xyz[:, 2] <= self.config.max_z_m)
@@ -125,6 +119,14 @@ class Go2VoxelMapper:
             return Go2VoxelMapperResult(
                 points_xyz=points_xyz,
                 voxel_count=0,
+                timestamp=timestamp,
+            )
+
+        if self._voxel_block_grid is None:
+            self._update_fallback_pointcloud(filtered_points)
+            return Go2VoxelMapperResult(
+                points_xyz=filtered_points,
+                voxel_count=self.get_voxel_count(),
                 timestamp=timestamp,
             )
 
@@ -196,7 +198,9 @@ class Go2VoxelMapper:
 
     def get_global_pointcloud(self) -> Optional[np.ndarray]:
         if self._voxel_block_grid is None:
-            return None
+            if self._fallback_points_xyz is None:
+                return None
+            return np.asarray(self._fallback_points_xyz, dtype=np.float32).copy()
 
         try:
             pcd = self._voxel_block_grid.get_point_cloud()
@@ -209,11 +213,21 @@ class Go2VoxelMapper:
 
     def get_voxel_count(self) -> int:
         if self._voxel_hashmap is None:
-            return 0
+            return int(self._fallback_points_xyz.shape[0]) if self._fallback_points_xyz is not None else 0
         return int(self._voxel_hashmap.size())
 
     def has_data(self) -> bool:
         return self.get_voxel_count() > 0
+
+    def restore_pointcloud(
+        self,
+        points_xyz: np.ndarray,
+        timestamp: float = 0.0,
+    ) -> Optional[Go2VoxelMapperResult]:
+        """从持久化点云恢复体素地图。"""
+
+        self.reset()
+        return self.add_frame(points_xyz, timestamp=timestamp)
 
     def reset(self) -> None:
         if self._initialized and _HAS_OPEN3D:
@@ -222,6 +236,35 @@ class Go2VoxelMapper:
         self._initialized = False
         self._frame_count = 0
         self._latest_frame_ts = 0.0
+        self._fallback_points_xyz = None
+
+    def _update_fallback_pointcloud(self, new_points: np.ndarray) -> None:
+        """在无 Open3D 环境下，使用量化点云维持最小体素语义。"""
+
+        voxel_size = max(float(self.config.voxel_size), 1e-6)
+        point_by_key = {}
+
+        if self._fallback_points_xyz is not None and self._fallback_points_xyz.size > 0:
+            existing_points = np.asarray(self._fallback_points_xyz[:, :3], dtype=np.float32)
+            existing_keys = np.floor(existing_points / voxel_size).astype(np.int64)
+            active_xy_keys = set()
+            if bool(self.config.carve_columns):
+                new_xy_keys = np.floor(np.asarray(new_points[:, :3], dtype=np.float32) / voxel_size).astype(np.int64)
+                active_xy_keys = {(int(key[0]), int(key[1])) for key in new_xy_keys.tolist()}
+            for key, point in zip(existing_keys.tolist(), existing_points.tolist()):
+                if active_xy_keys and (int(key[0]), int(key[1])) in active_xy_keys:
+                    continue
+                point_by_key[(int(key[0]), int(key[1]), int(key[2]))] = point
+
+        new_points_xyz = np.asarray(new_points[:, :3], dtype=np.float32)
+        new_keys = np.floor(new_points_xyz / voxel_size).astype(np.int64)
+        for key, point in zip(new_keys.tolist(), new_points_xyz.tolist()):
+            point_by_key[(int(key[0]), int(key[1]), int(key[2]))] = point
+
+        if not point_by_key:
+            self._fallback_points_xyz = None
+            return
+        self._fallback_points_xyz = np.asarray(list(point_by_key.values()), dtype=np.float32)
 
     def to_occupancy_grid(
         self,

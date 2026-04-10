@@ -897,8 +897,34 @@ class MemoryService:
     ) -> Optional[MemoryNavigationCandidate]:
         """把自由文本查询解析成可导航的记忆候选。"""
 
-        if not self.is_enabled():
+        candidates = self.resolve_navigation_candidates(
+            query,
+            camera_id=camera_id,
+            similarity_threshold=similarity_threshold,
+            max_age_sec=max_age_sec,
+            map_version_id=map_version_id,
+            localization_session_id=localization_session_id,
+            limit=1,
+        )
+        if not candidates:
             return None
+        return candidates[0]
+
+    def resolve_navigation_candidates(
+        self,
+        query: str,
+        *,
+        camera_id: Optional[str] = None,
+        similarity_threshold: float = 0.25,
+        max_age_sec: Optional[float] = None,
+        map_version_id: Optional[str] = None,
+        localization_session_id: Optional[str] = None,
+        limit: int = 5,
+    ) -> Tuple[MemoryNavigationCandidate, ...]:
+        """把自由文本查询解析成一组可导航的记忆候选。"""
+
+        if not self.is_enabled():
+            return ()
         current_pose = self._get_current_pose()
         map_snapshot = self._get_map_snapshot()
         self._refresh_semantic_map_context(map_snapshot)
@@ -924,12 +950,20 @@ class MemoryService:
                 MemoryRecordKind.NOTE,
             ),
             similarity_threshold=similarity_threshold,
-            limit=5,
+            limit=max(1, int(limit)),
             payload_filter=payload_filter,
         )
+        candidates: List[MemoryNavigationCandidate] = []
+        seen_record_ids = set()
         for match in result.matches:
             if match.navigation_candidate is not None:
-                return self._to_legacy_navigation_candidate(match.navigation_candidate)
+                candidate = self._to_legacy_navigation_candidate(match.navigation_candidate)
+                if candidate.record_id in seen_record_ids:
+                    continue
+                seen_record_ids.add(candidate.record_id)
+                candidates.append(candidate)
+                if len(candidates) >= max(1, int(limit)):
+                    return tuple(candidates)
         tagged_location = self.resolve_tagged_location(
             query,
             map_version_id=effective_map_version_id,
@@ -954,8 +988,10 @@ class MemoryService:
                 camera_id=camera_id,
                 localization_session_id=localization_session_id,
             )
-            return self._to_legacy_navigation_candidate(spatial_candidate)
-        return None
+            candidate = self._to_legacy_navigation_candidate(spatial_candidate)
+            if candidate.record_id not in seen_record_ids:
+                candidates.append(candidate)
+        return tuple(candidates[: max(1, int(limit))])
 
     def resolve_semantic_region_goal(
         self,

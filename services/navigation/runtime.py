@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 
+from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry import Pose
 from contracts.maps import CostMap, OccupancyGrid
 from contracts.navigation import NavigationGoal, NavigationStatus
@@ -175,7 +176,11 @@ class Go2GridNavigationPlanner:
         occupancy_grid: Optional[OccupancyGrid],
         cost_map: Optional[CostMap],
     ) -> _PlanningOutcome:
-        if current_pose.frame_id and target_pose.frame_id and current_pose.frame_id != target_pose.frame_id:
+        if (
+            current_pose.frame_id
+            and target_pose.frame_id
+            and not frame_ids_semantically_equal(current_pose.frame_id, target_pose.frame_id)
+        ):
             return _PlanningOutcome(
                 plan=None,
                 message=(
@@ -384,7 +389,7 @@ class Go2GridNavigationPlanner:
         if map_like is None:
             return False
         map_frame = str(getattr(map_like, "frame_id", "") or "")
-        if map_frame and frame_id and map_frame != frame_id:
+        if map_frame and frame_id and not frame_ids_semantically_equal(map_frame, frame_id):
             return False
         return True
 
@@ -600,7 +605,11 @@ class Go2NavigationSession:
                 status=NavigationStatus.FAILED,
                 message="导航目标缺少目标位姿。",
             )
-        if current_pose.frame_id and target_pose.frame_id and current_pose.frame_id != target_pose.frame_id:
+        if (
+            current_pose.frame_id
+            and target_pose.frame_id
+            and not frame_ids_semantically_equal(current_pose.frame_id, target_pose.frame_id)
+        ):
             return Go2NavigationTickResult(
                 status=NavigationStatus.FAILED,
                 message=f"目标坐标系 {target_pose.frame_id} 与当前位姿坐标系 {current_pose.frame_id} 不一致。",
@@ -991,7 +1000,11 @@ class Go2NavigationSession:
     ):
         if occupancy_grid is None:
             return None
-        if occupancy_grid.frame_id and plan.frame_id and occupancy_grid.frame_id != plan.frame_id:
+        if (
+            occupancy_grid.frame_id
+            and plan.frame_id
+            and not frame_ids_semantically_equal(occupancy_grid.frame_id, plan.frame_id)
+        ):
             return None
         robot_width_m = float(getattr(self._planner_config, "path_mask_robot_width_m", 0.0))
         if robot_width_m <= 1e-6:

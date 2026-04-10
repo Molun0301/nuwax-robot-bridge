@@ -5,7 +5,7 @@ import logging
 import math
 import threading
 import time
-from typing import Dict, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from contracts.artifacts import ArtifactRetentionPolicy
 from contracts.capabilities import (
@@ -1034,6 +1034,32 @@ class GatewayRuntime:
                 cancel_supported=True,
             ),
             _descriptor(
+                "find_target",
+                "查找目标",
+                "优先检查当前场景，其次回忆同图记忆候选并导航复核，用于查找人、物或地点。",
+                execution_mode=CapabilityExecutionMode.ASYNC_TASK,
+                risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=_schema_object(
+                    {
+                        "map_name": {"type": "string"},
+                        "query": {"type": "string"},
+                        "camera_id": {"type": "string"},
+                        "verify_similarity_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.55},
+                        "poll_interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.1},
+                        "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
+                    },
+                    required=("query",),
+                ),
+                output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
+                required_resources=(
+                    RuntimeResource.BASE_MOTION.value,
+                    RuntimeResource.NAVIGATION.value,
+                    RuntimeResource.CAMERA_OBSERVATION.value,
+                ),
+                timeout_sec=300,
+                cancel_supported=True,
+            ),
+            _descriptor(
                 "explore_area",
                 "探索区域",
                 "以统一探索接口发起前沿或覆盖式探索任务。",
@@ -1057,6 +1083,40 @@ class GatewayRuntime:
                 output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
                 required_resources=(RuntimeResource.BASE_MOTION.value, RuntimeResource.NAVIGATION.value),
                 timeout_sec=300,
+                cancel_supported=True,
+            ),
+            _descriptor(
+                "explore_and_find_target",
+                "探索并查找目标",
+                "在未知区域探索中持续沉淀图文空间记忆，并在命中目标后立即停止探索并完成复核。",
+                execution_mode=CapabilityExecutionMode.ASYNC_TASK,
+                risk_level=CapabilityRiskLevel.MEDIUM,
+                input_schema=_schema_object(
+                    {
+                        "map_name": {"type": "string"},
+                        "query": {"type": "string"},
+                        "camera_id": {"type": "string"},
+                        "frame_id": {"type": "string"},
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                        "z": {"type": "number", "default": 0.0},
+                        "radius_m": {"type": "number", "exclusiveMinimum": 0.0},
+                        "strategy": {"type": "string", "default": "frontier"},
+                        "max_duration_sec": {"type": "number", "exclusiveMinimum": 0.0},
+                        "poll_interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.2},
+                        "search_refresh_interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.8},
+                        "verify_similarity_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.55},
+                        "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
+                    },
+                    required=("query",),
+                ),
+                output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
+                required_resources=(
+                    RuntimeResource.BASE_MOTION.value,
+                    RuntimeResource.NAVIGATION.value,
+                    RuntimeResource.CAMERA_OBSERVATION.value,
+                ),
+                timeout_sec=600,
                 cancel_supported=True,
             ),
             _descriptor(
@@ -1271,7 +1331,9 @@ class GatewayRuntime:
             "remember_current_scene": self._handle_remember_current_scene,
             "navigate_to_pose": self._handle_navigate_to_pose,
             "navigate_to_named_location": self._handle_navigate_to_named_location,
+            "find_target": self._handle_find_target,
             "explore_area": self._handle_explore_area,
+            "explore_and_find_target": self._handle_explore_and_find_target,
             "inspect_target": self._handle_inspect_target,
             "follow_target": self._handle_follow_target,
             "relative_move": self._handle_relative_move,
@@ -1636,11 +1698,25 @@ class GatewayRuntime:
                 capability_name="navigate_to_named_location",
             ),
             SkillDescriptor(
+                name="find_target",
+                display_name="查找目标",
+                description="优先检查当前场景，再基于向量记忆回忆目标位置并导航复核。",
+                category=SkillCategory.TASK,
+                capability_name="find_target",
+            ),
+            SkillDescriptor(
                 name="explore_area",
                 display_name="探索区域",
                 description="发起一次前沿或覆盖式探索任务。",
                 category=SkillCategory.TASK,
                 capability_name="explore_area",
+            ),
+            SkillDescriptor(
+                name="explore_and_find_target",
+                display_name="探索并查找目标",
+                description="在探索中持续沉淀记忆并查找目标，命中后立即停止探索。",
+                category=SkillCategory.TASK,
+                capability_name="explore_and_find_target",
             ),
             SkillDescriptor(
                 name="inspect_target",
@@ -2559,6 +2635,118 @@ class GatewayRuntime:
             ),
         )
 
+    def _handle_find_target(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None):
+        map_name, workspace = self._resolve_map_workspace_for_request(
+            arguments,
+            capability_name="find_target",
+            requested_by=requested_by,
+            create_if_missing=False,
+        )
+        self._ensure_robot_mapping_runtime_enabled(trigger="find_target")
+        self._refresh_workspace_snapshots()
+        self._ensure_workspace_memory_library_ready(map_name=map_name)
+        query = self._require_str(arguments, "query")
+        camera_id = str(arguments.get("camera_id", "")).strip() or None
+        verify_similarity_threshold = self._float(arguments, "verify_similarity_threshold", 0.55)
+        poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.1)
+        timeout_sec = self._resolve_async_timeout("find_target", arguments, minimum_sec=0.1)
+        descriptor = self.capability_registry.get_descriptor("find_target")
+
+        def runner(context) -> Dict[str, Any]:
+            context.update(progress=0.05, stage="search_prepare", message="准备查找目标。")
+            finalized = False
+            try:
+                perception_refresh = self._refresh_target_search_observation(
+                    query=query,
+                    camera_id=camera_id,
+                    requested_by=requested_by,
+                    reason="find_target_precheck",
+                    remember_result=True,
+                    frame_count=1,
+                )
+                search_state = self._build_target_search_state(
+                    query=query,
+                    map_name=map_name,
+                    camera_id=camera_id,
+                    verify_similarity_threshold=verify_similarity_threshold,
+                    rejected_record_ids=set(),
+                )
+                if search_state["current_scene_verification"].verified:
+                    context.update(progress=1.0, stage="completed", message="目标已在当前场景中找到。")
+                    result = {
+                        "query": query,
+                        "found_mode": "current_scene",
+                        "perception_refresh": perception_refresh,
+                        "arrival_verification": search_state["current_scene_verification"],
+                        "navigation_candidate": None,
+                        "navigation_context": None,
+                    }
+                    result.update(
+                        self._finalize_workspace_assets_after_task(
+                            map_name=map_name,
+                            trigger="find_target_completed",
+                        )
+                    )
+                    finalized = True
+                    return result
+
+                search_result = self._run_target_navigation_candidates(
+                    task_context=context,
+                    capability_name="find_target",
+                    map_name=map_name,
+                    query=query,
+                    camera_id=camera_id,
+                    requested_by=requested_by,
+                    poll_interval_sec=poll_interval_sec,
+                    verify_similarity_threshold=verify_similarity_threshold,
+                    search_state=search_state,
+                    rejected_record_ids=set(),
+                    allow_not_found=False,
+                )
+                result = {
+                    "query": query,
+                    "found_mode": str(search_result["found_mode"]),
+                    "perception_refresh": perception_refresh,
+                    **search_result,
+                }
+                result.update(
+                    self._finalize_workspace_assets_after_task(
+                        map_name=map_name,
+                        trigger="find_target_completed",
+                    )
+                )
+                finalized = True
+                return result
+            finally:
+                if not finalized:
+                    try:
+                        self._finalize_workspace_assets_after_task(
+                            map_name=map_name,
+                            trigger="find_target_finalize",
+                        )
+                    except Exception:
+                        RUNTIME_LOGGER.exception("查找目标任务结束后刷新地图工作区失败 map_name=%s", map_name)
+                if context.is_cancel_requested() or context.is_timed_out():
+                    try:
+                        self.navigation_service.cancel_goal()
+                    except Exception:
+                        pass
+
+        return self.task_manager.submit(
+            "find_target",
+            runner,
+            input_payload={
+                "map_name": map_name,
+                "query": query,
+                "camera_id": camera_id,
+                "poll_interval_sec": poll_interval_sec,
+            },
+            requested_by=requested_by,
+            required_resources=list(descriptor.required_resources),
+            timeout_sec=timeout_sec,
+            metadata={"requested_by": requested_by or "unknown"},
+        )
+
     def _handle_explore_area(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None):
         map_name, workspace = self._resolve_map_workspace_for_request(
             arguments,
@@ -2595,6 +2783,347 @@ class GatewayRuntime:
             poll_interval_sec=poll_interval_sec,
             timeout_sec=timeout_sec,
             requested_by=requested_by,
+        )
+
+    def _handle_explore_and_find_target(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None):
+        map_name, workspace = self._resolve_map_workspace_for_request(
+            arguments,
+            capability_name="explore_and_find_target",
+            requested_by=requested_by,
+            create_if_missing=True,
+        )
+        self._ensure_robot_mapping_runtime_enabled(trigger="explore_and_find_target")
+        self._refresh_workspace_snapshots()
+        if self._workspace_requires_localization_before_explore(workspace):
+            self._ensure_localization_ready(
+                capability_name="explore_and_find_target",
+                map_name=map_name,
+                workspace=workspace,
+            )
+        self._ensure_workspace_memory_library_ready(map_name=map_name)
+        query = self._require_str(arguments, "query")
+        camera_id = str(arguments.get("camera_id", "")).strip() or None
+        center_pose = None
+        if "frame_id" in arguments or "x" in arguments or "y" in arguments:
+            center_pose = self._build_pose_from_arguments(arguments)
+        request = ExploreAreaRequest(
+            request_id=self._build_runtime_request_id("explore_find"),
+            map_name=map_name,
+            center_pose=center_pose,
+            radius_m=self._float(arguments, "radius_m", 0.0) or None,
+            strategy=str(arguments.get("strategy") or "frontier"),
+            max_duration_sec=self._float(arguments, "max_duration_sec", 0.0) or None,
+            metadata={
+                "requested_by": requested_by or "unknown",
+                "search_query": query,
+            },
+        )
+        poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.2)
+        search_refresh_interval_sec = self._float(arguments, "search_refresh_interval_sec", 0.8)
+        verify_similarity_threshold = self._float(arguments, "verify_similarity_threshold", 0.55)
+        timeout_sec = self._resolve_async_timeout("explore_and_find_target", arguments, minimum_sec=0.1)
+        descriptor = self.capability_registry.get_descriptor("explore_and_find_target")
+
+        def runner(context) -> Dict[str, Any]:
+            context.update(progress=0.03, stage="search_prepare", message="准备探索并查找目标。")
+            finalized = False
+            rejected_record_ids: Set[str] = set()
+            exploration_context = None
+            exploration_stop_context = None
+            resume_round = 0
+            last_search_refresh_at = 0.0
+            try:
+                precheck_refresh = self._refresh_target_search_observation(
+                    query=query,
+                    camera_id=camera_id,
+                    requested_by=requested_by,
+                    reason="explore_find_precheck",
+                    remember_result=True,
+                    frame_count=1,
+                )
+                search_state = self._build_target_search_state(
+                    query=query,
+                    map_name=map_name,
+                    camera_id=camera_id,
+                    verify_similarity_threshold=verify_similarity_threshold,
+                    rejected_record_ids=rejected_record_ids,
+                )
+                if search_state["current_scene_verification"].verified:
+                    context.update(progress=1.0, stage="completed", message="目标已在当前场景中找到。")
+                    result = {
+                        "query": query,
+                        "found_mode": "current_scene",
+                        "perception_refresh": precheck_refresh,
+                        "arrival_verification": search_state["current_scene_verification"],
+                        "navigation_candidate": None,
+                        "navigation_context": None,
+                        "exploration_context": None,
+                        "exploration_stop_context": None,
+                        "rejected_candidate_ids": sorted(rejected_record_ids),
+                    }
+                    result.update(
+                        self._finalize_workspace_assets_after_task(
+                            map_name=map_name,
+                            trigger="explore_and_find_target_completed",
+                        )
+                    )
+                    finalized = True
+                    return result
+
+                precheck_navigation = self._run_target_navigation_candidates(
+                    task_context=context,
+                    capability_name="explore_and_find_target",
+                    map_name=map_name,
+                    query=query,
+                    camera_id=camera_id,
+                    requested_by=requested_by,
+                    poll_interval_sec=poll_interval_sec,
+                    verify_similarity_threshold=verify_similarity_threshold,
+                    search_state=search_state,
+                    rejected_record_ids=rejected_record_ids,
+                    allow_not_found=True,
+                )
+                if precheck_navigation is not None:
+                    context.update(progress=1.0, stage="completed", message="已根据记忆候选找到目标。")
+                    result = {
+                        "query": query,
+                        "perception_refresh": precheck_refresh,
+                        "exploration_context": None,
+                        "exploration_stop_context": None,
+                        "rejected_candidate_ids": sorted(rejected_record_ids),
+                        **precheck_navigation,
+                    }
+                    result.update(
+                        self._finalize_workspace_assets_after_task(
+                            map_name=map_name,
+                            trigger="explore_and_find_target_completed",
+                        )
+                    )
+                    finalized = True
+                    return result
+
+                active_request = request
+                context.update(progress=0.08, stage="exploration_accepted", message="开始探索并持续查找目标。")
+                self._ensure_robot_mapping_runtime_enabled(trigger="explore_and_find_target")
+                exploration_context = self.navigation_service.start_exploration(active_request)
+                while True:
+                    context.ensure_active()
+                    exploration_context = self.navigation_service.refresh_exploration()
+                    status = exploration_context.exploration_state.status
+                    context.update(
+                        progress=max(0.1, min(0.92, self._estimate_exploration_progress(exploration_context))),
+                        stage=f"explore_find_{status.value}",
+                        message=exploration_context.exploration_state.message or "探索并查找目标中。",
+                        payload={
+                            "query": query,
+                            "request_id": exploration_context.exploration_state.current_request_id,
+                            "covered_ratio": exploration_context.exploration_state.covered_ratio,
+                            "frontier_count": exploration_context.exploration_state.frontier_count,
+                            "rejected_candidate_ids": sorted(rejected_record_ids),
+                        },
+                    )
+
+                    now = time.monotonic()
+                    if now - last_search_refresh_at >= max(0.1, search_refresh_interval_sec):
+                        self._refresh_target_search_observation(
+                            query=query,
+                            camera_id=camera_id,
+                            requested_by=requested_by,
+                            reason="explore_find_cycle",
+                            remember_result=True,
+                            frame_count=1,
+                        )
+                        last_search_refresh_at = now
+
+                    search_state = self._build_target_search_state(
+                        query=query,
+                        map_name=map_name,
+                        camera_id=camera_id,
+                        verify_similarity_threshold=verify_similarity_threshold,
+                        rejected_record_ids=rejected_record_ids,
+                    )
+                    if search_state["current_scene_verification"].verified:
+                        exploration_stop_context = self.navigation_service.stop_exploration()
+                        context.update(progress=1.0, stage="completed", message="探索中已找到目标。")
+                        result = {
+                            "query": query,
+                            "found_mode": "current_scene",
+                            "arrival_verification": search_state["current_scene_verification"],
+                            "navigation_candidate": None,
+                            "navigation_context": None,
+                            "exploration_context": exploration_context,
+                            "exploration_stop_context": exploration_stop_context,
+                            "rejected_candidate_ids": sorted(rejected_record_ids),
+                        }
+                        result.update(
+                            self._finalize_workspace_assets_after_task(
+                                map_name=map_name,
+                                trigger="explore_and_find_target_completed",
+                            )
+                        )
+                        finalized = True
+                        return result
+
+                    if search_state["memory_candidates"] or search_state["semantic_goal"] is not None:
+                        exploration_stop_context = self.navigation_service.stop_exploration()
+                        navigation_result = self._run_target_navigation_candidates(
+                            task_context=context,
+                            capability_name="explore_and_find_target",
+                            map_name=map_name,
+                            query=query,
+                            camera_id=camera_id,
+                            requested_by=requested_by,
+                            poll_interval_sec=poll_interval_sec,
+                            verify_similarity_threshold=verify_similarity_threshold,
+                            search_state=search_state,
+                            rejected_record_ids=rejected_record_ids,
+                            allow_not_found=True,
+                        )
+                        if navigation_result is not None:
+                            context.update(progress=1.0, stage="completed", message="探索中已找到目标。")
+                            result = {
+                                "query": query,
+                                "exploration_context": exploration_context,
+                                "exploration_stop_context": exploration_stop_context,
+                                "rejected_candidate_ids": sorted(rejected_record_ids),
+                                **navigation_result,
+                            }
+                            result.update(
+                                self._finalize_workspace_assets_after_task(
+                                    map_name=map_name,
+                                    trigger="explore_and_find_target_completed",
+                                )
+                            )
+                            finalized = True
+                            return result
+                        resume_round += 1
+                        active_request = active_request.model_copy(
+                            update={"request_id": f"{request.request_id}_resume_{resume_round}"},
+                            deep=True,
+                        )
+                        exploration_context = self.navigation_service.start_exploration(active_request)
+                        continue
+
+                    if status.value == "succeeded":
+                        self._refresh_target_search_observation(
+                            query=query,
+                            camera_id=camera_id,
+                            requested_by=requested_by,
+                            reason="explore_find_final",
+                            remember_result=True,
+                            frame_count=1,
+                        )
+                        final_search_state = self._build_target_search_state(
+                            query=query,
+                            map_name=map_name,
+                            camera_id=camera_id,
+                            verify_similarity_threshold=verify_similarity_threshold,
+                            rejected_record_ids=rejected_record_ids,
+                        )
+                        if final_search_state["current_scene_verification"].verified:
+                            context.update(progress=1.0, stage="completed", message="探索结束时已找到目标。")
+                            result = {
+                                "query": query,
+                                "found_mode": "current_scene",
+                                "arrival_verification": final_search_state["current_scene_verification"],
+                                "navigation_candidate": None,
+                                "navigation_context": None,
+                                "exploration_context": exploration_context,
+                                "exploration_stop_context": exploration_stop_context,
+                                "rejected_candidate_ids": sorted(rejected_record_ids),
+                            }
+                            result.update(
+                                self._finalize_workspace_assets_after_task(
+                                    map_name=map_name,
+                                    trigger="explore_and_find_target_completed",
+                                )
+                            )
+                            finalized = True
+                            return result
+                        final_navigation_result = self._run_target_navigation_candidates(
+                            task_context=context,
+                            capability_name="explore_and_find_target",
+                            map_name=map_name,
+                            query=query,
+                            camera_id=camera_id,
+                            requested_by=requested_by,
+                            poll_interval_sec=poll_interval_sec,
+                            verify_similarity_threshold=verify_similarity_threshold,
+                            search_state=final_search_state,
+                            rejected_record_ids=rejected_record_ids,
+                            allow_not_found=True,
+                        )
+                        if final_navigation_result is not None:
+                            context.update(progress=1.0, stage="completed", message="探索结束后已找到目标。")
+                            result = {
+                                "query": query,
+                                "exploration_context": exploration_context,
+                                "exploration_stop_context": exploration_stop_context,
+                                "rejected_candidate_ids": sorted(rejected_record_ids),
+                                **final_navigation_result,
+                            }
+                            result.update(
+                                self._finalize_workspace_assets_after_task(
+                                    map_name=map_name,
+                                    trigger="explore_and_find_target_completed",
+                                )
+                            )
+                            finalized = True
+                            return result
+                        raise GatewayError(
+                            "探索已完成，但仍未找到目标：%s" % query,
+                            error_code="target_not_found_after_exploration",
+                            http_status=404,
+                            jsonrpc_code=-32004,
+                            details={
+                                "map_name": map_name,
+                                "query": query,
+                                "rejected_candidate_ids": sorted(rejected_record_ids),
+                            },
+                        )
+
+                    if status.value == "failed":
+                        raise GatewayError(exploration_context.exploration_state.message or "探索执行失败。")
+                    if status.value == "cancelled":
+                        raise GatewayError(exploration_context.exploration_state.message or "探索已取消。")
+                    time.sleep(max(0.05, poll_interval_sec))
+            finally:
+                if not finalized:
+                    try:
+                        self._finalize_workspace_assets_after_task(
+                            map_name=map_name,
+                            trigger="explore_and_find_target_finalize",
+                        )
+                    except Exception:
+                        RUNTIME_LOGGER.exception("探索并查找目标任务结束后刷新地图工作区失败 map_name=%s", map_name)
+                if context.is_cancel_requested() or context.is_timed_out():
+                    try:
+                        self.navigation_service.stop_exploration()
+                    except Exception:
+                        pass
+                    try:
+                        self.navigation_service.cancel_goal()
+                    except Exception:
+                        pass
+
+        return self.task_manager.submit(
+            "explore_and_find_target",
+            runner,
+            input_payload={
+                "map_name": map_name,
+                "query": query,
+                "camera_id": camera_id,
+                "center_pose": center_pose.model_dump(mode="json") if center_pose is not None else None,
+                "radius_m": request.radius_m,
+                "strategy": request.strategy,
+                "max_duration_sec": request.max_duration_sec,
+                "poll_interval_sec": poll_interval_sec,
+                "search_refresh_interval_sec": search_refresh_interval_sec,
+            },
+            requested_by=requested_by,
+            required_resources=list(descriptor.required_resources),
+            timeout_sec=timeout_sec,
+            metadata={"requested_by": requested_by or "unknown"},
         )
 
     def _handle_inspect_target(self, arguments: Dict[str, Any], *, requested_by: Optional[str] = None):
@@ -3111,6 +3640,364 @@ class GatewayRuntime:
             "arrival_verification": arrival_verification,
         }
 
+    def _refresh_target_search_observation(
+        self,
+        *,
+        query: str,
+        camera_id: Optional[str],
+        requested_by: Optional[str],
+        reason: str,
+        remember_result: bool,
+        frame_count: int,
+    ) -> Dict[str, Any]:
+        burst_messages: Tuple[str, ...] = ()
+        perception_context = None
+        if self.perception_video_runtime.is_enabled():
+            burst_messages = self.perception_video_runtime.run_burst(
+                frame_count=max(1, int(frame_count)),
+                interval_sec=0.05,
+                requested_reason=reason,
+                store_artifact=False,
+                remember_result=remember_result,
+            )
+            perception_context = self.perception_service.get_latest_perception(camera_id)
+        else:
+            perception_context = self.perception_service.describe_current_scene(
+                camera_id=camera_id,
+                refresh=True,
+                requested_by=requested_by or "target_search",
+            )
+            if remember_result and self.memory_service.is_enabled():
+                try:
+                    self.memory_service.remember_current_scene(
+                        title="自动目标搜索：%s" % query[:48],
+                        camera_id=camera_id,
+                        summary_override=perception_context.scene_summary.headline,
+                        tags=[query],
+                        metadata={
+                            "requested_by": requested_by or "unknown",
+                            "source": reason,
+                        },
+                    )
+                except Exception:
+                    RUNTIME_LOGGER.exception("目标搜索时写入当前场景记忆失败 query=%s", query)
+        return {
+            "burst_messages": burst_messages,
+            "scene_headline": (
+                perception_context.scene_summary.headline if perception_context is not None else None
+            ),
+            "camera_id": camera_id,
+        }
+
+    def _build_target_search_state(
+        self,
+        *,
+        query: str,
+        map_name: str,
+        camera_id: Optional[str],
+        verify_similarity_threshold: float,
+        rejected_record_ids: Set[str],
+    ) -> Dict[str, Any]:
+        workspace = self.map_workspace_service.get_active_workspace()
+        current_map_version_id = (
+            workspace.latest_map_snapshot.version_id
+            if workspace is not None and workspace.latest_map_snapshot is not None
+            else None
+        )
+        current_localization_session_id = (
+            workspace.active_localization_session.session_id
+            if workspace is not None and workspace.active_localization_session is not None
+            else None
+        )
+        current_scene_verification = self.memory_service.verify_arrival(
+            query,
+            navigation_candidate=None,
+            camera_id=camera_id,
+            similarity_threshold=verify_similarity_threshold,
+            expected_map_version_id=current_map_version_id,
+            localization_session_id=current_localization_session_id,
+        )
+        memory_candidates = [
+            candidate
+            for candidate in self.memory_service.resolve_navigation_candidates(
+                query,
+                camera_id=camera_id,
+                map_version_id=current_map_version_id,
+                localization_session_id=current_localization_session_id,
+                limit=5,
+            )
+            if candidate.record_id not in rejected_record_ids
+        ]
+        semantic_goal = None
+        if not memory_candidates:
+            try:
+                semantic_goal = self.memory_service.resolve_semantic_region_goal(
+                    query,
+                    map_name=map_name,
+                )
+            except GatewayError:
+                semantic_goal = None
+        return {
+            "workspace": workspace,
+            "current_map_version_id": current_map_version_id,
+            "current_localization_session_id": current_localization_session_id,
+            "current_scene_verification": current_scene_verification,
+            "memory_candidates": tuple(memory_candidates),
+            "semantic_goal": semantic_goal,
+        }
+
+    def _build_goal_from_navigation_candidate(
+        self,
+        *,
+        map_name: str,
+        query: str,
+        candidate,
+        requested_by: Optional[str],
+        map_version_id: Optional[str],
+        localization_session_id: Optional[str],
+    ) -> NavigationGoal:
+        return NavigationGoal(
+            goal_id=self._build_runtime_request_id("find_target_nav"),
+            map_name=map_name,
+            target_pose=candidate.target_pose,
+            target_name=candidate.target_name,
+            metadata={
+                "resolved_from": "memory_search",
+                "record_id": candidate.record_id,
+                "record_kind": candidate.record_kind.value,
+                "query": query,
+                "map_version_id": map_version_id,
+                "localization_session_id": localization_session_id,
+                "requested_by": requested_by or "unknown",
+            },
+        )
+
+    def _build_target_navigation_verification(
+        self,
+        *,
+        map_name: str,
+        query: str,
+        camera_id: Optional[str],
+        navigation_candidate,
+        verify_similarity_threshold: float,
+        requested_by: Optional[str],
+        expected_map_version_id: Optional[str],
+        localization_session_id: Optional[str],
+    ) -> Dict[str, Any]:
+        refresh_payload = self._refresh_target_search_observation(
+            query=query,
+            camera_id=camera_id,
+            requested_by=requested_by,
+            reason="target_arrival_verify",
+            remember_result=True,
+            frame_count=3,
+        )
+        arrival_verification = self.memory_service.verify_arrival(
+            query,
+            navigation_candidate=navigation_candidate,
+            camera_id=camera_id,
+            similarity_threshold=verify_similarity_threshold,
+            expected_map_version_id=expected_map_version_id,
+            localization_session_id=localization_session_id,
+        )
+        return {
+            "burst_messages": refresh_payload["burst_messages"],
+            "scene_headline": refresh_payload["scene_headline"],
+            "arrival_verification": arrival_verification,
+            "map_name": map_name,
+        }
+
+    def _run_target_navigation_candidates(
+        self,
+        *,
+        task_context,
+        capability_name: str,
+        map_name: str,
+        query: str,
+        camera_id: Optional[str],
+        requested_by: Optional[str],
+        poll_interval_sec: float,
+        verify_similarity_threshold: float,
+        search_state: Dict[str, Any],
+        rejected_record_ids: Set[str],
+        allow_not_found: bool,
+    ) -> Optional[Dict[str, Any]]:
+        memory_candidates = list(search_state["memory_candidates"])
+        semantic_goal = search_state["semantic_goal"]
+        current_map_version_id = search_state["current_map_version_id"]
+        current_localization_session_id = search_state["current_localization_session_id"]
+        workspace = search_state["workspace"]
+        if not memory_candidates and semantic_goal is None:
+            if allow_not_found:
+                return None
+            raise GatewayError(
+                "未在地图 %s 的记忆库或语义区域中找到目标：%s" % (map_name, query),
+                error_code="target_not_found_in_memory",
+                http_status=404,
+                jsonrpc_code=-32004,
+                details={"map_name": map_name, "query": query},
+            )
+        try:
+            self._ensure_localization_ready(
+                capability_name=capability_name,
+                map_name=map_name,
+                workspace=workspace,
+            )
+        except GatewayError:
+            if allow_not_found:
+                return None
+            raise
+
+        last_error: Optional[GatewayError] = None
+        last_verification = None
+        attempted_candidate_ids: List[str] = []
+        for candidate in memory_candidates:
+            attempted_candidate_ids.append(candidate.record_id)
+            task_context.update(
+                progress=0.55,
+                stage="target_candidate_navigation",
+                message="正在前往记忆候选目标。",
+                payload={
+                    "query": query,
+                    "candidate_record_id": candidate.record_id,
+                    "candidate_record_kind": candidate.record_kind.value,
+                },
+            )
+            goal = self._build_goal_from_navigation_candidate(
+                map_name=map_name,
+                query=query,
+                candidate=candidate,
+                requested_by=requested_by,
+                map_version_id=current_map_version_id,
+                localization_session_id=current_localization_session_id,
+            )
+            try:
+                navigation_context = self.navigation_service.navigate_until_complete(
+                    goal,
+                    poll_interval_sec=max(0.02, poll_interval_sec),
+                    on_progress=lambda nav_context: (
+                        task_context.ensure_active(),
+                        task_context.update(
+                            progress=max(0.55, min(0.9, 0.55 + (0.3 * self._estimate_navigation_progress(nav_context)))),
+                            stage=f"target_navigation_{nav_context.navigation_state.status.value}",
+                            message=nav_context.navigation_state.message or "正在前往目标候选。",
+                            payload={
+                                "query": query,
+                                "goal_id": goal.goal_id,
+                                "remaining_distance_m": nav_context.navigation_state.remaining_distance_m,
+                            },
+                        ),
+                    ),
+                )
+            except GatewayError as exc:
+                rejected_record_ids.add(candidate.record_id)
+                last_error = exc
+                continue
+            verification_payload = self._build_target_navigation_verification(
+                map_name=map_name,
+                query=query,
+                camera_id=camera_id,
+                navigation_candidate=candidate,
+                verify_similarity_threshold=verify_similarity_threshold,
+                requested_by=requested_by,
+                expected_map_version_id=current_map_version_id,
+                localization_session_id=current_localization_session_id,
+            )
+            if verification_payload["arrival_verification"].verified:
+                return {
+                    "found_mode": "memory_candidate_navigation",
+                    "navigation_candidate": candidate,
+                    "navigation_context": navigation_context,
+                    "attempted_candidate_ids": attempted_candidate_ids,
+                    **verification_payload,
+                }
+            rejected_record_ids.add(candidate.record_id)
+            last_verification = verification_payload["arrival_verification"]
+
+        if semantic_goal is not None:
+            task_context.update(
+                progress=0.55,
+                stage="semantic_goal_navigation",
+                message="正在前往语义区域目标。",
+                payload={"query": query, "goal_id": semantic_goal.goal_id},
+            )
+            try:
+                navigation_context = self.navigation_service.navigate_until_complete(
+                    semantic_goal,
+                    poll_interval_sec=max(0.02, poll_interval_sec),
+                    on_progress=lambda nav_context: (
+                        task_context.ensure_active(),
+                        task_context.update(
+                            progress=max(0.55, min(0.9, 0.55 + (0.3 * self._estimate_navigation_progress(nav_context)))),
+                            stage=f"semantic_navigation_{nav_context.navigation_state.status.value}",
+                            message=nav_context.navigation_state.message or "正在前往语义目标。",
+                            payload={
+                                "query": query,
+                                "goal_id": semantic_goal.goal_id,
+                                "remaining_distance_m": nav_context.navigation_state.remaining_distance_m,
+                            },
+                        ),
+                    ),
+                )
+            except GatewayError as exc:
+                last_error = exc
+            else:
+                verification_payload = self._build_target_navigation_verification(
+                    map_name=map_name,
+                    query=query,
+                    camera_id=camera_id,
+                    navigation_candidate=None,
+                    verify_similarity_threshold=verify_similarity_threshold,
+                    requested_by=requested_by,
+                    expected_map_version_id=current_map_version_id,
+                    localization_session_id=current_localization_session_id,
+                )
+                if verification_payload["arrival_verification"].verified:
+                    return {
+                        "found_mode": "semantic_region_navigation",
+                        "navigation_candidate": None,
+                        "navigation_context": navigation_context,
+                        "attempted_candidate_ids": attempted_candidate_ids,
+                        **verification_payload,
+                    }
+                last_verification = verification_payload["arrival_verification"]
+
+        if allow_not_found:
+            return None
+        if last_verification is not None:
+            raise GatewayError(
+                "已到达候选位置，但目标复核未通过：%s" % (last_verification.reason or query),
+                error_code="arrival_verification_failed",
+                http_status=409,
+                jsonrpc_code=-32000,
+                details={
+                    "map_name": map_name,
+                    "query": query,
+                    "arrival_verification": last_verification.model_dump(mode="json"),
+                    "attempted_candidate_ids": attempted_candidate_ids,
+                },
+            )
+        if last_error is not None:
+            raise GatewayError(
+                "查找目标时导航候选全部失败：%s" % last_error.message,
+                error_code=last_error.error_code,
+                http_status=last_error.http_status,
+                jsonrpc_code=last_error.jsonrpc_code,
+                details={
+                    "map_name": map_name,
+                    "query": query,
+                    "attempted_candidate_ids": attempted_candidate_ids,
+                    "last_error": last_error.to_payload(),
+                },
+            )
+        raise GatewayError(
+            "未在地图 %s 的记忆库或语义区域中找到目标：%s" % (map_name, query),
+            error_code="target_not_found_in_memory",
+            http_status=404,
+            jsonrpc_code=-32004,
+            details={"map_name": map_name, "query": query},
+        )
+
     def _safe_stop_robot(self, reason: Optional[str]) -> None:
         providers = getattr(self.robot, "providers", None)
         if isinstance(providers, SafetyProvider):
@@ -3451,15 +4338,43 @@ class GatewayRuntime:
         *,
         map_name: Optional[str],
         trigger: str,
-    ) -> Dict[str, Any]:
+        ) -> Dict[str, Any]:
         if not map_name:
             return {}
         self._refresh_workspace_snapshots()
+        saved_map_version = None
+        if trigger.startswith("explore"):
+            saved_map_version = self._maybe_save_map_version_after_exploration(
+                map_name=map_name,
+                trigger=trigger,
+            )
         active_workspace = self.map_workspace_service.get_active_workspace()
         return {
             "map_runtime": self._get_robot_named_map_runtime_status(),
             "active_workspace": active_workspace,
+            "saved_map_version": saved_map_version,
         }
+
+    def _maybe_save_map_version_after_exploration(
+        self,
+        *,
+        map_name: str,
+        trigger: str,
+    ):
+        active_workspace = self.map_workspace_service.get_active_workspace()
+        if active_workspace is None or active_workspace.active_map_name != map_name:
+            return None
+        if active_workspace.latest_map_snapshot is None:
+            return None
+        try:
+            return self.map_workspace_service.save_map_version(
+                map_name=map_name,
+                reason=trigger,
+                metadata={"source": "task_finalize"},
+            )
+        except Exception:
+            RUNTIME_LOGGER.exception("探索任务结束后自动保存平台地图版本失败 map_name=%s trigger=%s", map_name, trigger)
+            return None
 
     def _ensure_robot_mapping_runtime_enabled(self, *, trigger: str) -> None:
         data_plane = getattr(self.robot, "data_plane", None)
@@ -3630,9 +4545,17 @@ class GatewayRuntime:
                 and (self.mapping_service.is_available() or bool(self.memory_service.list_tagged_locations(limit=1))),
                 "当前机器人入口未提供导航后端，且也没有可用地点记忆或语义地图。",
             ),
+            "find_target": (
+                self.navigation_service.is_navigation_available() and self._has_provider(ImageProvider),
+                "当前机器人入口未同时提供导航后端和图像采集提供器。",
+            ),
             "explore_area": (
                 self.navigation_service.is_exploration_available(),
                 "当前机器人入口未提供探索后端。",
+            ),
+            "explore_and_find_target": (
+                self.navigation_service.is_exploration_available() and self._has_provider(ImageProvider),
+                "当前机器人入口未同时提供探索后端和图像采集提供器。",
             ),
             "inspect_target": (
                 self._has_provider(ImageProvider),

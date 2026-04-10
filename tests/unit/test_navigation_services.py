@@ -3,6 +3,7 @@ from __future__ import annotations
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
+from contracts.runtime_views import LocalizationSessionStatus
 from core import EventBus, StateNamespace, StateStore
 from providers import ExplorationProvider, LocalizationProvider, MapProvider, NavigationProvider
 from services import LocalizationService, MappingService, NavigationService
@@ -284,6 +285,27 @@ def test_localization_and_mapping_services_write_latest_state_and_versions() -> 
     assert external_map_snapshot.version_id.startswith("mapv_cartographer_")
     assert latest_map is not None
     assert latest_map.value.source_name == "cartographer"
+
+
+def test_localization_service_accepts_scoped_map_frame_alias() -> None:
+    """定位会话应接受 scoped map frame（带路径地图坐标系）作为语义等价坐标系。"""
+
+    providers, _, localization_service, _, _ = _build_navigation_services()
+    providers.current_pose = Pose(
+        frame_id="world/fake_navigation/map",
+        position=Vector3(x=1.0, y=2.0, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+
+    session = localization_service.refresh_active_session(
+        map_name="测试地图",
+        map_version_id="mapver_000001",
+        frame_id="map",
+    )
+
+    assert session.status == LocalizationSessionStatus.READY
+    assert session.pose_available is True
+    assert session.last_error is None
 
 
 def test_navigation_service_supports_named_goal_resolution_after_map_source_switch() -> None:

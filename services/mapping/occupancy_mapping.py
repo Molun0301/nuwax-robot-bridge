@@ -306,6 +306,77 @@ class SparseOccupancyMapBuilder:
 
         return bool(self._log_odds_by_cell)
 
+    def export_state(self) -> Dict[str, object]:
+        """导出当前稀疏建图状态，用于运行时恢复。"""
+
+        entries = [
+            {
+                "row": int(row),
+                "col": int(col),
+                "log_odds": round(float(log_odds), 8),
+            }
+            for (row, col), log_odds in sorted(self._log_odds_by_cell.items())
+        ]
+        return {
+            "cells": entries,
+            "source_labels": sorted(self._source_labels),
+            "latest_sensor_cell": (
+                [int(self._latest_sensor_cell[0]), int(self._latest_sensor_cell[1])]
+                if self._latest_sensor_cell is not None
+                else None
+            ),
+        }
+
+    def restore_state(self, payload: Optional[Dict[str, object]]) -> bool:
+        """从持久化载荷恢复稀疏建图状态。"""
+
+        self.reset()
+        if not isinstance(payload, dict):
+            return False
+
+        raw_cells = payload.get("cells")
+        if not isinstance(raw_cells, list):
+            return False
+
+        restored_cells: Dict[Cell2D, float] = {}
+        for item in raw_cells:
+            if not isinstance(item, dict):
+                continue
+            try:
+                row = int(item.get("row"))
+                col = int(item.get("col"))
+                log_odds = float(item.get("log_odds"))
+            except (TypeError, ValueError):
+                continue
+            restored_cells[(row, col)] = log_odds
+
+        if not restored_cells:
+            return False
+
+        self._log_odds_by_cell = restored_cells
+        raw_labels = payload.get("source_labels")
+        if isinstance(raw_labels, list):
+            self._source_labels = {
+                str(item).strip()
+                for item in raw_labels
+                if str(item).strip()
+            }
+
+        raw_sensor_cell = payload.get("latest_sensor_cell")
+        if isinstance(raw_sensor_cell, (list, tuple)) and len(raw_sensor_cell) >= 2:
+            try:
+                self._latest_sensor_cell = (int(raw_sensor_cell[0]), int(raw_sensor_cell[1]))
+            except (TypeError, ValueError):
+                self._latest_sensor_cell = None
+        return True
+
+    def reset(self) -> None:
+        """清空当前稀疏建图状态。"""
+
+        self._log_odds_by_cell = {}
+        self._source_labels = set()
+        self._latest_sensor_cell = None
+
     def build(self) -> Optional[OccupancyMapBuildResult]:
         """导出当前全局地图快照。"""
 

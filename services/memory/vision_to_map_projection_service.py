@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.runtime_views import PerceptionContext
 from services.memory.semantic_map_builder import SemanticMapBuildResult
@@ -91,8 +92,10 @@ class VisionToMapProjectionService:
         return result
 
     def _resolve_detection3d_pose(self, pose: Pose, *, current_pose: Pose, map_frame: str) -> Pose:
-        if pose.frame_id == map_frame:
-            return pose
+        if frame_ids_semantically_equal(pose.frame_id, map_frame):
+            if pose.frame_id == map_frame:
+                return pose
+            return pose.model_copy(update={"frame_id": map_frame}, deep=True)
         return self._relative_pose_to_map(pose, current_pose=current_pose, map_frame=map_frame)
 
     def _resolve_detection2d_pose(
@@ -108,8 +111,10 @@ class VisionToMapProjectionService:
             return projected_pose
         if detection.track_id and detection.track_id in track_pose_by_id:
             track_pose = track_pose_by_id[detection.track_id]
-            if track_pose.frame_id == map_frame:
-                return track_pose
+            if frame_ids_semantically_equal(track_pose.frame_id, map_frame):
+                if track_pose.frame_id == map_frame:
+                    return track_pose
+                return track_pose.model_copy(update={"frame_id": map_frame}, deep=True)
             return self._relative_pose_to_map(track_pose, current_pose=current_pose, map_frame=map_frame)
 
         depth_m = self._float_or_none(detection.attributes.get("depth_m"))

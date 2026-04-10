@@ -11,7 +11,7 @@ from contracts.capabilities import CapabilityMatrix
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Twist, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
-from contracts.memory import MemoryArrivalVerification
+from contracts.memory import MemoryArrivalVerification, MemoryNavigationCandidate, MemoryRecordKind
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
 from contracts.robot_state import IMUState, JointState, RobotControlMode, RobotState, SafetyState
 from drivers.robots.common.assembly import RobotAssemblyBase, RobotAssemblyStatus
@@ -667,7 +667,9 @@ def test_gateway_mcp_http_and_auth_behaviour(tmp_path: Path) -> None:
         assert "get_navigation_snapshot" in tool_names
         assert "navigate_to_pose" in tool_names
         assert "navigate_to_named_location" in tool_names
+        assert "find_target" in tool_names
         assert "explore_area" in tool_names
+        assert "explore_and_find_target" in tool_names
         assert "relative_move" in tool_names
         assert "get_task_status" in tool_names
         assert "switch_control_mode" not in tool_names
@@ -1194,6 +1196,162 @@ def test_gateway_explore_area_can_start_without_target_or_coordinates(tmp_path: 
         assert robot.data_plane.mapping_runtime_calls[-1] == "explore_area"
 
 
+def test_gateway_find_target_can_complete_from_current_scene(tmp_path: Path) -> None:
+    """正式找目标入口应支持直接从当前场景完成目标查找。"""
+
+    app, _, robot, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        _create_map(client, map_name="找目标测试地图")
+        _activate_map(client, map_name="找目标测试地图")
+
+        find_target = client.post(
+            "/api/capabilities/find_target/invoke",
+            headers=_agent_headers(),
+            json={"arguments": {"query": "person", "timeout_sec": 1.0}},
+        )
+        assert find_target.status_code == 200
+        task_payload = _wait_for_task(client, find_target.json()["task"]["task_id"])
+
+        assert task_payload["status"]["state"] == "succeeded"
+        assert task_payload["result"]["found_mode"] == "current_scene"
+        assert task_payload["result"]["arrival_verification"]["verified"] is True
+        assert task_payload["result"]["navigation_context"] is None
+        assert robot.data_plane.mapping_runtime_calls[-1] == "find_target"
+
+
+def test_gateway_explore_and_find_target_stops_exploration_and_saves_map_version(tmp_path: Path) -> None:
+    """探索并找目标在命中后应停止探索，并自动收口平台地图版本。"""
+
+    app, runtime, robot, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        _create_map(client, map_name="探索找目标测试地图")
+        _activate_map(client, map_name="探索找目标测试地图")
+
+        original_verify_arrival = runtime.memory_service.verify_arrival
+        original_resolve_navigation_candidates = runtime.memory_service.resolve_navigation_candidates
+        call_counter = {"count": 0}
+
+        def fake_verify_arrival(query: str, *args, **kwargs):
+            del args, kwargs
+            call_counter["count"] += 1
+            verified = call_counter["count"] >= 3 and query == "person"
+            return MemoryArrivalVerification(
+                query=query,
+                verified=verified,
+                score=0.95 if verified else 0.1,
+                matched_labels=["person"] if verified else [],
+                matched_memory_id=None,
+                reason="测试模拟探索中命中目标。" if verified else "测试模拟尚未命中目标。",
+                metadata={"source": "integration_test", "call_count": call_counter["count"]},
+            )
+
+        runtime.memory_service.verify_arrival = fake_verify_arrival
+        runtime.memory_service.resolve_navigation_candidates = lambda *args, **kwargs: ()
+        try:
+            response = client.post(
+                "/api/capabilities/explore_and_find_target/invoke",
+                headers=_agent_headers(),
+                json={"arguments": {"query": "person", "timeout_sec": 1.0, "poll_interval_sec": 0.05}},
+            )
+            assert response.status_code == 200
+            task_payload = _wait_for_task(client, response.json()["task"]["task_id"])
+        finally:
+            runtime.memory_service.verify_arrival = original_verify_arrival
+            runtime.memory_service.resolve_navigation_candidates = original_resolve_navigation_candidates
+
+        assert task_payload["status"]["state"] == "succeeded"
+        assert task_payload["result"]["found_mode"] == "current_scene"
+        assert task_payload["result"]["exploration_stop_context"]["exploration_state"]["status"] == "cancelled"
+        assert task_payload["result"]["saved_map_version"]["version_id"]
+        assert robot.exploration_cancelled is True
+        assert robot.data_plane.mapping_runtime_calls[-1] == "explore_and_find_target"
+
+
+def test_gateway_explore_and_find_target_rejects_false_candidate_and_resumes_exploration(tmp_path: Path) -> None:
+    """探索并找目标命中伪候选后应继续探索，直到真正找到目标。"""
+
+    app, runtime, robot, _ = _build_host_app(tmp_path)
+    with TestClient(app) as client:
+        _create_map(client, map_name="探索找目标回退测试地图")
+        _activate_map(client, map_name="探索找目标回退测试地图")
+
+        candidate = MemoryNavigationCandidate(
+            record_kind=MemoryRecordKind.OBJECT_INSTANCE,
+            record_id="mem_scene_20260410T000001Z_abcd1234",
+            target_pose=Pose(frame_id="map", position=Vector3(x=1.2, y=0.3, z=0.0)),
+            target_name="疑似人员目标",
+            verification_query="person",
+            metadata={"source": "integration_test_false_candidate"},
+        )
+        original_verify_arrival = runtime.memory_service.verify_arrival
+        original_resolve_navigation_candidates = runtime.memory_service.resolve_navigation_candidates
+        verify_state = {"scene_checks": 0, "candidate_checks": 0}
+        resolve_state = {"call_count": 0}
+
+        def fake_verify_arrival(query: str, *args, navigation_candidate=None, **kwargs):
+            del args, kwargs
+            if navigation_candidate is None:
+                verify_state["scene_checks"] += 1
+                verified = verify_state["scene_checks"] >= 3 and query == "person"
+                return MemoryArrivalVerification(
+                    query=query,
+                    verified=verified,
+                    score=0.97 if verified else 0.08,
+                    matched_labels=["person"] if verified else [],
+                    matched_memory_id=None,
+                    reason="恢复探索后在当前场景命中目标。" if verified else "当前场景尚未命中目标。",
+                    metadata={
+                        "source": "integration_test_false_candidate",
+                        "scene_checks": verify_state["scene_checks"],
+                    },
+                )
+            verify_state["candidate_checks"] += 1
+            return MemoryArrivalVerification(
+                query=query,
+                verified=False,
+                score=0.12,
+                matched_labels=[],
+                matched_memory_id=navigation_candidate.record_id,
+                reason="候选位置复核失败，应继续探索。",
+                metadata={
+                    "source": "integration_test_false_candidate",
+                    "candidate_checks": verify_state["candidate_checks"],
+                    "candidate_record_id": navigation_candidate.record_id,
+                },
+            )
+
+        def fake_resolve_navigation_candidates(*args, **kwargs):
+            del args, kwargs
+            resolve_state["call_count"] += 1
+            if resolve_state["call_count"] == 2:
+                return (candidate,)
+            return ()
+
+        runtime.memory_service.verify_arrival = fake_verify_arrival
+        runtime.memory_service.resolve_navigation_candidates = fake_resolve_navigation_candidates
+        try:
+            response = client.post(
+                "/api/capabilities/explore_and_find_target/invoke",
+                headers=_agent_headers(),
+                json={"arguments": {"query": "person", "timeout_sec": 1.2, "poll_interval_sec": 0.05}},
+            )
+            assert response.status_code == 200
+            task_payload = _wait_for_task(client, response.json()["task"]["task_id"])
+        finally:
+            runtime.memory_service.verify_arrival = original_verify_arrival
+            runtime.memory_service.resolve_navigation_candidates = original_resolve_navigation_candidates
+
+        assert task_payload["status"]["state"] == "succeeded"
+        assert task_payload["result"]["found_mode"] == "current_scene"
+        assert candidate.record_id in task_payload["result"]["rejected_candidate_ids"]
+        assert task_payload["result"]["exploration_context"]["exploration_state"]["current_request_id"].endswith("_resume_1")
+        assert task_payload["result"]["exploration_stop_context"]["exploration_state"]["status"] == "cancelled"
+        assert task_payload["result"]["saved_map_version"]["version_id"]
+        assert robot.navigation_goal_count == 1
+        assert robot.exploration_cancelled is True
+        assert robot.data_plane.mapping_runtime_calls[-1] == "explore_and_find_target"
+
+
 def test_gateway_map_catalog_tools_and_memory_compatibility(tmp_path: Path) -> None:
     """地图资产目录应可通过网关管理，并兼容旧记忆库启用入口。"""
 
@@ -1543,6 +1701,8 @@ def test_gateway_memory_tools_and_named_navigation(tmp_path: Path) -> None:
         assert "tag_location" in skill_names
         assert "get_navigation_semantic_context" in skill_names
         assert "navigate_to_named_location" in skill_names
+        assert "find_target" in skill_names
+        assert "explore_and_find_target" in skill_names
 
         delete_result = _delete_memory_library(client, library_name="网关记忆链路")
         delete_payload = delete_result["result"]

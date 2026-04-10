@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
+
 from contracts.base import utc_now
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.maps import OccupancyGrid, SemanticMap, SemanticRegion
@@ -130,6 +132,42 @@ def test_projection_service_projects_rgb_and_3d_targets_into_map_frame() -> None
     assert labels == {"charger", "person"}
     assert all(item.pose.frame_id == "map" for item in projected)
     assert any(item.semantic_region_id == "dock_zone" for item in projected)
+
+
+def test_projection_service_treats_scoped_map_frame_as_same_map_frame() -> None:
+    projection_service = VisionToMapProjectionService()
+    map_context = SemanticMapBuilder().build(_build_map_snapshot())
+    scoped_context = PerceptionContext(
+        camera_id="front_camera",
+        observation=Observation(
+            observation_id="obs_camera_front_20260401T120500Z_deadbeef",
+            frame_id="camera/front",
+            summary="看到了人员。",
+            detections_3d=[
+                Detection3D(
+                    label="person",
+                    score=0.95,
+                    pose=Pose(frame_id="world/test/map", position=Vector3(x=1.0, y=0.2, z=0.0)),
+                    attributes={"instance_type": "person"},
+                )
+            ],
+        ),
+        scene_summary=SceneSummary(headline="看到了人员。"),
+        pipeline_name="test_pipeline",
+        detector_backend="metadata",
+        tracker_backend="basic",
+    )
+
+    projected = projection_service.project(
+        scoped_context,
+        current_pose=Pose(frame_id="map", position=Vector3(x=9.0, y=9.0, z=0.0), orientation=Quaternion(w=1.0)),
+        map_context=map_context,
+    )
+
+    assert len(projected) == 1
+    assert projected[0].pose.frame_id == "map"
+    assert projected[0].pose.position.x == pytest.approx(1.0)
+    assert projected[0].pose.position.y == pytest.approx(0.2)
 
 
 def test_instance_association_merges_static_instances_and_marks_stale() -> None:

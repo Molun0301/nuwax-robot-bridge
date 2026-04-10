@@ -4,6 +4,7 @@ from collections import deque
 
 from contracts.base import utc_now
 from contracts.events import RuntimeEventCategory
+from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.runtime_views import LocalizationSession, LocalizationSessionStatus, LocalizationSnapshot
 from core import EventBus, StateNamespace, StateStore
 from gateways.errors import GatewayError
@@ -57,7 +58,14 @@ class LocalizationService:
             existing is not None
             and existing.map_name == str(map_name or "").strip()
             and existing.map_version_id == str(map_version_id or "").strip()
-            and existing.frame_id == (str(frame_id or "").strip() or None)
+            and (
+                existing.frame_id == (str(frame_id or "").strip() or None)
+                or (
+                    existing.frame_id is not None
+                    and str(frame_id or "").strip()
+                    and frame_ids_semantically_equal(existing.frame_id, str(frame_id or "").strip())
+                )
+            )
         ):
             return existing
         session = LocalizationSession(
@@ -97,7 +105,7 @@ class LocalizationService:
         if current_pose is None:
             usable_pose = None
             last_error = "当前定位提供器还没有可用位姿。"
-        elif session.frame_id and current_pose.frame_id != session.frame_id:
+        elif session.frame_id and not frame_ids_semantically_equal(current_pose.frame_id, session.frame_id):
             usable_pose = None
             last_error = "定位提供器位姿坐标系 %s 与目标地图坐标系 %s 不一致。" % (
                 current_pose.frame_id,

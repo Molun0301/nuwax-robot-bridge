@@ -90,3 +90,32 @@ def test_sparse_global_map_builder_accumulates_points_from_multiple_robot_positi
     assert occupancy[first_obstacle_index] == 100
     assert occupancy[second_obstacle_index] == 100
     assert occupancy[free_cell_index] == 0
+
+
+def test_sparse_global_map_builder_can_restore_persisted_state() -> None:
+    builder = Go2SparseGlobalMapBuilder(
+        Go2MapSynthesisConfig(
+            global_map_enabled=True,
+            global_map_resolution_m=0.5,
+            global_map_padding_cells=0,
+            global_map_max_width=40,
+            global_map_max_height=40,
+            global_map_inflation_radius_m=0.0,
+        )
+    )
+    scan = np.asarray([[1.0, 0.0, 0.1], [2.0, 0.0, 0.1]], dtype=np.float32)
+    assert builder.ingest_scan(world_points=scan, sensor_x=0.0, sensor_y=0.0, source_label="direct_dds_point_cloud")
+
+    exported_state = builder.export_state()
+    restored_builder = Go2SparseGlobalMapBuilder(builder.config)
+
+    assert restored_builder.restore_state(exported_state) is True
+
+    original = builder.build()
+    restored = restored_builder.build()
+
+    assert original is not None
+    assert restored is not None
+    assert restored.known_cell_count == original.known_cell_count
+    assert restored.source_label == original.source_label
+    assert restored.occupancy_data.tolist() == original.occupancy_data.tolist()

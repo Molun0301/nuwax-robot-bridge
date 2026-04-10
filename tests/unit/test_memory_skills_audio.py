@@ -787,7 +787,10 @@ def test_memory_service_supports_payload_filters_navigation_and_arrival_verifica
 
     providers.current_pose = Pose(frame_id="map", position=Vector3(x=1.1, y=0.45, z=0.0), orientation=Quaternion(w=1.0))
     navigation_candidate = memory_service.resolve_navigation_candidate("charging dock")
+    navigation_candidates = memory_service.resolve_navigation_candidates("charging dock", limit=3)
     assert navigation_candidate is not None
+    assert navigation_candidates
+    assert navigation_candidates[0].record_id == navigation_candidate.record_id
     assert navigation_candidate.record_id != tagged_location.location_id
     assert navigation_candidate.target_pose.frame_id == "map"
     assert navigation_candidate.metadata["map_name"] == "单元测试记忆库"

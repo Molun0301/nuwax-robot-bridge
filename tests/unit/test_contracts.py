@@ -7,6 +7,7 @@ import pytest
 from contracts.artifacts import ArtifactKind, ArtifactRef
 from contracts.capabilities import CapabilityDescriptor, CapabilityExecutionMode, CapabilityRiskLevel
 from contracts.events import RuntimeEvent, RuntimeEventCategory, RuntimeEventSeverity
+from contracts.frame_semantics import frame_ids_semantically_equal, infer_frame_role
 from contracts.geometry import Pose, Quaternion, Transform, Twist, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.maps import OccupancyGrid
@@ -80,6 +81,17 @@ def test_image_frame_requires_payload() -> None:
             height_px=480,
             encoding=ImageEncoding.JPEG,
         )
+
+
+def test_frame_semantics_support_scoped_aliases_without_cross_scope_confusion() -> None:
+    """坐标系语义比较应接受 scoped alias（带路径别名），同时避免跨作用域误判。"""
+
+    assert infer_frame_role("world/go2/map") == "map"
+    assert infer_frame_role("world/go2/body") == "base"
+    assert frame_ids_semantically_equal("map", "world/go2/map") is True
+    assert frame_ids_semantically_equal("body", "world/go2/body") is True
+    assert frame_ids_semantically_equal("map", "odom") is False
+    assert frame_ids_semantically_equal("world/go2/map", "world/other_robot/map") is False
 
 
 def test_navigation_goal_requires_pose_or_name() -> None:

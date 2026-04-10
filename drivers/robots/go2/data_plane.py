@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import importlib
 import importlib.util
 import json
@@ -19,6 +19,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple, TYPE_CHECK
 
 import numpy as np
 
+from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
@@ -291,7 +292,10 @@ class RclpyGo2RosBridge:
         self._local_map_scans: Deque[LocalMapScan] = deque()
         self._last_global_map_update_monotonic = 0.0
         self._last_local_map_update_monotonic = 0.0
+        self._last_voxel_cache_update_monotonic = 0.0
         self._point_cloud_mapping_runtime_enabled = not self._should_defer_point_cloud_mapping_until_runtime_enabled()
+        self._global_map_cache_restored = False
+        self._voxel_map_cache_restored = False
 
         self._collision_detector = Go2CollisionDetector(self.config.collision_detector)
         self._cost_mapper = Go2CostMapper(self.config.cost_mapper)
@@ -300,6 +304,9 @@ class RclpyGo2RosBridge:
         self._frontier_explorer: Optional[Go2FrontierExplorer] = None
         self._last_collision_status = CollisionStatus.SAFE
         self._last_local_velocity_cmd: Optional[Go2VelocityCommand] = None
+        if self._point_cloud_mapping_runtime_enabled:
+            with self._lock:
+                self._restore_mapping_runtime_cache_unlocked(reason="bridge_init")
 
     def start(self) -> None:
         """启动 Go2 数据桥。"""
@@ -619,8 +626,12 @@ class RclpyGo2RosBridge:
                 "ros_map_ready": self._ros_occupancy_ready or self._ros_grid_map_ready or self._ros_cost_map_ready,
                 "global_map_ready": self._global_map_ready,
                 "global_map_source": self._latest_global_map_source,
+                "global_map_cache_restored": self._global_map_cache_restored,
                 "local_map_ready": self._local_map_ready,
                 "local_map_source": self._latest_local_map_source,
+                "voxel_map_ready": self._voxel_mapper.has_data(),
+                "voxel_map_count": self._voxel_mapper.get_voxel_count(),
+                "voxel_map_cache_restored": self._voxel_map_cache_restored,
                 "last_error": self._last_error,
             }
 
@@ -849,9 +860,10 @@ class RclpyGo2RosBridge:
         if self._latest_pose_from_dds is not None:
             self._latest_pose = self._latest_pose_from_dds
             self._latest_pose_source = f"dds:{self.config.direct_dds.pose_topic}"
-            return
-        self._latest_pose = self._latest_pose_from_ros
-        self._latest_pose_source = self._latest_odom_source_topic
+        else:
+            self._latest_pose = self._latest_pose_from_ros
+            self._latest_pose_source = self._latest_odom_source_topic
+        self._maybe_refresh_global_map_outputs_unlocked()
 
     def _update_preferred_imu_unlocked(self) -> None:
         """按照优先级更新当前 IMU 来源。"""
@@ -964,9 +976,11 @@ class RclpyGo2RosBridge:
         """清理 bridge 内部点云建图产物，恢复到冷启动状态。"""
 
         self._global_map_builder = Go2SparseGlobalMapBuilder(self.config.map_synthesis)
+        self._voxel_mapper.reset()
         self._local_map_scans.clear()
         self._last_global_map_update_monotonic = 0.0
         self._last_local_map_update_monotonic = 0.0
+        self._last_voxel_cache_update_monotonic = 0.0
         self._latest_occupancy_from_global_cloud = None
         self._latest_cost_from_global_cloud = None
         self._latest_semantic_map_from_global_cloud = None
@@ -977,13 +991,213 @@ class RclpyGo2RosBridge:
         self._local_map_ready = False
         self._latest_global_map_source = ""
         self._latest_local_map_source = ""
+        self._global_map_cache_restored = False
+        self._voxel_map_cache_restored = False
+
+    def _mapping_runtime_cache_root(self) -> Path:
+        root = str(getattr(self.config, "named_map_archive_root", "") or "").strip()
+        if not root:
+            root = str(Path.cwd() / "runtime_data" / "go2_named_maps")
+        return Path(root).expanduser() / "_runtime_cache"
+
+    def _global_map_cache_path(self) -> Path:
+        return self._mapping_runtime_cache_root() / "global_map_state.json"
+
+    def _voxel_map_cache_path(self) -> Path:
+        return self._mapping_runtime_cache_root() / "voxel_map_points.npz"
+
+    def _persist_global_map_cache_unlocked(self) -> None:
+        """把当前实时全局图状态持久化到本地缓存。"""
+
+        if not bool(self.config.map_synthesis.global_map_enabled):
+            return
+
+        has_builder_state = self._global_map_builder.has_data()
+        has_snapshot = any(
+            item is not None
+            for item in (
+                self._latest_occupancy_from_global_cloud,
+                self._latest_cost_from_global_cloud,
+                self._latest_semantic_map_from_global_cloud,
+            )
+        )
+        state_path = self._global_map_cache_path()
+        if not has_builder_state and not has_snapshot:
+            if state_path.exists():
+                state_path.unlink()
+            return
+
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "saved_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "source_label": self._latest_global_map_source,
+            "builder_state": self._global_map_builder.export_state(),
+            "occupancy_grid": (
+                self._latest_occupancy_from_global_cloud.model_dump(mode="json")
+                if self._latest_occupancy_from_global_cloud is not None
+                else None
+            ),
+            "cost_map": (
+                self._latest_cost_from_global_cloud.model_dump(mode="json")
+                if self._latest_cost_from_global_cloud is not None
+                else None
+            ),
+            "semantic_map": (
+                self._latest_semantic_map_from_global_cloud.model_dump(mode="json")
+                if self._latest_semantic_map_from_global_cloud is not None
+                else None
+            ),
+        }
+        state_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _restore_global_map_cache_unlocked(self) -> bool:
+        """从本地缓存恢复实时全局图状态。"""
+
+        if not bool(self.config.map_synthesis.global_map_enabled):
+            self._global_map_cache_restored = False
+            return False
+        state_path = self._global_map_cache_path()
+        if not state_path.exists():
+            self._global_map_cache_restored = False
+            return False
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOGGER.warning("读取 Go2 全局图缓存失败 path=%s error=%s", state_path, exc)
+            self._global_map_cache_restored = False
+            return False
+
+        restored_builder = self._global_map_builder.restore_state(payload.get("builder_state"))
+        try:
+            self._latest_occupancy_from_global_cloud = (
+                OccupancyGrid.model_validate(payload["occupancy_grid"])
+                if payload.get("occupancy_grid") is not None
+                else None
+            )
+            self._latest_cost_from_global_cloud = (
+                CostMap.model_validate(payload["cost_map"])
+                if payload.get("cost_map") is not None
+                else None
+            )
+            self._latest_semantic_map_from_global_cloud = (
+                SemanticMap.model_validate(payload["semantic_map"])
+                if payload.get("semantic_map") is not None
+                else None
+            )
+        except Exception as exc:
+            LOGGER.warning("解析 Go2 全局图缓存失败 path=%s error=%s", state_path, exc)
+            self._latest_occupancy_from_global_cloud = None
+            self._latest_cost_from_global_cloud = None
+            self._latest_semantic_map_from_global_cloud = None
+            self._global_map_ready = False
+            self._global_map_cache_restored = restored_builder
+            return restored_builder
+
+        self._global_map_ready = any(
+            item is not None
+            for item in (
+                self._latest_occupancy_from_global_cloud,
+                self._latest_cost_from_global_cloud,
+                self._latest_semantic_map_from_global_cloud,
+            )
+        )
+        self._latest_global_map_source = str(payload.get("source_label") or self._latest_global_map_source or "")
+        self._global_map_cache_restored = restored_builder or self._global_map_ready
+        return self._global_map_cache_restored
+
+    def _persist_voxel_map_cache_unlocked(self) -> None:
+        """把当前体素地图点云持久化到本地缓存。"""
+
+        if not (bool(self.config.voxel_mapper.enabled) and bool(self.config.map_synthesis.global_map_enabled)):
+            return
+        state_path = self._voxel_map_cache_path()
+        points_xyz = self._voxel_mapper.get_global_pointcloud()
+        if points_xyz is None or points_xyz.size == 0:
+            if state_path.exists():
+                state_path.unlink()
+            return
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(state_path, points_xyz=np.asarray(points_xyz, dtype=np.float32))
+
+    def _restore_voxel_map_cache_unlocked(self) -> bool:
+        """从本地缓存恢复体素地图。"""
+
+        if not (bool(self.config.voxel_mapper.enabled) and bool(self.config.map_synthesis.global_map_enabled)):
+            self._voxel_map_cache_restored = False
+            return False
+        state_path = self._voxel_map_cache_path()
+        if not state_path.exists():
+            self._voxel_map_cache_restored = False
+            return False
+        try:
+            with np.load(state_path) as payload:
+                points_xyz = np.asarray(payload["points_xyz"], dtype=np.float32)
+        except Exception as exc:
+            LOGGER.warning("读取 Go2 体素图缓存失败 path=%s error=%s", state_path, exc)
+            self._voxel_map_cache_restored = False
+            return False
+        if points_xyz.ndim != 2 or points_xyz.shape[1] < 3 or points_xyz.size == 0:
+            self._voxel_map_cache_restored = False
+            return False
+        self._voxel_mapper.restore_pointcloud(points_xyz[:, :3], timestamp=time.time())
+        self._voxel_map_cache_restored = self._voxel_mapper.has_data()
+        return self._voxel_map_cache_restored
+
+    def _restore_mapping_runtime_cache_unlocked(self, *, reason: str = "") -> bool:
+        """恢复点云建图运行态缓存。"""
+
+        restored_global = self._restore_global_map_cache_unlocked()
+        restored_voxel = self._restore_voxel_map_cache_unlocked()
+        restored_any = restored_global or restored_voxel
+        if restored_any:
+            LOGGER.info(
+                "Go2 点云建图运行态已从缓存恢复 reason=%s global=%s voxel=%s",
+                reason or "unknown",
+                restored_global,
+                restored_voxel,
+            )
+        return restored_any
+
+    def _maybe_refresh_global_map_outputs_unlocked(self) -> None:
+        """当仅恢复了稀疏状态但尚未恢复快照时，按当前位姿补生成一次地图快照。"""
+
+        if not (
+            self._point_cloud_mapping_runtime_enabled
+            and bool(self.config.map_synthesis.global_map_enabled)
+            and self._latest_pose is not None
+            and self._global_map_builder.has_data()
+        ):
+            return
+        if self._global_map_ready:
+            return
+        build_result = self._global_map_builder.build()
+        occupancy, cost_map, semantic_map = self._build_contract_maps_from_global_result(
+            build_result,
+            current_pose=self._latest_pose,
+        )
+        self._latest_occupancy_from_global_cloud = occupancy
+        self._latest_cost_from_global_cloud = cost_map
+        self._latest_semantic_map_from_global_cloud = semantic_map
+        self._global_map_ready = bool(occupancy is not None or cost_map is not None or semantic_map is not None)
+        if build_result is not None:
+            self._latest_global_map_source = build_result.source_label
+        self._persist_global_map_cache_unlocked()
 
     def enable_mapping_runtime(self, *, reason: str = "") -> Dict[str, object]:
         """显式启用点云地图合成链。"""
 
+        restored_runtime_cache = False
         with self._lock:
             already_enabled = self._point_cloud_mapping_runtime_enabled
             self._point_cloud_mapping_runtime_enabled = True
+            if not already_enabled:
+                restored_runtime_cache = self._restore_mapping_runtime_cache_unlocked(
+                    reason=reason or "enable_mapping_runtime"
+                )
+                self._maybe_refresh_global_map_outputs_unlocked()
             status = {
                 "point_cloud_mapping_runtime_enabled": self._point_cloud_mapping_runtime_enabled,
                 "point_cloud_mapping_deferred_until_runtime_enable": (
@@ -992,6 +1206,8 @@ class RclpyGo2RosBridge:
                 "point_cloud_available": self._point_cloud_available,
                 "global_map_ready": self._global_map_ready,
                 "local_map_ready": self._local_map_ready,
+                "voxel_map_ready": self._voxel_mapper.has_data(),
+                "restored_runtime_cache": restored_runtime_cache,
             }
         if not already_enabled:
             LOGGER.info("Go2 点云地图合成链已启用 reason=%s", reason or "mapping_runtime")
@@ -1012,6 +1228,7 @@ class RclpyGo2RosBridge:
                 "point_cloud_available": self._point_cloud_available,
                 "global_map_ready": self._global_map_ready,
                 "local_map_ready": self._local_map_ready,
+                "voxel_map_ready": self._voxel_mapper.has_data(),
                 "map_available": self.is_map_available(),
             }
         if supports_runtime_toggle and was_enabled:
@@ -1212,6 +1429,14 @@ class RclpyGo2RosBridge:
         now_sec = time.time()
         now_mono = time.monotonic()
         with self._lock:
+            voxel_updated = False
+            if bool(self.config.voxel_mapper.enabled):
+                try:
+                    voxel_result = self._voxel_mapper.add_frame(world_points, timestamp=now_sec)
+                    voxel_updated = voxel_result is not None and self._voxel_mapper.has_data()
+                except Exception as exc:
+                    LOGGER.warning("Go2 体素地图更新失败 source=%s error=%s", source_label, exc)
+
             if self.config.map_synthesis.global_map_enabled:
                 ingested = self._global_map_builder.ingest_scan(
                     world_points=world_points,
@@ -1234,6 +1459,7 @@ class RclpyGo2RosBridge:
                     self._global_map_ready = bool(occupancy is not None or cost_map is not None or semantic_map is not None)
                     if build_result is not None:
                         self._latest_global_map_source = build_result.source_label
+                    self._persist_global_map_cache_unlocked()
                     self._last_global_map_update_monotonic = now_mono
 
             if self.config.map_synthesis.local_map_enabled:
@@ -1255,6 +1481,13 @@ class RclpyGo2RosBridge:
                 self._latest_semantic_map_from_local_cloud = semantic_map
                 self._local_map_ready = bool(occupancy is not None or cost_map is not None or semantic_map is not None)
                 self._last_local_map_update_monotonic = now_mono
+
+            voxel_cache_interval_sec = max(0.05, float(getattr(self.config.voxel_mapper, "publish_interval_sec", 0.5)))
+            if voxel_updated and (
+                now_mono - self._last_voxel_cache_update_monotonic >= voxel_cache_interval_sec
+            ):
+                self._persist_voxel_map_cache_unlocked()
+                self._last_voxel_cache_update_monotonic = now_mono
 
     def _extract_xyz_from_point_cloud(self, message: object) -> np.ndarray:
         fields = list(getattr(message, "fields", []) or [])
@@ -2166,7 +2399,7 @@ class Go2DataPlaneRuntime:
             }
         archive_path = self._named_map_archive_path(resolved_name)
         archive_path.parent.mkdir(parents=True, exist_ok=True)
-        saved_at = datetime.utcnow().isoformat() + "Z"
+        saved_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         archive_path.write_text(
             json.dumps(
                 {
@@ -3001,7 +3234,11 @@ class Go2DataPlaneRuntime:
             if goal.target_pose is None:
                 self._set_official_navigation_failed(goal, "导航目标缺少目标位姿。")
                 return
-            if goal.target_pose.frame_id and current_pose.frame_id and goal.target_pose.frame_id != current_pose.frame_id:
+            if (
+                goal.target_pose.frame_id
+                and current_pose.frame_id
+                and not frame_ids_semantically_equal(goal.target_pose.frame_id, current_pose.frame_id)
+            ):
                 self._set_official_navigation_failed(
                     goal,
                     f"目标坐标系 {goal.target_pose.frame_id} 与当前里程计坐标系 {current_pose.frame_id} 不一致。",
@@ -3453,7 +3690,11 @@ class Go2DataPlaneRuntime:
             return "当前定位尚未就绪，等待探索起步条件。"
         if occupancy_grid is None:
             return "当前探索地图尚未就绪，等待首帧地图。"
-        if occupancy_grid.frame_id and current_pose.frame_id and occupancy_grid.frame_id != current_pose.frame_id:
+        if (
+            occupancy_grid.frame_id
+            and current_pose.frame_id
+            and not frame_ids_semantically_equal(occupancy_grid.frame_id, current_pose.frame_id)
+        ):
             return "当前地图与定位坐标系尚未对齐，等待探索起步条件。"
         return None
 

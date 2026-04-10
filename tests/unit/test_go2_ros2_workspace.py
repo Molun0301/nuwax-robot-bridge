@@ -460,6 +460,52 @@ def test_go2_bridge_can_synthesize_local_maps_from_direct_dds_point_cloud() -> N
     assert any(region.label == "hazard" for region in semantic_map.regions)
 
 
+def test_go2_bridge_restores_persisted_global_map_and_voxel_cache_after_restart(tmp_path: Path) -> None:
+    cache_root = tmp_path / "named_maps"
+    config = Go2DataPlaneConfig(
+        enabled=True,
+        named_map_archive_root=str(cache_root),
+        official=Go2OfficialBackendConfig(enabled=False),
+        map_synthesis=Go2MapSynthesisConfig(
+            global_map_enabled=True,
+            global_map_resolution_m=0.5,
+            global_map_update_interval_sec=0.0,
+            global_map_inflation_radius_m=0.0,
+            local_map_enabled=False,
+            semantic_min_cells=1,
+        ),
+    )
+
+    first_bridge = RclpyGo2RosBridge(config)
+    first_bridge._on_sport_mode_state(
+        _build_sport_mode_state_message(x=0.0, y=0.0),
+        source_topic="dds:rt/sportmodestate",
+    )
+    first_bridge._on_direct_point_cloud(
+        _build_point_cloud_message([(1.0, 0.0, 0.10), (1.5, 0.0, 0.10)]),
+        source_topic="dds:rt/utlidar/cloud",
+    )
+
+    first_status = first_bridge.get_status()
+    first_occupancy = first_bridge.get_occupancy_grid()
+
+    assert first_occupancy is not None
+    assert first_status["global_map_ready"] is True
+    assert first_status["voxel_map_ready"] is True
+    assert first_status["voxel_map_count"] > 0
+
+    second_bridge = RclpyGo2RosBridge(config)
+    second_status = second_bridge.get_status()
+    second_occupancy = second_bridge.get_occupancy_grid()
+
+    assert second_occupancy is not None
+    assert second_status["global_map_ready"] is True
+    assert second_status["global_map_cache_restored"] is True
+    assert second_status["voxel_map_ready"] is True
+    assert second_status["voxel_map_cache_restored"] is True
+    assert second_status["voxel_map_count"] > 0
+
+
 def test_go2_bridge_defers_direct_dds_point_cloud_mapping_until_runtime_enabled() -> None:
     bridge = RclpyGo2RosBridge(
         Go2DataPlaneConfig(

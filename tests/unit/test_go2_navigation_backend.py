@@ -229,6 +229,35 @@ def test_grid_planner_can_route_around_blocking_wall() -> None:
     assert any(waypoint_y > 4.5 for _waypoint_x, waypoint_y in plan.waypoints)
 
 
+def test_grid_planner_accepts_scoped_odom_alias() -> None:
+    occupancy, cost_map = _build_maps(
+        width=10,
+        height=10,
+        resolution_m=0.5,
+        origin_x=0.0,
+        origin_y=0.0,
+        blocked_cells=set(),
+    )
+    planner = Go2GridNavigationPlanner(
+        Go2NavigationBackendConfig(
+            planner_inflation_radius_m=0.0,
+            planning_horizon_margin_m=0.2,
+        )
+    )
+    current_pose = _build_pose(x=1.0, y=1.0, frame_id="world/test/odom")
+    goal_pose = _build_pose(x=3.0, y=1.0, frame_id="odom")
+
+    plan = planner.plan_preview(
+        current_pose=current_pose,
+        target_pose=goal_pose,
+        occupancy_grid=occupancy,
+        cost_map=cost_map,
+    )
+
+    assert plan is not None
+    assert plan.frame_id == "odom"
+
+
 def test_navigation_session_replans_when_path_is_blocked_ahead() -> None:
     session = _build_session(goal_pose=_build_pose(x=6.0, y=1.0))
     free_occupancy, free_cost_map = _build_maps(
