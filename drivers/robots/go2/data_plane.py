@@ -23,6 +23,7 @@ from contracts.frame_semantics import frame_ids_semantically_equal
 from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
+from contracts.pointcloud import PointCloudFrame, PointField, PointFieldDataType
 from contracts.robot_state import IMUState
 from drivers.robots.go2.collision_detector import Go2CollisionDetector, Go2CollisionDetectorConfig, CollisionStatus
 from drivers.robots.go2.cost_mapper import Go2CostMapper, Go2CostMapperConfig, Go2CostMapperResult
@@ -216,6 +217,19 @@ class ManagedRos2Process:
             LOGGER.warning("ROS2 子进程超时未退出，强制杀死 name=%s pid=%s", self.name, self.process.pid)
             self.process.kill()
             self.process.wait(timeout=2.0)
+
+
+@dataclass(frozen=True)
+class _SelectedMapLayers:
+    """桥层当前对外暴露的统一地图图层集合。"""
+
+    source_name: str = ""
+    occupancy_grid: Optional[OccupancyGrid] = None
+    cost_map: Optional[CostMap] = None
+    semantic_map: Optional[SemanticMap] = None
+
+    def has_any_layer(self) -> bool:
+        return self.occupancy_grid is not None or self.cost_map is not None or self.semantic_map is not None
 
     def is_running(self) -> bool:
         """返回子进程是否仍在运行。"""
@@ -416,19 +430,8 @@ class RclpyGo2RosBridge:
     def is_map_available(self) -> bool:
         """返回地图数据是否可用。"""
 
-        return (
-            self._latest_occupancy_direct is not None
-            or self._latest_occupancy_from_grid is not None
-            or self._latest_occupancy_from_global_cloud is not None
-            or self._latest_occupancy_from_local_cloud is not None
-            or self._latest_cost_direct is not None
-            or self._latest_cost_from_grid is not None
-            or self._latest_cost_from_global_cloud is not None
-            or self._latest_cost_from_local_cloud is not None
-            or self._latest_semantic_map is not None
-            or self._latest_semantic_map_from_global_cloud is not None
-            or self._latest_semantic_map_from_local_cloud is not None
-        )
+        with self._lock:
+            return self._select_effective_map_layers_unlocked().has_any_layer()
 
     def is_navigation_available(self) -> bool:
         """桥本身不再提供导航控制能力。"""
@@ -477,24 +480,14 @@ class RclpyGo2RosBridge:
         """读取占据栅格地图。"""
 
         with self._lock:
-            grid = (
-                self._latest_occupancy_direct
-                or self._latest_occupancy_from_grid
-                or self._latest_occupancy_from_global_cloud
-                or self._latest_occupancy_from_local_cloud
-            )
+            grid = self._select_effective_map_layers_unlocked().occupancy_grid
             return grid.model_copy(deep=True) if grid is not None else None
 
     def get_cost_map(self) -> Optional[CostMap]:
         """读取代价地图。"""
 
         with self._lock:
-            cost_map = (
-                self._latest_cost_direct
-                or self._latest_cost_from_grid
-                or self._latest_cost_from_global_cloud
-                or self._latest_cost_from_local_cloud
-            )
+            cost_map = self._select_effective_map_layers_unlocked().cost_map
             return cost_map.model_copy(deep=True) if cost_map is not None else None
 
     def get_collision_status(
@@ -553,6 +546,79 @@ class RclpyGo2RosBridge:
         """获取当前体素数量。"""
         return self._voxel_mapper.get_voxel_count()
 
+    def get_latest_local_point_cloud(self, *, max_points: int = 512) -> Optional[PointCloudFrame]:
+        """返回最近局部窗口聚合后的点云帧。"""
+
+        with self._lock:
+            scans = list(self._local_map_scans)
+            current_pose = self._latest_pose.model_copy(deep=True) if self._latest_pose is not None else None
+            source_topic = str(self._latest_point_cloud_source_topic or "").strip()
+
+        if not scans:
+            return None
+
+        raw_batches: List[np.ndarray] = []
+        latest_stamp_sec = 0.0
+        source_labels: List[str] = []
+        for scan in scans:
+            points = np.asarray(scan.points_xyz_world, dtype=np.float32)
+            if points.ndim != 2 or points.shape[0] <= 0 or points.shape[1] < 3:
+                continue
+            raw_batches.append(points[:, :3])
+            latest_stamp_sec = max(latest_stamp_sec, float(scan.stamp_sec))
+            if scan.source_label and scan.source_label not in source_labels:
+                source_labels.append(scan.source_label)
+
+        if not raw_batches:
+            return None
+
+        point_cloud = np.concatenate(raw_batches, axis=0)
+        raw_point_count = int(point_cloud.shape[0])
+        target_count = max(1, int(max_points))
+        if raw_point_count > target_count:
+            sample_indices = np.linspace(0, raw_point_count - 1, num=target_count, dtype=np.int64)
+            point_cloud = point_cloud[sample_indices]
+
+        frame_id = (
+            str(current_pose.frame_id or "").strip()
+            if current_pose is not None
+            else str(self.config.map_synthesis.map_frame or "").strip()
+        ) or str(self.config.map_synthesis.map_frame)
+        timestamp = (
+            datetime.fromtimestamp(latest_stamp_sec, tz=timezone.utc)
+            if latest_stamp_sec > 0.0
+            else datetime.now(timezone.utc)
+        )
+        points = [
+            Vector3(
+                x=float(row[0]),
+                y=float(row[1]),
+                z=float(row[2]),
+            )
+            for row in point_cloud
+        ]
+        return PointCloudFrame(
+            timestamp=timestamp,
+            frame_id=frame_id,
+            point_count=len(points),
+            fields=[
+                PointField(name="x", offset=0, datatype=PointFieldDataType.FLOAT32),
+                PointField(name="y", offset=4, datatype=PointFieldDataType.FLOAT32),
+                PointField(name="z", offset=8, datatype=PointFieldDataType.FLOAT32),
+            ],
+            points=points,
+            is_dense=True,
+            metadata={
+                "kind": "recent_local_scan_window",
+                "source_topic": source_topic or None,
+                "source_labels": tuple(source_labels),
+                "scan_count": len(scans),
+                "raw_point_count": raw_point_count,
+                "sampled_point_count": len(points),
+                "latest_scan_stamp_sec": round(float(latest_stamp_sec), 6) if latest_stamp_sec > 0.0 else None,
+            },
+        )
+
     def get_local_planner_state(self) -> LocalPlannerState:
         """获取局部规划器状态。"""
         return self._local_planner.state
@@ -565,11 +631,7 @@ class RclpyGo2RosBridge:
         """读取语义地图。"""
 
         with self._lock:
-            semantic_map = (
-                self._latest_semantic_map
-                or self._latest_semantic_map_from_global_cloud
-                or self._latest_semantic_map_from_local_cloud
-            )
+            semantic_map = self._select_effective_map_layers_unlocked().semantic_map
             return semantic_map.model_copy(deep=True) if semantic_map is not None else None
 
     def set_goal(self, goal: NavigationGoal) -> bool:
@@ -599,13 +661,14 @@ class RclpyGo2RosBridge:
         """返回当前桥状态。"""
 
         with self._lock:
+            effective_map_layers = self._select_effective_map_layers_unlocked()
             return {
                 "started": self._started,
                 "ros_started": self._ros_started,
                 "ros_in_process_disabled_reason": self._ros_in_process_disabled_reason,
                 "direct_dds_started": self._direct_dds_started,
                 "localization_available": self.is_localization_available(),
-                "map_available": self.is_map_available(),
+                "map_available": effective_map_layers.has_any_layer(),
                 "navigation_available": self.is_navigation_available(),
                 "pose_source": self._latest_pose_source,
                 "dds_pose_ready": self._direct_pose_ready,
@@ -623,6 +686,16 @@ class RclpyGo2RosBridge:
                 "point_cloud_mapping_deferred_until_runtime_enable": (
                     self._should_defer_point_cloud_mapping_until_runtime_enabled()
                 ),
+                "effective_map_source": effective_map_layers.source_name,
+                "effective_map_layers": [
+                    layer_name
+                    for layer_name, layer_value in (
+                        ("occupancy_grid", effective_map_layers.occupancy_grid),
+                        ("cost_map", effective_map_layers.cost_map),
+                        ("semantic_map", effective_map_layers.semantic_map),
+                    )
+                    if layer_value is not None
+                ],
                 "ros_map_ready": self._ros_occupancy_ready or self._ros_grid_map_ready or self._ros_cost_map_ready,
                 "global_map_ready": self._global_map_ready,
                 "global_map_source": self._latest_global_map_source,
@@ -634,6 +707,124 @@ class RclpyGo2RosBridge:
                 "voxel_map_cache_restored": self._voxel_map_cache_restored,
                 "last_error": self._last_error,
             }
+
+    def _same_grid_layout(self, primary, candidate) -> bool:
+        if primary is None or candidate is None:
+            return False
+        primary_frame = str(getattr(primary, "frame_id", "") or "")
+        candidate_frame = str(getattr(candidate, "frame_id", "") or "")
+        primary_origin = getattr(getattr(primary, "origin", None), "position", None)
+        candidate_origin = getattr(getattr(candidate, "origin", None), "position", None)
+        if (
+            primary_frame
+            and candidate_frame
+            and not frame_ids_semantically_equal(primary_frame, candidate_frame)
+        ):
+            return False
+        return (
+            int(getattr(primary, "width", 0)) == int(getattr(candidate, "width", 0))
+            and int(getattr(primary, "height", 0)) == int(getattr(candidate, "height", 0))
+            and abs(float(getattr(primary, "resolution_m", 0.0)) - float(getattr(candidate, "resolution_m", 0.0))) <= 1e-6
+            and abs(float(getattr(primary_origin, "x", 0.0)) - float(getattr(candidate_origin, "x", 0.0))) <= 1e-6
+            and abs(float(getattr(primary_origin, "y", 0.0)) - float(getattr(candidate_origin, "y", 0.0))) <= 1e-6
+        )
+
+    def _normalize_selected_map_layers_unlocked(
+        self,
+        *,
+        source_name: str,
+        occupancy_grid: Optional[OccupancyGrid],
+        cost_map: Optional[CostMap],
+        semantic_map: Optional[SemanticMap],
+    ) -> _SelectedMapLayers:
+        normalized_cost_map = cost_map
+        normalized_semantic_map = semantic_map
+        if occupancy_grid is not None and normalized_cost_map is not None and not self._same_grid_layout(occupancy_grid, normalized_cost_map):
+            normalized_cost_map = None
+        reference_frame_id = ""
+        if occupancy_grid is not None:
+            reference_frame_id = str(occupancy_grid.frame_id or "")
+        elif normalized_cost_map is not None:
+            reference_frame_id = str(normalized_cost_map.frame_id or "")
+        if (
+            normalized_semantic_map is not None
+            and reference_frame_id
+            and normalized_semantic_map.frame_id
+            and not frame_ids_semantically_equal(normalized_semantic_map.frame_id, reference_frame_id)
+        ):
+            normalized_semantic_map = None
+        return _SelectedMapLayers(
+            source_name=source_name,
+            occupancy_grid=occupancy_grid,
+            cost_map=normalized_cost_map,
+            semantic_map=normalized_semantic_map,
+        )
+
+    def _select_effective_map_layers_unlocked(self) -> _SelectedMapLayers:
+        prefer_platform_point_cloud = bool(
+            self._point_cloud_mapping_runtime_enabled
+            and (
+                self._latest_occupancy_from_global_cloud is not None
+                or self._latest_cost_from_global_cloud is not None
+                or self._latest_semantic_map_from_global_cloud is not None
+                or self._latest_occupancy_from_local_cloud is not None
+                or self._latest_cost_from_local_cloud is not None
+                or self._latest_semantic_map_from_local_cloud is not None
+            )
+        )
+        ordered_sources = (
+            (
+                "platform_global_cloud",
+                self._latest_occupancy_from_global_cloud,
+                self._latest_cost_from_global_cloud,
+                self._latest_semantic_map_from_global_cloud,
+            ),
+            (
+                "platform_local_cloud",
+                self._latest_occupancy_from_local_cloud,
+                self._latest_cost_from_local_cloud,
+                self._latest_semantic_map_from_local_cloud,
+            ),
+            (
+                "ros_grid_map",
+                self._latest_occupancy_from_grid,
+                self._latest_cost_from_grid,
+                self._latest_semantic_map,
+            ),
+            (
+                "ros_direct_map",
+                self._latest_occupancy_direct,
+                self._latest_cost_direct,
+                None,
+            ),
+        )
+        if not prefer_platform_point_cloud:
+            ordered_sources = (
+                ordered_sources[2],
+                ordered_sources[3],
+                ordered_sources[0],
+                ordered_sources[1],
+            )
+
+        normalized_sources = [
+            self._normalize_selected_map_layers_unlocked(
+                source_name=source_name,
+                occupancy_grid=occupancy_grid,
+                cost_map=cost_map,
+                semantic_map=semantic_map,
+            )
+            for source_name, occupancy_grid, cost_map, semantic_map in ordered_sources
+        ]
+        for layers in normalized_sources:
+            if layers.occupancy_grid is not None:
+                return layers
+        for layers in normalized_sources:
+            if layers.cost_map is not None:
+                return layers
+        for layers in normalized_sources:
+            if layers.semantic_map is not None:
+                return layers
+        return _SelectedMapLayers()
 
     def _load_ros_modules(self) -> Optional[Dict[str, object]]:
         self._ensure_ros_python_environment()
@@ -3724,6 +3915,18 @@ class Go2DataPlaneRuntime:
             }
 
         cost_map = self.get_cost_map()
+        cost_map_layout_mismatch = (
+            cost_map is not None
+            and not self._grid_navigation_planner._same_grid_layout(occupancy_grid, cost_map)
+        )
+        cost_map_frame_mismatch = (
+            cost_map is not None
+            and occupancy_grid.frame_id
+            and cost_map.frame_id
+            and not frame_ids_semantically_equal(occupancy_grid.frame_id, cost_map.frame_id)
+        )
+        if cost_map_layout_mismatch or cost_map_frame_mismatch:
+            cost_map = None
         frontier_mask = self._frontier_explorer._build_frontier_mask(
             free_mask=free_mask,
             unknown_mask=unknown_mask,

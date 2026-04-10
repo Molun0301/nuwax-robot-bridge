@@ -7,6 +7,7 @@ from providers.localization import LocalizationProvider
 from providers.maps import MapProvider
 from providers.motion import MotionControl
 from providers.navigation import NavigationProvider
+from providers.pointcloud import PointCloudProvider
 from providers.safety import SafetyProvider
 from providers.state import StateProvider
 
@@ -18,6 +19,7 @@ __all__ = [
     "MapProvider",
     "MotionControl",
     "NavigationProvider",
+    "PointCloudProvider",
     "SafetyProvider",
     "StateProvider",
 ]

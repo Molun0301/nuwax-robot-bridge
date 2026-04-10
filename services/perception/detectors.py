@@ -170,13 +170,30 @@ def normalize_detection_2d(raw_detection: object, image_frame: ImageFrame) -> De
         height_px=bbox_payload.get("height_px", raw_detection.get("height_px", image_frame.height_px)),
         image_frame=image_frame,
     )
+    known_keys = {
+        "label",
+        "score",
+        "bbox",
+        "x_px",
+        "y_px",
+        "width_px",
+        "height_px",
+        "camera_id",
+        "track_id",
+        "attributes",
+    }
+    merged_attributes = dict(raw_detection.get("attributes") or {})
+    for key, value in raw_detection.items():
+        if key in known_keys:
+            continue
+        merged_attributes.setdefault(str(key), value)
     return Detection2D(
         label=_normalize_label(raw_detection.get("label")),
         score=_clamp_score(raw_detection.get("score", 0.0)),
         bbox=bbox,
         camera_id=str(raw_detection.get("camera_id") or image_frame.camera_id),
         track_id=str(raw_detection.get("track_id")).strip() or None if raw_detection.get("track_id") else None,
-        attributes=dict(raw_detection.get("attributes") or {}),
+        attributes=merged_attributes,
     )
 
 
@@ -194,12 +211,26 @@ def normalize_detection_3d(raw_detection: object) -> Detection3D:
         )
     if not isinstance(raw_detection, dict):
         raise GatewayError(f"三维检测结果类型非法：{type(raw_detection)!r}")
+    known_keys = {
+        "label",
+        "score",
+        "pose",
+        "size_x_m",
+        "size_y_m",
+        "size_z_m",
+        "attributes",
+    }
+    merged_attributes = dict(raw_detection.get("attributes") or {})
+    for key, value in raw_detection.items():
+        if key in known_keys:
+            continue
+        merged_attributes.setdefault(str(key), value)
     return Detection3D.model_validate(
         {
             **raw_detection,
             "label": _normalize_label(raw_detection.get("label")),
             "score": _clamp_score(raw_detection.get("score", 0.0)),
-            "attributes": dict(raw_detection.get("attributes") or {}),
+            "attributes": merged_attributes,
         }
     )
 

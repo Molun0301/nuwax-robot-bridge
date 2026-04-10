@@ -4,8 +4,9 @@ from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Twist, Ve
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap
 from contracts.navigation import ExplorationState, ExploreAreaRequest, NavigationGoal, NavigationState
+from contracts.pointcloud import PointCloudFrame
 from contracts.robot_state import IMUState, JointState, RobotState, SafetyState
-from providers import ExplorationProvider, ImageProvider, LocalizationProvider, MapProvider, MotionControl, NavigationProvider, SafetyProvider, StateProvider
+from providers import ExplorationProvider, ImageProvider, LocalizationProvider, MapProvider, MotionControl, NavigationProvider, PointCloudProvider, SafetyProvider, StateProvider
 from typing import List, Optional
 
 
@@ -47,6 +48,14 @@ class DummyRobotProvider:
             fy=10.0,
             cx=8.0,
             cy=8.0,
+        )
+
+    def get_latest_point_cloud(self) -> Optional[PointCloudFrame]:
+        return PointCloudFrame(
+            frame_id="world/dummy/base",
+            point_count=1,
+            points=[Vector3(x=1.0, y=0.0, z=0.5)],
+            metadata={"source_topic": "/dummy/cloud"},
         )
 
     def get_occupancy_grid(self) -> Optional[OccupancyGrid]:
@@ -121,6 +130,7 @@ def test_dummy_provider_matches_protocols() -> None:
     assert isinstance(provider, ImageProvider)
     assert isinstance(provider, LocalizationProvider)
     assert isinstance(provider, MapProvider)
+    assert isinstance(provider, PointCloudProvider)
     assert isinstance(provider, NavigationProvider)
     assert isinstance(provider, ExplorationProvider)
     assert isinstance(provider, MotionControl)

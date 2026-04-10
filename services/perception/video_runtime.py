@@ -329,7 +329,7 @@ class PerceptionVideoRuntime:
                 except Exception:
                     pass
                 snapshot = localization_service.get_latest_snapshot()
-            elif snapshot is None and localization_service.is_available():
+            elif localization_service.is_available():
                 try:
                     snapshot = localization_service.refresh()
                 except Exception:
@@ -341,7 +341,7 @@ class PerceptionVideoRuntime:
         if mapping_service is not None:
             snapshot = mapping_service.get_latest_snapshot()
             # 已有平台地图快照时直接复用，避免 burst 复核把平台地图真值刷新成新的 provider 版本。
-            if snapshot is None and mapping_service.is_available():
+            if mapping_service.is_available():
                 try:
                     snapshot = mapping_service.refresh()
                 except Exception:

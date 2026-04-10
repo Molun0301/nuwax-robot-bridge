@@ -7,6 +7,7 @@ from contracts.geometry import FrameTree, Pose, Quaternion, Twist, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap
 from contracts.navigation import ExplorationState, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
+from contracts.pointcloud import PointCloudFrame
 from contracts.robot_state import IMUState, JointState, RobotControlMode, RobotState, SafetyState
 from drivers.robots.common import MotionCommandDataPlane
 from drivers.robots.go2.defaults import GO2_DEFAULT_CAMERA_INFO
@@ -16,6 +17,7 @@ from providers.localization import LocalizationProvider
 from providers.maps import MapProvider
 from providers.motion import MotionControl
 from providers.navigation import NavigationProvider
+from providers.pointcloud import PointCloudProvider
 from providers.safety import SafetyProvider
 from providers.state import StateProvider
 
@@ -47,6 +49,7 @@ class Go2ProviderBundle(
     ImageProvider,
     LocalizationProvider,
     MapProvider,
+    PointCloudProvider,
     NavigationProvider,
     ExplorationProvider,
     MotionControl,
@@ -206,6 +209,15 @@ class Go2ProviderBundle(
         if self.assembly.data_plane is None:
             return None
         return self.assembly.data_plane.get_semantic_map()
+
+    def get_latest_point_cloud(self) -> Optional[PointCloudFrame]:
+        if self.assembly.data_plane is None:
+            return None
+        getter = getattr(self.assembly.data_plane, "get_latest_local_point_cloud", None)
+        if getter is None:
+            return None
+        point_cloud = getter()
+        return point_cloud.model_copy(deep=True) if point_cloud is not None else None
 
     def set_goal(self, goal: NavigationGoal) -> bool:
         if self.assembly.data_plane is None:

@@ -27,12 +27,14 @@ from contracts.memory import (
 )
 from contracts.navigation import NavigationGoal
 from contracts.naming import build_location_id, build_memory_id, build_observation_event_id
-from contracts.runtime_views import NavigationSemanticContext, TopologyNodeSummary
+from contracts.runtime_views import LocalizationSnapshot, NavigationSemanticContext, TopologyNodeSummary
 from contracts.spatial_memory import (
     GroundingQueryPlan,
     NavigationCandidate,
     ObservationEvent,
     SemanticInstance,
+    SpatialAnchor,
+    SpatialAnchorKind,
     VerificationResult,
 )
 from core import EventBus, StateNamespace, StateStore
@@ -1232,6 +1234,7 @@ class MemoryService:
         ):
             localization_session_id = active_session.session_id
             localization_ready = bool(active_session.pose_available)
+        dynamic_anchors = self._build_dynamic_instance_anchors()
         context = NavigationSemanticContext(
             map_name=resolved_map_name,
             map_version_id=map_context.map_version_id,
@@ -1239,13 +1242,16 @@ class MemoryService:
             localization_ready=localization_ready,
             semantic_regions=[item.model_copy(deep=True) for item in map_context.semantic_regions],
             topology_nodes=self._build_topology_node_summaries(map_context),
-            anchors=[item.model_copy(deep=True) for item in map_context.anchors_by_id.values()],
+            anchors=[
+                *[item.model_copy(deep=True) for item in map_context.anchors_by_id.values()],
+                *dynamic_anchors,
+            ],
             metadata={
                 "active_library_name": self._active_library_name,
                 "frame_id": map_context.frame_id,
                 "semantic_region_count": len(map_context.semantic_regions),
                 "topology_node_count": len(map_context.topology_nodes_by_id),
-                "anchor_count": len(map_context.anchors_by_id),
+                "anchor_count": len(map_context.anchors_by_id) + len(dynamic_anchors),
                 "localization_session_status": active_session.status.value if active_session is not None else None,
             },
         )
@@ -1435,6 +1441,7 @@ class MemoryService:
             perception_context=perception_context,
             observation_context=observation_context,
             map_snapshot=map_snapshot,
+            localization_snapshot=localization_snapshot,
             current_pose=pose,
             camera_id=camera_id,
         )
@@ -1511,13 +1518,15 @@ class MemoryService:
             scored_candidates.append(candidate)
 
         scored_candidates.sort(key=lambda item: item.final_score, reverse=True)
-        matches = [self._build_query_match(query, item, current_pose) for item in scored_candidates[: max(1, limit)]]
+        selected_candidates = self._select_ranked_candidates(scored_candidates, limit=max(1, limit))
+        matches = [self._build_query_match(query, item, current_pose) for item in selected_candidates]
         return MemoryQueryResult(
             query=query,
             similarity_threshold=similarity_threshold,
             matches=matches,
             metadata={
                 "candidate_count": len(scored_candidates),
+                "returned_candidate_count": len(selected_candidates),
                 "retrieval_mode": "text_recall_then_filter_then_multimodal_rerank",
                 "vector_store_backend": self._vector_store.backend_name,
                 "text_embedding_model": self._text_embedder.model_name,
@@ -1608,6 +1617,51 @@ class MemoryService:
             distance_m=distance_m,
             final_score=final_score,
         )
+
+    def _select_ranked_candidates(
+        self,
+        candidates: List[_ScoredCandidate],
+        *,
+        limit: int,
+    ) -> List[_ScoredCandidate]:
+        selected: List[_ScoredCandidate] = []
+        seen_keys = set()
+        for candidate in candidates:
+            dedup_key = self._candidate_dedup_key(candidate)
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+            selected.append(candidate)
+            if len(selected) >= limit:
+                break
+        return selected
+
+    def _candidate_dedup_key(self, candidate: _ScoredCandidate) -> Tuple[object, ...]:
+        if candidate.tagged_location is not None:
+            return (MemoryRecordKind.TAGGED_LOCATION.value, candidate.tagged_location.location_id)
+        if candidate.semantic_memory is not None:
+            return (candidate.semantic_memory.kind.value, candidate.semantic_memory.memory_id)
+        if candidate.semantic_instance is not None:
+            return (
+                MemoryRecordKind.OBJECT_INSTANCE.value,
+                candidate.semantic_instance.anchor_id or candidate.semantic_instance.instance_id,
+            )
+        if candidate.observation_event is not None:
+            if candidate.observation_event.linked_instance_ids:
+                return (
+                    MemoryRecordKind.OBSERVATION_EVENT.value,
+                    "instance",
+                    *candidate.observation_event.linked_instance_ids,
+                )
+            return (
+                MemoryRecordKind.OBSERVATION_EVENT.value,
+                "anchor",
+                candidate.observation_event.anchor_id or "",
+                candidate.observation_event.semantic_region_id or "",
+                candidate.observation_event.topo_node_id or "",
+                *candidate.observation_event.visual_labels,
+            )
+        return (candidate.record_kind.value, candidate.point.point_id)
 
     def _build_query_match(
         self,
@@ -2470,6 +2524,7 @@ class MemoryService:
         perception_context,
         observation_context,
         map_snapshot,
+        localization_snapshot: Optional[LocalizationSnapshot],
         current_pose: Optional[Pose],
         camera_id: Optional[str],
     ) -> None:
@@ -2480,6 +2535,7 @@ class MemoryService:
             perception_context,
             current_pose=current_pose,
             map_context=map_context,
+            localization_snapshot=localization_snapshot,
         )
         if not projected:
             return
@@ -2505,56 +2561,40 @@ class MemoryService:
             self._repository.upsert_semantic_instance(instance)
             self._upsert_vector_point_for_instance(instance)
 
-        observation_event = ObservationEvent(
-            event_id=build_observation_event_id("perception", timestamp=memory_entry.timestamp),
-            title=memory_entry.title,
-            summary=memory_entry.summary,
-            camera_id=camera_id or str(memory_entry.metadata.get("camera_id", "") or "") or None,
-            pose=current_pose,
-            map_version_id=memory_entry.map_version_id,
-            topo_node_id=memory_entry.topo_node_id,
-            semantic_region_id=memory_entry.semantic_region_id,
-            anchor_id=self._resolve_memory_anchor_id(memory_entry),
-            source_observation_id=(
-                observation_context.observation.observation_id if observation_context is not None else memory_entry.observation_id
-            ),
-            source_memory_id=memory_entry.memory_id,
-            linked_instance_ids=self._normalize_aliases(linked_instance_ids),
-            artifact_ids=list(memory_entry.artifact_ids),
-            semantic_labels=self._normalize_tags(
-                [
-                    *memory_entry.semantic_labels,
-                    *[item for projection in projected for item in projection.semantic_labels],
-                ]
-            ),
-            visual_labels=self._normalize_tags([item.label for item in perception_context.scene_summary.objects]),
-            vision_tags=self._normalize_tags(self._collect_scene_vision_tags(perception_context.scene_summary)),
-            metadata=self._attach_library_metadata(
-                {
-                    "camera_id": camera_id or "",
-                    "projection_count": len(projected),
-                    "linked_memory_id": memory_entry.memory_id,
-                    **self._build_platform_semantic_metadata(
-                        map_snapshot=map_snapshot,
-                    ),
-                }
-            ),
+        observation_events = self._build_projected_observation_events(
+            memory_entry=memory_entry,
+            projected=projected,
+            association_outcomes=outcomes,
+            perception_context=perception_context,
+            observation_context=observation_context,
+            map_snapshot=map_snapshot,
+            camera_id=camera_id,
+            current_pose=current_pose,
         )
-        self._observation_events_by_id[observation_event.event_id] = observation_event
-        self._observation_event_history.append(observation_event)
-        self._write_observation_event_state(observation_event)
-        self._repository.upsert_observation_event(observation_event)
-        self._upsert_vector_point_for_observation_event(observation_event)
+        for observation_event in observation_events:
+            self._observation_events_by_id[observation_event.event_id] = observation_event
+            self._observation_event_history.append(observation_event)
+            self._write_observation_event_state(observation_event)
+            self._repository.upsert_observation_event(observation_event)
+            self._upsert_vector_point_for_observation_event(observation_event)
+
+        linked_events_by_instance_id: Dict[str, List[str]] = {}
+        for observation_event in observation_events:
+            for instance_id in observation_event.linked_instance_ids:
+                linked_events_by_instance_id.setdefault(instance_id, []).append(observation_event.event_id)
 
         for instance_id in linked_instance_ids:
             current_instance = self._semantic_instances_by_id.get(instance_id)
             if current_instance is None:
                 continue
+            new_event_ids = linked_events_by_instance_id.get(instance_id, [])
+            if not new_event_ids:
+                continue
             updated_instance = current_instance.model_copy(
                 update={
-                    "last_observation_event_id": observation_event.event_id,
+                    "last_observation_event_id": new_event_ids[-1],
                     "supporting_observation_event_ids": self._normalize_aliases(
-                        [*current_instance.supporting_observation_event_ids, observation_event.event_id]
+                        [*current_instance.supporting_observation_event_ids, *new_event_ids]
                     ),
                 },
                 deep=True,
@@ -2658,7 +2698,169 @@ class MemoryService:
             anchor = self._latest_semantic_map_context.anchors_by_id[anchor_id]
             if anchor.inspection_poses:
                 return anchor.inspection_poses[0]
+        if anchor_id:
+            for instance in self._semantic_instances_by_id.values():
+                if instance.anchor_id == anchor_id and instance.inspection_poses:
+                    return instance.inspection_poses[0]
         return fallback_pose
+
+    def _build_projected_observation_events(
+        self,
+        *,
+        memory_entry: SemanticMemoryEntry,
+        projected: Tuple[ProjectedObservation, ...],
+        association_outcomes: Tuple[AssociationOutcome, ...],
+        perception_context,
+        observation_context,
+        map_snapshot,
+        camera_id: Optional[str],
+        current_pose: Pose,
+    ) -> Tuple[ObservationEvent, ...]:
+        source_observation_id = (
+            observation_context.observation.observation_id if observation_context is not None else memory_entry.observation_id
+        )
+        scene_visual_labels = self._normalize_tags([item.label for item in perception_context.scene_summary.objects])
+        scene_vision_tags = self._normalize_tags(self._collect_scene_vision_tags(perception_context.scene_summary))
+        linked_instance_ids = self._normalize_aliases(
+            [outcome.instance.instance_id for outcome in association_outcomes if outcome.instance is not None]
+        )
+        events: List[ObservationEvent] = []
+        for item, outcome in zip(projected, association_outcomes):
+            matched_instance_id = outcome.instance.instance_id
+            linked_ids = [matched_instance_id] if matched_instance_id in self._semantic_instances_by_id else []
+            linked_anchor_id = self._resolve_memory_anchor_id(memory_entry)
+            if linked_ids:
+                linked_anchor_id = self._semantic_instances_by_id[matched_instance_id].anchor_id
+            event_title = "观察到%s" % item.label
+            event_summary = "在地图位置 %.2f, %.2f 观察到 %s。" % (
+                float(item.pose.position.x),
+                float(item.pose.position.y),
+                item.label,
+            )
+            visual_labels = self._normalize_tags([item.label, *item.visual_labels])
+            semantic_labels = self._normalize_tags(
+                [
+                    *memory_entry.semantic_labels,
+                    *item.semantic_labels,
+                    *self._flatten_metadata_strings(item.attributes.get("semantic_labels")),
+                ]
+            )
+            vision_tags = self._normalize_tags(
+                [
+                    *scene_vision_tags,
+                    *semantic_labels,
+                    *visual_labels,
+                ]
+            )
+            events.append(
+                ObservationEvent(
+                    event_id=build_observation_event_id("perception", timestamp=memory_entry.timestamp),
+                    title=event_title,
+                    summary=event_summary,
+                    camera_id=item.camera_id or camera_id or str(memory_entry.metadata.get("camera_id", "") or "") or None,
+                    pose=item.pose,
+                    map_version_id=memory_entry.map_version_id,
+                    topo_node_id=item.topo_node_id,
+                    semantic_region_id=item.semantic_region_id,
+                    anchor_id=linked_anchor_id,
+                    source_observation_id=item.source_observation_id or source_observation_id,
+                    source_memory_id=memory_entry.memory_id,
+                    linked_instance_ids=linked_ids,
+                    artifact_ids=self._normalize_aliases([*memory_entry.artifact_ids, *item.source_artifact_ids]),
+                    semantic_labels=semantic_labels,
+                    visual_labels=visual_labels,
+                    vision_tags=vision_tags,
+                    metadata=self._attach_library_metadata(
+                        {
+                            "camera_id": item.camera_id or camera_id or "",
+                            "projection_count": len(projected),
+                            "projection_method": str(item.attributes.get("projection_method") or ""),
+                            "projection_confidence": float(item.attributes.get("projection_confidence") or item.score),
+                            "support_point_count": int(item.attributes.get("support_point_count") or 0),
+                            "linked_memory_id": memory_entry.memory_id,
+                            "linked_instance_id": matched_instance_id,
+                            "linked_anchor_id": linked_anchor_id,
+                            "scene_visual_labels": scene_visual_labels,
+                            "scene_vision_tags": scene_vision_tags,
+                            "centroid_map_x": item.attributes.get("centroid_map_x"),
+                            "centroid_map_y": item.attributes.get("centroid_map_y"),
+                            "centroid_map_z": item.attributes.get("centroid_map_z"),
+                            "extent_x_m": item.attributes.get("extent_x_m"),
+                            "extent_y_m": item.attributes.get("extent_y_m"),
+                            "extent_z_m": item.attributes.get("extent_z_m"),
+                            **self._build_platform_semantic_metadata(
+                                map_snapshot=map_snapshot,
+                            ),
+                        }
+                    ),
+                )
+            )
+
+        if events:
+            return tuple(events)
+
+        return (
+            ObservationEvent(
+                event_id=build_observation_event_id("perception", timestamp=memory_entry.timestamp),
+                title=memory_entry.title,
+                summary=memory_entry.summary,
+                camera_id=camera_id or str(memory_entry.metadata.get("camera_id", "") or "") or None,
+                pose=current_pose,
+                map_version_id=memory_entry.map_version_id,
+                topo_node_id=memory_entry.topo_node_id,
+                semantic_region_id=memory_entry.semantic_region_id,
+                anchor_id=self._resolve_memory_anchor_id(memory_entry),
+                source_observation_id=source_observation_id,
+                source_memory_id=memory_entry.memory_id,
+                linked_instance_ids=self._normalize_aliases(linked_instance_ids),
+                artifact_ids=list(memory_entry.artifact_ids),
+                semantic_labels=list(memory_entry.semantic_labels),
+                visual_labels=scene_visual_labels,
+                vision_tags=scene_vision_tags,
+                metadata=self._attach_library_metadata(
+                    {
+                        "camera_id": camera_id or "",
+                        "projection_count": 0,
+                        "linked_memory_id": memory_entry.memory_id,
+                        **self._build_platform_semantic_metadata(
+                            map_snapshot=map_snapshot,
+                        ),
+                    }
+                ),
+            ),
+        )
+
+    def _build_dynamic_instance_anchors(self) -> List[SpatialAnchor]:
+        anchors: List[SpatialAnchor] = []
+        for instance in self._semantic_instances_by_id.values():
+            if instance.lifecycle_state.value == "removed":
+                continue
+            anchors.append(
+                SpatialAnchor(
+                    anchor_id=instance.anchor_id,
+                    anchor_kind=SpatialAnchorKind.OBJECT_INSTANCE,
+                    name=instance.display_name or instance.label,
+                    pose=instance.pose,
+                    map_version_id=instance.map_version_id,
+                    topo_node_id=instance.topo_node_id,
+                    semantic_region_id=instance.semantic_region_id,
+                    semantic_labels=self._normalize_tags(
+                        [instance.label, *instance.semantic_labels, *instance.visual_labels, *instance.vision_tags]
+                    ),
+                    inspection_poses=list(instance.inspection_poses),
+                    metadata=self._attach_library_metadata(
+                        {
+                            "instance_id": instance.instance_id,
+                            "instance_type": instance.instance_type,
+                            "movability": instance.movability.value,
+                            "lifecycle_state": instance.lifecycle_state.value,
+                            "observation_count": instance.observation_count,
+                            "last_seen_ts": instance.last_seen_ts.isoformat(),
+                        }
+                    ),
+                )
+            )
+        return anchors
 
     def _build_navigation_candidate_id(self, record_id: str) -> str:
         safe = re.sub(r"[^0-9a-z]+", "_", record_id.lower())

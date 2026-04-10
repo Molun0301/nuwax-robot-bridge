@@ -161,11 +161,12 @@ class Go2FrontierExplorer:
         unknown_mask = occupancy < 0
         if not np.any(free_mask) or not np.any(unknown_mask):
             return []
+        effective_cost_map = cost_map if self._same_grid_layout(occupancy_grid, cost_map) else None
 
         frontier_mask = self._build_frontier_mask(
             free_mask=free_mask,
             unknown_mask=unknown_mask,
-            cost_map=cost_map,
+            cost_map=effective_cost_map,
         )
         if not np.any(frontier_mask):
             return []
@@ -207,7 +208,7 @@ class Go2FrontierExplorer:
                     centroid_x=centroid_x,
                     centroid_y=centroid_y,
                     occupancy_grid=occupancy_grid,
-                    cost_map=cost_map,
+                    cost_map=effective_cost_map,
                 ),
             )
             goal_x, goal_y = _cell_to_world(
@@ -233,12 +234,12 @@ class Go2FrontierExplorer:
                 current_pose=current_pose,
                 target_pose=goal_pose,
                 occupancy_grid=occupancy_grid,
-                cost_map=cost_map,
+                cost_map=effective_cost_map,
             )
             if plan is None or plan.planning_mode != "goal":
                 continue
 
-            average_cost = self._cluster_average_cost(cluster=cluster, cost_map=cost_map)
+            average_cost = self._cluster_average_cost(cluster=cluster, cost_map=effective_cost_map)
             heading_error = abs(_normalize_angle(yaw_rad - current_yaw))
             heading_bonus = max(0.0, math.cos(heading_error))
             info_gain_cells = len(cluster)
@@ -267,6 +268,23 @@ class Go2FrontierExplorer:
             )
         )
         return candidates
+
+    def _same_grid_layout(self, occupancy_grid: OccupancyGrid, cost_map: Optional[CostMap]) -> bool:
+        if cost_map is None:
+            return False
+        if (
+            occupancy_grid.frame_id
+            and cost_map.frame_id
+            and not frame_ids_semantically_equal(occupancy_grid.frame_id, cost_map.frame_id)
+        ):
+            return False
+        return (
+            int(occupancy_grid.width) == int(cost_map.width)
+            and int(occupancy_grid.height) == int(cost_map.height)
+            and abs(float(occupancy_grid.resolution_m) - float(cost_map.resolution_m)) <= 1e-6
+            and abs(float(occupancy_grid.origin.position.x) - float(cost_map.origin.position.x)) <= 1e-6
+            and abs(float(occupancy_grid.origin.position.y) - float(cost_map.origin.position.y)) <= 1e-6
+        )
 
     def count_known_cells(self, occupancy_grid: Optional[OccupancyGrid]) -> int:
         """统计当前地图已知栅格数量。"""

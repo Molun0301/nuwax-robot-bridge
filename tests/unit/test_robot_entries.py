@@ -8,6 +8,7 @@ from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Twist, Ve
 from contracts.image import ImageFrame
 from contracts.maps import CostMap, OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.navigation import ExplorationState, ExplorationStatus, ExploreAreaRequest, NavigationGoal, NavigationState, NavigationStatus
+from contracts.pointcloud import PointCloudFrame
 from contracts.robot_state import IMUState, RobotControlMode
 from drivers.robots.common import ManagedRobotDataPlane, MotionCommandDataPlane
 from drivers.robots.g1 import G1_MANIFEST, create_g1_assembly
@@ -254,6 +255,14 @@ class FakeGo2DataPlane:
     def get_semantic_map(self) -> Optional[SemanticMap]:
         return self.semantic_map
 
+    def get_latest_local_point_cloud(self) -> Optional[PointCloudFrame]:
+        return PointCloudFrame(
+            frame_id="odom",
+            point_count=1,
+            points=[Vector3(x=1.0, y=0.0, z=0.2)],
+            metadata={"source_topic": "/fake/cloud"},
+        )
+
     def set_goal(self, goal: NavigationGoal) -> bool:
         self.navigation_state = NavigationState(
             current_goal_id=goal.goal_id,
@@ -369,6 +378,23 @@ def test_go2_provider_outputs_match_platform_contracts() -> None:
     assert image.width_px == 1280
     assert state.mode == RobotControlMode.HIGH_LEVEL
     assert state.metadata["default_sensors"]
+
+
+def test_go2_provider_exposes_local_point_cloud_when_data_plane_supports_it() -> None:
+    """Go2 提供器应在数据面可用时转发最近局部点云。"""
+
+    assembly = create_go2_assembly(
+        APP_CONFIG,
+        factories=_build_go2_factories(FakeChannelInitializer()),
+        data_plane=FakeGo2DataPlane(),
+    )
+    assembly.start()
+
+    point_cloud = assembly.providers.get_latest_point_cloud()
+
+    assert point_cloud is not None
+    assert point_cloud.frame_id == "odom"
+    assert point_cloud.point_count == 1
 
 
 def test_go2_low_level_mode_and_capability_matrix_are_consistent() -> None:

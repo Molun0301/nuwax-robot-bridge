@@ -437,11 +437,16 @@ def test_go2_bridge_can_synthesize_local_maps_from_direct_dds_point_cloud() -> N
     occupancy = bridge.get_occupancy_grid()
     cost_map = bridge.get_cost_map()
     semantic_map = bridge.get_semantic_map()
+    local_point_cloud = bridge.get_latest_local_point_cloud(max_points=8)
     status = bridge.get_status()
 
     assert occupancy is not None
     assert cost_map is not None
     assert semantic_map is not None
+    assert local_point_cloud is not None
+    assert local_point_cloud.frame_id == "odom"
+    assert local_point_cloud.point_count == 2
+    assert local_point_cloud.metadata["source_topic"] == "dds:rt/utlidar/cloud"
     assert status["dds_cloud_ready"] is True
     assert status["local_map_ready"] is True
     assert status["local_map_source"] == "direct_dds_point_cloud"
@@ -674,6 +679,124 @@ def test_go2_bridge_can_use_ros_point_cloud_as_local_map_fallback() -> None:
     assert status["local_map_ready"] is True
     assert status["local_map_source"] == "ros_point_cloud"
     assert status["point_cloud_source_topic"] == "/utlidar/cloud"
+
+
+def test_go2_bridge_prefers_coherent_platform_cloud_map_layers_for_exploration() -> None:
+    config = Go2DataPlaneConfig(
+        enabled=True,
+        official=Go2OfficialBackendConfig(enabled=False),
+        exploration=Go2ExplorationConfig(
+            enabled=True,
+            frontier_enabled=True,
+            frontier_min_cluster_cells=3,
+        ),
+    )
+    bridge = RclpyGo2RosBridge(config)
+    bridge._latest_pose = Pose(
+        frame_id="odom",
+        position=Vector3(x=-2.25, y=-0.25, z=0.0),
+        orientation=Quaternion(w=1.0),
+    )
+
+    disconnected_direct_occupancy = OccupancyGrid(
+        map_id="direct_legacy",
+        frame_id="odom",
+        width=12,
+        height=12,
+        resolution_m=0.5,
+        origin=Pose(
+            frame_id="odom",
+            position=Vector3(x=-3.0, y=-3.0, z=0.0),
+            orientation=Quaternion(w=1.0),
+        ),
+        data=[
+            100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+            100, 0, 0, 0, 0, -1, -1, -1, -1, 100, 100, 100,
+            100, 0, 0, 0, 0, -1, -1, -1, -1, 100, 100, 100,
+            100, 0, 0, 0, 0, -1, -1, -1, -1, 100, 100, 100,
+            100, 0, 0, 0, 0, -1, -1, -1, -1, 100, 100, 100,
+            100, 0, 0, 0, 0, -1, -1, -1, -1, 100, 100, 100,
+            100, 0, 0, 0, 0, -1, -1, -1, -1, 100, 100, 100,
+            100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+            100, 100, 100, 100, 100, 100, 100, 100, 0, 0, 0, 100,
+            100, 100, 100, 100, 100, 100, 100, 100, 0, 0, 0, 100,
+            100, 100, 100, 100, 100, 100, 100, 100, 0, 0, 0, 100,
+            100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+        ],
+    )
+    reachable_cloud_occupancy = OccupancyGrid(
+        map_id="cloud_runtime",
+        frame_id="odom",
+        width=32,
+        height=24,
+        resolution_m=0.5,
+        origin=Pose(
+            frame_id="odom",
+            position=Vector3(x=-8.0, y=-6.0, z=0.0),
+            orientation=Quaternion(w=1.0),
+        ),
+        data=[
+            -1 if (row, col) not in (
+                {(r, c) for r in range(8, 15) for c in range(8, 15)}
+                | {(r, c) for r in range(10, 13) for c in range(15, 23)}
+                | {(7, c) for c in range(7, 16)}
+                | {(15, c) for c in range(7, 16)}
+                | {(r, 7) for r in range(7, 16)}
+                | {(r, 15) for r in range(7, 16) if r not in {10, 11, 12}}
+                | {(9, c) for c in range(15, 23)}
+                | {(13, c) for c in range(15, 23)}
+            )
+            else (
+                100 if (row, col) in (
+                    {(7, c) for c in range(7, 16)}
+                    | {(15, c) for c in range(7, 16)}
+                    | {(r, 7) for r in range(7, 16)}
+                    | {(r, 15) for r in range(7, 16) if r not in {10, 11, 12}}
+                    | {(9, c) for c in range(15, 23)}
+                    | {(13, c) for c in range(15, 23)}
+                )
+                else 0
+            )
+            for row in range(24)
+            for col in range(32)
+        ],
+    )
+    reachable_cloud_cost = CostMap(
+        map_id="cloud_runtime_cost",
+        frame_id="odom",
+        width=32,
+        height=24,
+        resolution_m=0.5,
+        origin=reachable_cloud_occupancy.origin.model_copy(deep=True),
+        data=[
+            100.0 if value == 100 else 0.0 if value == 0 else 100.0
+            for value in reachable_cloud_occupancy.data
+        ],
+    )
+
+    bridge._latest_occupancy_direct = disconnected_direct_occupancy
+    bridge._latest_occupancy_from_global_cloud = reachable_cloud_occupancy
+    bridge._latest_cost_from_global_cloud = reachable_cloud_cost
+
+    runtime = Go2DataPlaneRuntime(config, bridge=bridge)
+    effective_occupancy = bridge.get_occupancy_grid()
+    effective_cost = bridge.get_cost_map()
+    effective_gap_message, effective_metadata = runtime._describe_exploration_frontier_gap(
+        request=ExploreAreaRequest(request_id="effective_gap", strategy="frontier"),
+        current_pose=bridge.get_current_pose(),
+        occupancy_grid=effective_occupancy,
+    )
+    status = bridge.get_status()
+
+    assert bridge._latest_occupancy_direct is disconnected_direct_occupancy
+    assert effective_occupancy is not None
+    assert effective_cost is not None
+    assert effective_occupancy.map_id == "cloud_runtime"
+    assert effective_cost.map_id == "cloud_runtime_cost"
+    assert effective_gap_message is None
+    assert effective_metadata["reachable_frontier_clusters"] == 1
+    assert status["effective_map_source"] == "platform_global_cloud"
+    assert status["effective_map_layers"] == ["occupancy_grid", "cost_map"]
 
 
 def test_go2_cyclonedds_lib_dir_uses_configured_path(monkeypatch, tmp_path: Path) -> None:

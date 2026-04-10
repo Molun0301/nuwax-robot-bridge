@@ -8,10 +8,11 @@ from contracts.perception import Detection2D, Observation, Track, TrackState
 from contracts.runtime_views import PerceptionContext
 from core import EventBus, StateNamespace, StateStore
 from gateways.errors import GatewayError
-from providers import ImageProvider
+from providers import ImageProvider, LocalizationProvider, PointCloudProvider
 from services.artifact_service import ArtifactService
 from services.perception.base import SceneDescriptionBackend, TrackerBackend
 from services.perception.detectors import DetectorPipeline
+from services.perception.geometry import DetectionGeometryAugmentor
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.trackers import Basic2DTrackerBackend
 from typing import Deque, Dict, List, Optional, Tuple
@@ -29,6 +30,7 @@ class PerceptionService:
         detector_pipeline: DetectorPipeline,
         tracker_backend: Optional[TrackerBackend] = None,
         scene_description_backend: Optional[SceneDescriptionBackend] = None,
+        geometry_augmentor: Optional[DetectionGeometryAugmentor] = None,
         event_bus: Optional[EventBus] = None,
         history_limit: int = 100,
         pipeline_name: str = "default_perception_pipeline",
@@ -39,6 +41,7 @@ class PerceptionService:
         self._detector_pipeline = detector_pipeline
         self._tracker_backend = tracker_backend or Basic2DTrackerBackend()
         self._scene_description_backend = scene_description_backend or SimpleSceneDescriptionBackend()
+        self._geometry_augmentor = geometry_augmentor or DetectionGeometryAugmentor()
         self._event_bus = event_bus
         self._history: Deque[PerceptionContext] = deque(maxlen=max(1, history_limit))
         self._latest_by_camera: Dict[str, PerceptionContext] = {}
@@ -83,6 +86,11 @@ class PerceptionService:
             camera_info,
             backend_name=detector_backend_name,
         )
+        detection_bundle = self._augment_detection_geometry(
+            detection_bundle,
+            image_frame=image_frame,
+            camera_info=camera_info,
+        )
         tracks = self._tracker_backend.update(
             image_frame,
             detections_2d=detection_bundle.detections_2d,
@@ -115,6 +123,8 @@ class PerceptionService:
                 "requested_by": requested_by or "unknown",
                 "source_name": source_name or "unknown",
                 "image_encoding": image_frame.encoding.value,
+                "width_px": image_frame.width_px,
+                "height_px": image_frame.height_px,
                 "detection_count": len(detections_2d),
                 "track_count": len(tracks),
                 **dict(detection_bundle.metadata),
@@ -278,6 +288,60 @@ class PerceptionService:
         if not providers.is_available():
             raise GatewayError("当前图像提供器暂不可用。")
         return providers
+
+    def _get_localization_provider_optional(self) -> Optional[LocalizationProvider]:
+        providers = getattr(self._provider_owner, "providers", None)
+        if providers is None or not isinstance(providers, LocalizationProvider):
+            return None
+        if not providers.is_available():
+            return None
+        return providers
+
+    def _get_point_cloud_provider_optional(self) -> Optional[PointCloudProvider]:
+        providers = getattr(self._provider_owner, "providers", None)
+        if providers is None or not isinstance(providers, PointCloudProvider):
+            return None
+        if not providers.is_available():
+            return None
+        return providers
+
+    def _augment_detection_geometry(
+        self,
+        detection_bundle,
+        *,
+        image_frame,
+        camera_info,
+    ):
+        if camera_info is None or not detection_bundle.detections_2d:
+            return detection_bundle
+        point_cloud_provider = self._get_point_cloud_provider_optional()
+        if point_cloud_provider is None:
+            return detection_bundle
+        point_cloud = point_cloud_provider.get_latest_point_cloud()
+        if point_cloud is None or not point_cloud.points:
+            return detection_bundle
+
+        localization_provider = self._get_localization_provider_optional()
+        frame_tree = localization_provider.get_frame_tree() if localization_provider is not None else None
+        current_pose = localization_provider.get_current_pose() if localization_provider is not None else None
+        detections_2d, geometry_metadata = self._geometry_augmentor.augment_detections(
+            detection_bundle.detections_2d,
+            image_frame=image_frame,
+            camera_info=camera_info,
+            point_cloud=point_cloud,
+            frame_tree=frame_tree,
+            current_pose=current_pose,
+        )
+        if detections_2d == detection_bundle.detections_2d and not geometry_metadata:
+            return detection_bundle
+        return detection_bundle.__class__(
+            detections_2d=detections_2d,
+            detections_3d=detection_bundle.detections_3d,
+            metadata={
+                **dict(detection_bundle.metadata),
+                **geometry_metadata,
+            },
+        )
 
     def _normalize_camera_id(self, camera_id: str) -> str:
         normalized = []

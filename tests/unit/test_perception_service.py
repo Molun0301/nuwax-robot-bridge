@@ -7,9 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from contracts.artifacts import ArtifactRetentionPolicy
-from contracts.geometry import Pose, Quaternion, Vector3
+from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
 from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.maps import SemanticMap, SemanticRegion
+from contracts.pointcloud import PointCloudFrame
 from contracts.runtime_views import LocalizationSnapshot, MapSnapshot
 from contracts.perception import TrackState
 from contracts.runtime_views import SceneObjectSummary, SceneSummary
@@ -125,6 +126,81 @@ class RtspCameraBundle(ImageProvider):
             fy=120.0,
             cx=160.0,
             cy=120.0,
+        )
+
+
+class PointCloudGeometryBundle(ImageProvider):
+    """模拟同时提供图像、定位和点云的输入源。"""
+
+    provider_name = "pointcloud_geometry_bundle"
+    provider_version = "0.1.0"
+
+    def is_available(self) -> bool:
+        return True
+
+    def capture_image(self, camera_id: Optional[str] = None) -> ImageFrame:
+        camera = camera_id or "front_camera"
+        return ImageFrame(
+            camera_id=camera,
+            frame_id="world/test/camera_front",
+            width_px=100,
+            height_px=100,
+            encoding=ImageEncoding.JPEG,
+            data=b"geometry-image",
+            metadata={
+                "detections_2d": [
+                    {
+                        "label": "bottle",
+                        "score": 0.91,
+                        "bbox": {"x_px": 45, "y_px": 45, "width_px": 10, "height_px": 10},
+                    }
+                ],
+            },
+        )
+
+    def get_camera_info(self, camera_id: Optional[str] = None) -> CameraInfo:
+        return CameraInfo(
+            camera_id=camera_id or "front_camera",
+            frame_id="world/test/camera_front",
+            width_px=100,
+            height_px=100,
+            fx=100.0,
+            fy=100.0,
+            cx=50.0,
+            cy=50.0,
+        )
+
+    def get_current_pose(self) -> Optional[Pose]:
+        return Pose(
+            frame_id="map",
+            position=Vector3(x=0.0, y=0.0, z=0.0),
+            orientation=Quaternion(w=1.0),
+        )
+
+    def get_frame_tree(self) -> Optional[FrameTree]:
+        return FrameTree(
+            root_frame_id="map",
+            transforms=[
+                Transform(
+                    parent_frame_id="map",
+                    child_frame_id="world/test/camera_front",
+                    translation=Vector3(x=0.0, y=0.0, z=0.0),
+                    rotation=Quaternion(w=1.0),
+                )
+            ],
+        )
+
+    def get_latest_point_cloud(self) -> Optional[PointCloudFrame]:
+        return PointCloudFrame(
+            frame_id="map",
+            point_count=4,
+            points=[
+                Vector3(x=0.0, y=0.0, z=1.0),
+                Vector3(x=0.02, y=0.0, z=1.0),
+                Vector3(x=0.0, y=0.02, z=1.0),
+                Vector3(x=0.8, y=0.8, z=1.0),
+            ],
+            metadata={"source_topic": "/test/cloud"},
         )
 
 
@@ -428,6 +504,26 @@ def test_yolo_detector_backend_prefers_engine_when_available(tmp_path: Path) -> 
 
     assert resolved_source == str(engine_path)
     assert backend_kind == "ultralytics_yolo_tensorrt"
+
+
+def test_perception_service_enriches_detection_geometry_from_pointcloud(tmp_path: Path) -> None:
+    """感知服务应基于点云为检测框补充几何样本。"""
+
+    provider_owner = _ProviderOwner(PointCloudGeometryBundle())
+    service, _ = _build_perception_service(tmp_path, provider_owner)
+
+    context = service.perceive_current_scene(camera_id="front_camera", requested_by="tester", store_artifact=False)
+    detection = context.observation.detections_2d[0]
+
+    assert detection.label == "bottle"
+    assert detection.attributes["camera_points"]["frame_id"] == "world/test/camera_front"
+    assert detection.attributes["map_points"]["frame_id"] == "map"
+    assert len(detection.attributes["camera_points"]["points"]) == 3
+    assert len(detection.attributes["map_points"]["points"]) == 3
+    assert detection.attributes["depth_m"] == pytest.approx(1.0)
+    assert detection.attributes["geometry_support_point_count"] == 3
+    assert context.observation.metadata["geometry_augmented_count"] == 1
+    assert context.observation.metadata["geometry_point_cloud_source_topic"] == "/test/cloud"
 
 
 def test_perception_video_runtime_uses_keyframes_and_burst_without_memory_flooding(tmp_path: Path) -> None:

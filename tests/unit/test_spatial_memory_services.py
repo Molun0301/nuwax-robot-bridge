@@ -6,10 +6,11 @@ from pathlib import Path
 import pytest
 
 from contracts.base import utc_now
-from contracts.geometry import Pose, Quaternion, Vector3
+from contracts.geometry import FrameTree, Pose, Quaternion, Transform, Vector3
+from contracts.image import CameraInfo
 from contracts.maps import OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.perception import BoundingBox2D, Detection2D, Detection3D, Observation, Track, TrackState
-from contracts.runtime_views import MapSnapshot, PerceptionContext, SceneObjectSummary, SceneSummary
+from contracts.runtime_views import LocalizationSnapshot, MapSnapshot, PerceptionContext, SceneObjectSummary, SceneSummary
 from contracts.spatial_memory import InstanceLifecycleState, InstanceMovability
 from services.memory.grounding_query_planner import GroundingQueryPlanner
 from services.memory.inspection_pose_planner import InspectionPosePlanner
@@ -168,6 +169,166 @@ def test_projection_service_treats_scoped_map_frame_as_same_map_frame() -> None:
     assert projected[0].pose.frame_id == "map"
     assert projected[0].pose.position.x == pytest.approx(1.0)
     assert projected[0].pose.position.y == pytest.approx(0.2)
+
+
+def test_projection_service_uses_depth_camera_projection_with_frame_tree() -> None:
+    projection_service = VisionToMapProjectionService()
+    map_context = SemanticMapBuilder().build(_build_map_snapshot())
+    perception_context = PerceptionContext(
+        camera_id="front_camera",
+        observation=Observation(
+            observation_id="obs_camera_front_20260401T121000Z_deadbeef",
+            frame_id="robot/front_camera",
+            summary="看到了巡检包。",
+            detections_2d=[
+                Detection2D(
+                    label="bag",
+                    score=0.92,
+                    bbox=BoundingBox2D(x_px=180, y_px=80, width_px=60, height_px=80),
+                    camera_id="front_camera",
+                    attributes={
+                        "depth_m": 2.0,
+                        "mask_center_px": [210.0, 120.0],
+                        "instance_type": "object",
+                    },
+                )
+            ],
+            metadata={"width_px": 320, "height_px": 240},
+            artifact_ids=["art_image_2"],
+        ),
+        scene_summary=SceneSummary(
+            headline="看到了巡检包。",
+            objects=[SceneObjectSummary(label="bag", count=1, max_score=0.92)],
+        ),
+        camera_info=CameraInfo(
+            camera_id="front_camera",
+            frame_id="robot/front_camera",
+            width_px=320,
+            height_px=240,
+            fx=100.0,
+            fy=100.0,
+            cx=160.0,
+            cy=120.0,
+        ),
+        pipeline_name="test_pipeline",
+        detector_backend="metadata",
+        tracker_backend="basic",
+    )
+    localization_snapshot = LocalizationSnapshot(
+        source_name="unit_test_localization",
+        current_pose=Pose(frame_id="map", position=Vector3(x=0.0, y=0.0, z=0.0), orientation=Quaternion(w=1.0)),
+        frame_tree=FrameTree(
+            root_frame_id="map",
+            transforms=[
+                Transform(
+                    parent_frame_id="map",
+                    child_frame_id="robot/front_camera",
+                    translation=Vector3(x=1.0, y=0.5, z=0.6),
+                    rotation=Quaternion(w=1.0),
+                    authority="unit_test",
+                )
+            ],
+        ),
+    )
+
+    projected = projection_service.project(
+        perception_context,
+        current_pose=localization_snapshot.current_pose,
+        map_context=map_context,
+        localization_snapshot=localization_snapshot,
+    )
+
+    assert len(projected) == 1
+    item = projected[0]
+    assert item.pose.frame_id == "map"
+    assert item.pose.position.x == pytest.approx(2.0)
+    assert item.pose.position.y == pytest.approx(0.5)
+    assert item.attributes["projection_method"] == "depth_camera_projection"
+    assert item.attributes["sample_pixel_source"] == "mask_center_px"
+    assert item.attributes["support_point_count"] == 1
+    assert item.attributes["centroid_map_z"] == pytest.approx(2.6)
+
+
+def test_projection_service_uses_camera_point_samples_with_frame_tree() -> None:
+    projection_service = VisionToMapProjectionService()
+    map_context = SemanticMapBuilder().build(_build_map_snapshot())
+    localization_snapshot = LocalizationSnapshot(
+        source_name="unit_test_localization",
+        current_pose=Pose(frame_id="map", position=Vector3(x=0.0, y=0.0, z=0.0), orientation=Quaternion(w=1.0)),
+        frame_tree=FrameTree(
+            root_frame_id="map",
+            transforms=[
+                Transform(
+                    parent_frame_id="map",
+                    child_frame_id="robot/front_camera",
+                    translation=Vector3(x=1.0, y=0.5, z=0.6),
+                    rotation=Quaternion(w=1.0),
+                    authority="unit_test",
+                )
+            ],
+        ),
+    )
+    perception_context = PerceptionContext(
+        camera_id="front_camera",
+        observation=Observation(
+            observation_id="obs_camera_front_20260401T121500Z_deadbeef",
+            frame_id="robot/front_camera",
+            summary="看到了补给盒。",
+            detections_2d=[
+                Detection2D(
+                    label="supply_box",
+                    score=0.88,
+                    bbox=BoundingBox2D(x_px=140, y_px=90, width_px=50, height_px=60),
+                    camera_id="front_camera",
+                    attributes={
+                        "camera_points": {
+                            "frame_id": "robot/front_camera",
+                            "points": [
+                                {"x": 1.0, "y": -0.5, "z": 2.0},
+                                {"x": 1.2, "y": -0.3, "z": 2.2},
+                            ],
+                        },
+                        "instance_type": "object",
+                    },
+                )
+            ],
+            artifact_ids=["art_image_3"],
+        ),
+        scene_summary=SceneSummary(
+            headline="看到了补给盒。",
+            objects=[SceneObjectSummary(label="supply_box", count=1, max_score=0.88)],
+        ),
+        camera_info=CameraInfo(
+            camera_id="front_camera",
+            frame_id="robot/front_camera",
+            width_px=320,
+            height_px=240,
+            fx=100.0,
+            fy=100.0,
+            cx=160.0,
+            cy=120.0,
+        ),
+        pipeline_name="test_pipeline",
+        detector_backend="metadata",
+        tracker_backend="basic",
+    )
+
+    projected = projection_service.project(
+        perception_context,
+        current_pose=localization_snapshot.current_pose,
+        map_context=map_context,
+        localization_snapshot=localization_snapshot,
+    )
+
+    assert len(projected) == 1
+    item = projected[0]
+    assert item.pose.position.x == pytest.approx(2.1)
+    assert item.pose.position.y == pytest.approx(0.1)
+    assert item.attributes["projection_method"] == "camera_point_samples"
+    assert item.attributes["support_point_count"] == 2
+    assert item.attributes["extent_x_m"] == pytest.approx(0.2)
+    assert item.attributes["extent_y_m"] == pytest.approx(0.2)
+    assert item.attributes["centroid_map_z"] == pytest.approx(2.7)
 
 
 def test_instance_association_merges_static_instances_and_marks_stale() -> None:

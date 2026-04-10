@@ -18,6 +18,7 @@ from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.maps import OccupancyGrid, SemanticMap, SemanticRegion
 from contracts.memory import MemoryPayloadFilter, MemoryRecordKind
 from contracts.runtime_views import SceneObjectSummary, SceneSummary
+from contracts.spatial_memory import SpatialAnchorKind
 from contracts.skills import SkillCategory, SkillDescriptor
 from core import CapabilityRegistry, EventBus, StateNamespace, StateStore
 from gateways.artifacts import LocalArtifactStore
@@ -845,6 +846,53 @@ def test_memory_service_deeply_integrates_visual_semantics_into_vector_memory(tm
         (match.semantic_instance is not None or match.observation_event is not None)
         for match in visual_filter_result.matches
     )
+
+
+def test_memory_service_writes_object_level_observation_events_and_dynamic_anchors(tmp_path: Path) -> None:
+    """场景记忆应产出对象级观察事件，并把实例锚点暴露到导航语义上下文。"""
+
+    stack = _build_memory_stack(tmp_path)
+    observation_service = stack["observation_service"]
+    perception_service = stack["perception_service"]
+    memory_service = stack["memory_service"]
+
+    observation_service.capture_observation(camera_id="front_camera")
+    perception_service.describe_current_scene(camera_id="front_camera", refresh=True, requested_by="tester")
+    memory_entry = memory_service.remember_current_scene(
+        title="对象级空间记忆",
+        camera_id="front_camera",
+    )
+
+    assert len(memory_service._semantic_instances_by_id) >= 2
+    assert len(memory_service._observation_events_by_id) >= 2
+
+    person_instance = next(item for item in memory_service._semantic_instances_by_id.values() if item.label == "person")
+    linked_event = next(
+        item
+        for item in memory_service._observation_events_by_id.values()
+        if person_instance.instance_id in item.linked_instance_ids
+    )
+    navigation_context = memory_service.get_navigation_semantic_context()
+    dynamic_anchor = next(item for item in navigation_context.anchors if item.anchor_id == person_instance.anchor_id)
+    navigation_candidate = memory_service.resolve_navigation_candidate("person")
+
+    assert linked_event.source_memory_id == memory_entry.memory_id
+    assert linked_event.anchor_id == person_instance.anchor_id
+    assert linked_event.pose is not None
+    assert linked_event.metadata["projection_method"] in {
+        "current_pose_fallback",
+        "track_pose",
+        "depth_camera_projection",
+        "depth_pose_fallback",
+        "map_point_samples",
+        "camera_point_samples",
+        "explicit_map_pose",
+    }
+    assert dynamic_anchor.anchor_kind == SpatialAnchorKind.OBJECT_INSTANCE
+    assert dynamic_anchor.metadata["instance_id"] == person_instance.instance_id
+    assert navigation_context.metadata["anchor_count"] == len(navigation_context.anchors)
+    assert navigation_candidate is not None
+    assert navigation_candidate.metadata["anchor_id"] == person_instance.anchor_id
 
 
 def test_memory_service_remember_current_scene_allows_missing_map_snapshot(tmp_path: Path) -> None:
